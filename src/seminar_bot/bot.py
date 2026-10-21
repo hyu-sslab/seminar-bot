@@ -354,8 +354,12 @@ class SeminarBot(discord.Client):
         return self.store.classify(guild_id, record_id, kind, user_id, manager)
 
     async def reload_rotation_file(self) -> None:
+        configs = self.store.all_configs()
+        default_guild_id = configs[0]["guild_id"] if len(configs) == 1 else None
         try:
-            rotations = await asyncio.to_thread(read_rotations, self.settings.rotation_file)
+            rotations = await asyncio.to_thread(
+                read_rotations, self.settings.rotation_file, default_guild_id=default_guild_id
+            )
         except (UserError, OSError) as exc:
             message = str(exc)
             if self.rotation_errors.get(None) != message:
@@ -363,6 +367,20 @@ class SeminarBot(discord.Client):
                 self.rotation_errors[None] = message
             return
         self.rotation_errors.pop(None, None)
+        file_guild_ids = {rotation.guild_id for rotation in rotations}
+        for config in configs:
+            guild_id = config["guild_id"]
+            if guild_id not in file_guild_ids:
+                message = (
+                    f"config/rotation.json의 guilds에 이 서버({guild_id})의 발표자 명단이 없습니다."
+                )
+                if self.rotation_errors.get(guild_id) != message:
+                    log.warning(
+                        "Presenter JSON not applied for guild %s; keeping existing schedule: %s",
+                        guild_id,
+                        message,
+                    )
+                    self.rotation_errors[guild_id] = message
         for rotation in rotations:
             guild_id = rotation.guild_id
             if self.store.rotation_fingerprint(guild_id) == rotation.fingerprint:
@@ -590,8 +608,9 @@ class SeminarBot(discord.Client):
                 text += f"\n기존 미래 일정도 새 요일에 맞춰 {delta}일 뒤로 이동했습니다."
             await self.reload_rotation_file()
             text += "\n발표 순서는 NAS의 config/rotation.json에서 관리합니다. 파일 저장 후 30초 안에 반영됩니다."
-            if self.rotation_errors.get(None) or self.rotation_errors.get(interaction.guild_id):
-                text += "\n⚠️ 발표 순서 파일을 적용하지 못했습니다. NAS의 봇 로그를 확인해주세요."
+            error = self.rotation_errors.get(None) or self.rotation_errors.get(interaction.guild_id)
+            if error:
+                text += f"\n⚠️ 발표 순서 파일 적용 오류: {safe(error, 800)}\n현재 서버 ID: `{interaction.guild_id}`"
             await interaction.followup.send(text, ephemeral=True)
 
         @tree.command(name="일정", description="다가오는 발표자와 휴강일을 확인합니다")
@@ -607,9 +626,15 @@ class SeminarBot(discord.Client):
                 rows = self.store.upcoming(interaction.guild_id, today, weeks)
                 holidays = self.store.holidays(interaction.guild_id, today)
             if not rows:
-                raise UserError(
-                    "아직 발표 순서가 없습니다. 서버의 config/rotation.json에 발표자를 등록해주세요."
+                error = self.rotation_errors.get(None) or self.rotation_errors.get(
+                    interaction.guild_id
                 )
+                message = f"현재 서버 ID: `{interaction.guild_id}`\n"
+                if error:
+                    message += f"발표 순서 파일 적용 오류: {safe(error, 800)}"
+                else:
+                    message += "아직 발표 순서가 없습니다. config/rotation.json의 presenters에 발표자를 등록해주세요."
+                raise UserError(message)
             items = [(row["seminar_date"], f"<@{row['presenter_id']}>") for row in rows]
             items.extend(
                 (row["seminar_date"], "💤 휴강")

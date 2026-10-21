@@ -6,6 +6,7 @@ import json
 import re
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -104,6 +105,197 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             await self.bot.reload_rotation_file()
         self.assertEqual(len(logs.output), 1)
         self.assertEqual(self.bot.store.upcoming(1, DAY), before)
+
+    async def test_empty_or_other_guild_json_reports_missing_guild_once_without_changing_db(self):
+        for guilds in ({}, {"2": {"presenters": [{"user_id": "201"}]}}):
+            with self.subTest(guilds=guilds):
+                self.bot.rotation_errors.clear()
+                self.bot.settings.rotation_file.write_text(json.dumps({"guilds": guilds}))
+                before = "\n".join(self.bot.store.db.iterdump())
+                with (
+                    patch.object(self.bot, "get_guild", return_value=None),
+                    self.assertLogs("seminar_bot.bot", level="WARNING") as logs,
+                ):
+                    await self.bot.reload_rotation_file()
+                    await self.bot.reload_rotation_file()
+                self.assertIn("config/rotation.json", self.bot.rotation_errors[1])
+                self.assertIn("이 서버(1)", self.bot.rotation_errors[1])
+                self.assertEqual(sum("for guild 1;" in entry for entry in logs.output), 1)
+                self.assertEqual(len(logs.output), 1 if not guilds else 2)
+                self.assertEqual("\n".join(self.bot.store.db.iterdump()), before)
+
+    async def test_missing_guild_error_clears_on_apply_and_unchanged_file_preserves_postponement(
+        self,
+    ):
+        self.bot.settings.rotation_file.write_text('{"guilds":{}}')
+        with self.assertLogs("seminar_bot.bot", level="WARNING"):
+            await self.bot.reload_rotation_file()
+        self.assertIn(1, self.bot.rotation_errors)
+        self.write_rotation()
+        guild = SimpleNamespace(get_member=Mock(return_value=SimpleNamespace(bot=False)))
+        with (
+            patch.object(self.bot, "get_guild", return_value=guild),
+            patch("seminar_bot.bot.datetime") as clock,
+        ):
+            clock.now.return_value = NOW
+            await self.bot.reload_rotation_file()
+        self.assertNotIn(1, self.bot.rotation_errors)
+        self.assertEqual(self.bot.store.session_on(1, DAY)["presenter_id"], 102)
+        self.bot.store.postpone(1, DAY)
+        postponed = "\n".join(self.bot.store.db.iterdump())
+        self.bot.settings.rotation_file.write_text('{"guilds":{}}')
+        with self.assertLogs("seminar_bot.bot", level="WARNING"):
+            await self.bot.reload_rotation_file()
+        self.write_rotation()
+        with patch.object(
+            self.bot, "get_guild", side_effect=AssertionError("unchanged file must not reapply")
+        ):
+            await self.bot.reload_rotation_file()
+        self.assertNotIn(1, self.bot.rotation_errors)
+        self.assertEqual("\n".join(self.bot.store.db.iterdump()), postponed)
+
+    async def test_flat_rotation_uses_single_configured_guild_without_changing_env_targets(self):
+        self.bot.settings = replace(self.bot.settings, guild_id=2, api_guild_id=3)
+        self.bot.settings.rotation_file.write_text(
+            json.dumps(
+                {
+                    "start_date": None,
+                    "presenters": [
+                        {"user_id": "102", "name": "Synthetic Presenter"},
+                        {"user_id": "101"},
+                    ],
+                }
+            )
+        )
+        guild = SimpleNamespace(get_member=Mock(return_value=SimpleNamespace(bot=False)))
+        with (
+            patch.object(self.bot, "get_guild", return_value=guild) as get_guild,
+            patch("seminar_bot.bot.datetime") as clock,
+        ):
+            clock.now.return_value = NOW
+            await self.bot.reload_rotation_file()
+        self.assertEqual(self.bot.store.session_on(1, DAY)["presenter_id"], 102)
+        get_guild.assert_called_once_with(1)
+        self.assertEqual((self.bot.settings.guild_id, self.bot.settings.api_guild_id), (2, 3))
+        self.assertFalse(self.bot.rotation_errors)
+
+    async def test_flat_rotation_waits_for_configuration_instead_of_using_env_guild_ids(self):
+        self.bot.settings.rotation_file.write_text('{"presenters":[{"user_id":"101"}]}')
+        fresh = SeminarBot(
+            replace(
+                self.bot.settings,
+                data_dir=Path(self.temp.name) / "fresh",
+                guild_id=1,
+                api_guild_id=1,
+            )
+        )
+        try:
+            with (
+                patch.object(
+                    fresh,
+                    "get_guild",
+                    side_effect=AssertionError("flat JSON needs actual server configuration"),
+                ),
+                self.assertLogs("seminar_bot.bot", level="WARNING"),
+            ):
+                await fresh.reload_rotation_file()
+            self.assertTrue(fresh.rotation_errors.get(None))
+            self.assertEqual(fresh.store.all_configs(), [])
+        finally:
+            await fresh.close()
+
+    async def test_flat_rotation_rejects_multiple_configs_but_legacy_mapping_still_applies(self):
+        self.bot.store.configure(2, 2001, 2002, 3, "09:00", "18:00", "Asia/Seoul", NOW)
+        self.bot.settings.rotation_file.write_text('{"presenters":[{"user_id":"102"}]}')
+        before = "\n".join(self.bot.store.db.iterdump())
+        with (
+            patch.object(
+                self.bot,
+                "get_guild",
+                side_effect=AssertionError("ambiguous flat rotation must not resolve a guild"),
+            ),
+            self.assertLogs("seminar_bot.bot", level="WARNING"),
+        ):
+            await self.bot.reload_rotation_file()
+        self.assertTrue(self.bot.rotation_errors.get(None))
+        self.assertEqual("\n".join(self.bot.store.db.iterdump()), before)
+        self.write_rotation()
+        guild = SimpleNamespace(get_member=Mock(return_value=SimpleNamespace(bot=False)))
+        with (
+            patch.object(self.bot, "get_guild", return_value=guild),
+            patch("seminar_bot.bot.datetime") as clock,
+            self.assertLogs("seminar_bot.bot", level="WARNING"),
+        ):
+            clock.now.return_value = NOW
+            await self.bot.reload_rotation_file()
+        self.assertNotIn(None, self.bot.rotation_errors)
+        self.assertNotIn(1, self.bot.rotation_errors)
+        self.assertEqual(self.bot.store.session_on(1, DAY)["presenter_id"], 102)
+
+    async def test_configure_shows_actual_escaped_rotation_error_and_current_guild_id(self):
+        error = "Read failed: **unsafe** @everyone <@123>"
+        target = SimpleNamespace(
+            id=1001,
+            guild=SimpleNamespace(id=1),
+            mention="<#1001>",
+            permissions_for=lambda _: SimpleNamespace(
+                view_channel=True, send_messages=True, embed_links=True, read_message_history=True
+            ),
+        )
+        interaction = SimpleNamespace(
+            guild_id=1,
+            guild=SimpleNamespace(me=object()),
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+
+        async def fail_reload():
+            self.bot.rotation_errors[1] = error
+
+        with patch.object(self.bot, "reload_rotation_file", side_effect=fail_reload):
+            await self.bot.tree.get_command("설정").callback(interaction, 3, target, target)
+        sent = interaction.followup.send.await_args
+        self.assertTrue(sent.kwargs["ephemeral"])
+        self.assertIn("현재 서버 ID: `1`", sent.args[0])
+        self.assertIn(safe(error, 800), sent.args[0])
+        self.assertNotIn(error, sent.args[0])
+        with patch.object(
+            self.bot, "reload_rotation_file", side_effect=self.bot.rotation_errors.clear
+        ):
+            await self.bot.tree.get_command("설정").callback(interaction, 3, target, target)
+        self.assertNotIn("현재 서버 ID:", interaction.followup.send.await_args.args[0])
+        self.assertNotIn("⚠️", interaction.followup.send.await_args.args[0])
+
+    async def test_empty_schedule_shows_actual_error_or_guild_mapping_guidance(self):
+        with self.bot.store.db:
+            self.bot.store.db.execute("DELETE FROM sessions WHERE guild_id=1")
+            self.bot.store.db.execute(
+                "UPDATE guilds SET rotation='[]',next_date=NULL WHERE guild_id=1"
+            )
+        interaction = SimpleNamespace(
+            guild_id=1,
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        for key in (None, 1):
+            error = "Broken config: @everyone **invalid**"
+            self.bot.rotation_errors = {key: error}
+            with (
+                patch.object(self.bot, "reload_rotation_file", AsyncMock()),
+                self.assertRaises(UserError) as rejected,
+            ):
+                await self.bot.tree.get_command("일정").callback(interaction)
+            self.assertIn("현재 서버 ID: `1`", str(rejected.exception))
+            self.assertIn(safe(error, 800), str(rejected.exception))
+            self.assertNotIn(error, str(rejected.exception))
+        self.bot.rotation_errors.clear()
+        with (
+            patch.object(self.bot, "reload_rotation_file", AsyncMock()),
+            self.assertRaises(UserError) as rejected,
+        ):
+            await self.bot.tree.get_command("일정").callback(interaction)
+        self.assertIn("현재 서버 ID: `1`", str(rejected.exception))
+        self.assertIn("config/rotation.json의 presenters", str(rejected.exception))
 
     async def test_bot_presenter_is_rejected_without_changing_schedule(self):
         self.write_rotation()

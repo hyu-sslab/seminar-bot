@@ -314,7 +314,11 @@ class SeminarAPI:
 
     async def names(self) -> dict[int, str]:
         try:
-            rotations = await asyncio.to_thread(read_rotations, self.settings.rotation_file)
+            configs = self.bot.store.all_configs()
+            default_guild_id = configs[0]["guild_id"] if len(configs) == 1 else None
+            rotations = await asyncio.to_thread(
+                read_rotations, self.settings.rotation_file, default_guild_id=default_guild_id
+            )
             for rotation in rotations:
                 if rotation.guild_id == self.guild_id:
                     return {

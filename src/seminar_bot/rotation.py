@@ -50,7 +50,7 @@ def unique_object(pairs: list[tuple[str, object]]) -> dict:
     return result
 
 
-def read_rotations(path: Path) -> list[Rotation]:
+def read_rotations(path: Path, default_guild_id: int | None = None) -> list[Rotation]:
     try:
         with path.open("rb") as stream:
             content = stream.read(MAX_BYTES + 1)
@@ -66,9 +66,26 @@ def read_rotations(path: Path) -> list[Rotation]:
         raise UserError(
             "발표 순서 JSON 형식이 잘못되었습니다. 괄호·쉼표·따옴표를 확인해주세요."
         ) from exc
-    if not isinstance(data, dict) or set(data) != {"guilds"}:
-        raise UserError('발표 순서 JSON의 최상위 항목은 "guilds"여야 합니다.')
-    guilds = data["guilds"]
+    if not isinstance(data, dict):
+        raise UserError('발표 순서 JSON은 "presenters"가 있는 객체여야 합니다.')
+    if "guilds" in data:
+        if set(data) != {"guilds"}:
+            raise UserError('"guilds" 형식과 "presenters" 형식을 섞어 사용할 수 없습니다.')
+        guilds = data["guilds"]
+    else:
+        if "presenters" not in data or set(data) - {"start_date", "presenters"}:
+            raise UserError(
+                '발표 순서 JSON에는 "presenters"와 선택 항목 "start_date"만 사용하세요.'
+            )
+        if default_guild_id is None:
+            raise UserError(
+                "발표 순서를 적용할 서버를 자동으로 정할 수 없습니다. "
+                "서버 한 곳에서 먼저 /설정을 실행해주세요. "
+                "설정된 서버가 여러 곳이면 기존 guilds 형식을 사용해주세요."
+            )
+        if type(default_guild_id) is not int or not 0 < default_guild_id <= 2**63 - 1:
+            raise UserError("발표 순서를 적용할 서버 ID를 확인해주세요.")
+        guilds = {str(default_guild_id): data}
     if not isinstance(guilds, dict) or len(guilds) > 100:
         raise UserError('"guilds"는 서버 ID를 키로 갖는 객체여야 합니다 (최대 100개).')
     rotations = []
@@ -145,7 +162,8 @@ def apply_rotation(store: Store, rotation: Rotation, now: datetime) -> date | No
 def export_rotations(store: Store, now: datetime) -> dict:
     """Adopt current DB state without rebuilding its individual occurrences."""
     guilds = {}
-    for config in store.all_configs():
+    configs = store.all_configs()
+    for config in configs:
         ids = json.loads(config["rotation"])
         if not ids:
             continue
@@ -160,6 +178,8 @@ def export_rotations(store: Store, now: datetime) -> dict:
         rotation = Rotation(config["guild_id"], tuple(ids), None)
         with store.db:
             store.remember_rotation_file(config["guild_id"], rotation.fingerprint)
+    if len(configs) <= 1:
+        return next(iter(guilds.values()), {"start_date": None, "presenters": []})
     return {"guilds": guilds}
 
 

@@ -12,6 +12,7 @@ from pathlib import Path
 from seminar_bot.__main__ import instance_lock
 from seminar_bot.rotation import apply_rotation, export_rotations, read_rotations
 from seminar_bot.store import Store, UserError
+from seminar_bot.submission_access import SubmissionAccess
 
 DAY = date(2026, 10, 22)
 NOW = datetime(2026, 10, 22, 0, tzinfo=UTC)  # 09:00 KST
@@ -38,6 +39,18 @@ class RotationTests(unittest.TestCase):
         }
         self.path.write_text(json.dumps(data, ensure_ascii=False))
         return read_rotations(self.path)[0]
+
+    def write_flat(self, ids=(101, 102), start=None, name="관리용 이름", guild_id=1):
+        self.path.write_text(
+            json.dumps(
+                {
+                    "start_date": start,
+                    "presenters": [{"user_id": str(user_id), "name": name} for user_id in ids],
+                },
+                ensure_ascii=False,
+            )
+        )
+        return read_rotations(self.path, default_guild_id=guild_id)[0]
 
     def test_initial_file_repeats_presenters(self):
         rotation = self.write()
@@ -123,8 +136,10 @@ class RotationTests(unittest.TestCase):
         self.store.postpone(1, DAY)
         original = self.store.upcoming(1, DAY)
         data = export_rotations(self.store, NOW)
+        self.assertEqual(set(data), {"start_date", "presenters"})
         self.path.write_text(json.dumps(data))
-        rotation = read_rotations(self.path)[0]
+        rotation = read_rotations(self.path, default_guild_id=1)[0]
+        self.assertEqual(self.store.rotation_fingerprint(1), rotation.fingerprint)
         self.assertIsNone(apply_rotation(self.store, rotation, NOW))
         self.assertEqual(self.store.upcoming(1, DAY), original)
         self.assertEqual(len(self.store.holidays(1, DAY)), 1)
@@ -149,7 +164,15 @@ class RotationTests(unittest.TestCase):
         command = [sys.executable, "-m", "seminar_bot.rotation"]
         env = dict(os.environ, DATA_DIR=str(self.root))
         result = subprocess.run(command, env=env, capture_output=True, text=True, check=True)
-        self.assertEqual(len(json.loads(result.stdout)["guilds"]["1"]["presenters"]), 2)
+        exported = json.loads(result.stdout)
+        self.assertEqual(set(exported), {"start_date", "presenters"})
+        self.assertIsNone(exported["start_date"])
+        self.assertEqual(len(exported["presenters"]), 2)
+        self.path.write_text(result.stdout)
+        rotation = read_rotations(self.path, default_guild_id=1)[0]
+        original = self.store.upcoming(1, DAY)
+        self.assertIsNone(apply_rotation(self.store, rotation, NOW))
+        self.assertEqual(self.store.upcoming(1, DAY), original)
         with instance_lock(self.root):
             result = subprocess.run(command, env=env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 2)
@@ -185,6 +208,146 @@ class RotationTests(unittest.TestCase):
         self.path.write_bytes(b" " * (256 * 1024 + 1))
         with self.assertRaises(UserError):
             read_rotations(self.path)
+
+    def test_flat_format_requires_an_unambiguous_valid_integer_guild(self):
+        self.write_flat()
+        with self.assertRaises(UserError):
+            read_rotations(self.path)
+        for guild_id in (None, 0, -1, 2**63, True, False, "1", 1.0, [], {}):
+            with self.subTest(guild_id=guild_id), self.assertRaises(UserError):
+                read_rotations(self.path, default_guild_id=guild_id)
+        for guild_id in (1, 2**63 - 1):
+            rotation = read_rotations(self.path, default_guild_id=guild_id)[0]
+            self.assertEqual(rotation.guild_id, guild_id)
+            self.assertEqual(rotation.presenters, (101, 102))
+        # Explicit legacy server IDs never require implicit server selection.
+        self.assertEqual(self.write().guild_id, 1)
+        self.assertEqual(read_rotations(self.path, default_guild_id=2)[0].guild_id, 1)
+
+    def test_flat_and_legacy_formats_have_identical_schedule_fingerprints(self):
+        for start in (None, str(DAY)):
+            with self.subTest(start=start):
+                legacy = self.write(start=start, name="이름 A")
+                flat = self.write_flat(start=start, name="이름 B")
+                self.assertEqual(
+                    (flat.guild_id, flat.presenters, flat.start_date),
+                    (legacy.guild_id, legacy.presenters, legacy.start_date),
+                )
+                self.assertEqual(flat.fingerprint, legacy.fingerprint)
+
+    def test_changing_only_to_flat_format_preserves_holidays_swaps_and_submission_grants(self):
+        legacy = self.write()
+        apply_rotation(self.store, legacy, NOW)
+        self.store.swap(1, DAY, DAY + timedelta(weeks=1), DAY)
+        self.store.postpone(1, DAY)
+        session = self.store.upcoming(1, DAY, 1)[0]
+        access = SubmissionAccess(self.store)
+        invite, _ = access.issue(
+            1, session["id"], session["presenter_id"], now=1_700_000_000, scope="presenter"
+        )
+        token, _ = access.redeem(invite, 1, now=1_700_000_001)
+        original = self.store.upcoming(1, DAY)
+        holidays = self.store.holidays(1, DAY)
+        fingerprint = self.store.rotation_fingerprint(1)
+        flat = self.write_flat(name="표시 이름 변경")
+        self.assertIsNone(apply_rotation(self.store, flat, NOW + timedelta(weeks=2)))
+        self.assertEqual(self.store.upcoming(1, DAY), original)
+        self.assertEqual(self.store.holidays(1, DAY), holidays)
+        self.assertEqual(self.store.rotation_fingerprint(1), fingerprint)
+        self.assertEqual(
+            access.validate(token, 1, now=1_700_000_002)["presenter_id"], session["presenter_id"]
+        )
+
+    def test_flat_format_rejects_unknown_mixed_and_duplicate_keys(self):
+        entry = {"start_date": None, "presenters": [{"user_id": "101", "name": "발표자"}]}
+        for payload in (
+            {**entry, "guild_id": "1"},
+            {**entry, "guilds": {"1": entry}},
+            {"guilds": {"1": entry}, "start_date": None},
+            {"guilds": {"1": {**entry, "timezone": "UTC"}}},
+            {"presenters": entry["presenters"], "unexpected": True},
+        ):
+            with self.subTest(payload=payload):
+                self.path.write_text(json.dumps(payload))
+                with self.assertRaises(UserError):
+                    read_rotations(self.path, default_guild_id=1)
+        self.path.write_text('{"start_date":null,"presenters":[],"presenters":[]}')
+        with self.assertRaises(UserError):
+            read_rotations(self.path, default_guild_id=1)
+
+    def test_flat_presenter_and_start_boundaries_match_legacy_validation(self):
+        for payload in (
+            {"presenters": []},
+            {"presenters": [{"user_id": str(i)} for i in range(1, 102)]},
+            {"presenters": [{"user_id": "101"}, {"user_id": "0101"}]},
+            {"presenters": [{"user_id": 101}]},
+            {"presenters": [{"user_id": True}]},
+            {"presenters": [{"user_id": "0"}]},
+            {"presenters": [{"user_id": str(2**63)}]},
+            {"presenters": [{"user_id": "101", "name": "x" * 101}]},
+            {"presenters": [{"user_id": "101", "name": None}]},
+            {"presenters": [{"user_id": "101", "role": "speaker"}]},
+            {"presenters": ["101"]},
+            {"presenters": {}},
+            {"presenters": [{"user_id": "101"}], "start_date": True},
+            {"presenters": [{"user_id": "101"}], "start_date": "2026-02-30"},
+        ):
+            with self.subTest(payload=payload):
+                self.path.write_text(json.dumps(payload))
+                with self.assertRaises(UserError):
+                    read_rotations(self.path, default_guild_id=1)
+        rotation = self.write_flat(ids=range(1, 101), name="x" * 100)
+        self.assertEqual(len(rotation.presenters), 100)
+        self.assertEqual(rotation.names, ("x" * 100,) * 100)
+        self.path.write_text('{"presenters":[{"user_id":"101"}]}')
+        self.assertIsNone(read_rotations(self.path, default_guild_id=1)[0].start_date)
+        self.path.write_text('{"guilds":{}}')
+        self.assertEqual(read_rotations(self.path), [])
+
+    def test_export_without_active_presenters_produces_an_empty_single_server_template(self):
+        self.assertEqual(export_rotations(self.store, NOW), {"start_date": None, "presenters": []})
+        with tempfile.TemporaryDirectory() as directory:
+            empty = Store(Path(directory) / "empty.sqlite3")
+            try:
+                self.assertEqual(
+                    export_rotations(empty, NOW), {"start_date": None, "presenters": []}
+                )
+            finally:
+                empty.close()
+
+    def test_export_keeps_explicit_guilds_when_multiple_configured_servers_have_one_rotation(self):
+        self.store.set_rotation(1, [101, 102], DAY, DAY)
+        self.store.configure(2, 2001, 2002, 3, "09:00", "18:00", "Asia/Seoul", NOW)
+        original = self.store.upcoming(1, DAY)
+        data = export_rotations(self.store, NOW)
+        self.assertEqual(set(data), {"guilds"})
+        self.assertEqual(set(data["guilds"]), {"1"})
+        self.path.write_text(json.dumps(data))
+        rotations = read_rotations(self.path)
+        self.assertEqual(len(rotations), 1)
+        self.assertIsNone(apply_rotation(self.store, rotations[0], NOW))
+        self.assertEqual(self.store.upcoming(1, DAY), original)
+        self.assertEqual(self.store.upcoming(2, DAY), [])
+
+    def test_export_of_multiple_active_servers_preserves_each_schedule_and_fingerprint(self):
+        self.store.set_rotation(1, [101, 102], DAY, DAY)
+        self.store.configure(2, 2001, 2002, 3, "09:00", "18:00", "Asia/Seoul", NOW)
+        self.store.set_rotation(2, [201, 202], DAY, DAY)
+        self.store.swap(1, DAY, DAY + timedelta(weeks=1), DAY)
+        self.store.postpone(2, DAY)
+        before = {guild: self.store.upcoming(guild, DAY) for guild in (1, 2)}
+        data = export_rotations(self.store, NOW)
+        self.assertEqual(set(data), {"guilds"})
+        self.assertEqual(set(data["guilds"]), {"1", "2"})
+        self.path.write_text(json.dumps(data))
+        rotations = read_rotations(self.path)
+        self.assertEqual({rotation.guild_id for rotation in rotations}, {1, 2})
+        for rotation in rotations:
+            self.assertEqual(
+                self.store.rotation_fingerprint(rotation.guild_id), rotation.fingerprint
+            )
+            self.assertIsNone(apply_rotation(self.store, rotation, NOW))
+            self.assertEqual(self.store.upcoming(rotation.guild_id, DAY), before[rotation.guild_id])
 
 
 if __name__ == "__main__":
