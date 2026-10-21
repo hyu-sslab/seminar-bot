@@ -1138,6 +1138,65 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.extraction_method, "filename")
         self.assertEqual(result.text, "")
 
+    async def test_paper_uses_verified_metadata_after_isolated_parsing(self):
+        self.bot.settings = replace(self.bot.settings, parser_url="http://document-parser:8081")
+        parsed = DocumentInfo(
+            "Truncated Paper",
+            "Complete Research Paper Title",
+            "10.1234/example",
+            None,
+            "a" * 64,
+            "pdf_text",
+        )
+        verified = replace(parsed, title="Complete Research Paper Title")
+        with (
+            patch("seminar_bot.bot.extract_remote", AsyncMock(return_value=parsed)) as parser,
+            patch.object(
+                self.bot.paper_metadata, "enrich", AsyncMock(return_value=verified)
+            ) as enrich,
+        ):
+            result = await self.bot.extract_document(
+                Path("unused"), "paper.pdf", b"%PDF", kind="paper"
+            )
+        parser.assert_awaited_once_with(
+            Path("unused"), "paper.pdf", b"%PDF", "http://document-parser:8081", kind="paper"
+        )
+        enrich.assert_awaited_once_with(parsed)
+        self.assertIs(result, verified)
+
+    async def test_slides_never_resolve_a_cited_paper_doi_as_the_presentation_title(self):
+        self.bot.settings = replace(self.bot.settings, parser_url="http://document-parser:8081")
+        parsed = DocumentInfo(
+            "Visible Presentation Title",
+            "Reference DOI 10.1234/example",
+            "10.1234/example",
+            None,
+            "b" * 64,
+            "pdf_text",
+        )
+        with (
+            patch("seminar_bot.bot.extract_remote", AsyncMock(return_value=parsed)),
+            patch.object(self.bot.paper_metadata, "enrich", AsyncMock()) as enrich,
+        ):
+            result = await self.bot.extract_document(
+                Path("unused"), "slides.pdf", b"%PDF", kind="slides"
+            )
+        enrich.assert_not_awaited()
+        self.assertIs(result, parsed)
+
+    async def test_local_paper_parsing_uses_the_same_metadata_verification(self):
+        parsed = DocumentInfo("Local Paper", "Local Paper body", None, None, "c" * 64, "pdf_text")
+        with (
+            patch("seminar_bot.bot.extract_saved", AsyncMock(return_value=parsed)) as parser,
+            patch.object(
+                self.bot.paper_metadata, "enrich", AsyncMock(return_value=parsed)
+            ) as enrich,
+        ):
+            result = await self.bot.extract_document(Path("unused"), "paper.pdf", b"%PDF")
+        parser.assert_awaited_once_with(Path("unused"), "paper.pdf", b"%PDF", kind="paper")
+        enrich.assert_awaited_once_with(parsed)
+        self.assertIs(result, parsed)
+
     async def test_reminders_ignore_inactive_guild_even_when_it_is_connected_and_enabled(self):
         self.bot.settings = replace(self.bot.settings, api_guild_id=1)
         self.enable_notifications()

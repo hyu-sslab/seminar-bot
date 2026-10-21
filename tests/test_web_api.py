@@ -451,6 +451,27 @@ class WebAPITests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(download.status, 404)
 
+    async def test_verified_paper_title_is_stored_without_pdf_or_extracted_body(self):
+        title = "Complete Verified Research Paper Title"
+
+        async def verified(info):
+            self.assertEqual(info.doi, "10.1234/verified")
+            self.assertIn(title, info.text)
+            return replace(info, title=title)
+
+        with patch.object(self.bot.paper_metadata, "enrich", AsyncMock(side_effect=verified)):
+            response = await self.upload(
+                "paper", pdf_bytes("Truncated Research Title", title + " DOI:10.1234/verified")
+            )
+        self.assertEqual(response.status, 201, await response.text())
+        document = (await response.json())["document"]
+        self.assertEqual(document["title"], title)
+        stored = self.bot.store.document(1, document["id"])
+        self.assertEqual(stored["doi"], "10.1234/verified")
+        self.assertEqual(stored["extracted_text"], "")
+        self.assertEqual(stored["file_path"], "")
+        self.assertEqual(self.files(), [])
+
     async def test_slides_pdf_is_preserved_and_downloaded_as_private_attachment(self):
         data = pdf_bytes("A Preserved Presentation")
         response = await self.upload(data=data, filename="발표 자료.pdf")

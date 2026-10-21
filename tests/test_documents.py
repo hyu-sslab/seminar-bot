@@ -177,6 +177,9 @@ class DocumentTests(unittest.TestCase):
         self.assertEqual(document.title, "Robust Learning for Changing Data")
         self.assertEqual(document.extraction_method, "pdf_text")
         self.assertEqual(extract_document(data, "paper.pdf").title, "Old Template Title")
+        explicit_paper = extract_document(data, "paper.pdf", kind="paper")
+        self.assertEqual(explicit_paper.title, "Old Template Title")
+        self.assertEqual(explicit_paper.extraction_method, "pdf_metadata")
 
     def test_slides_pdf_joins_separate_font_runs_on_one_line(self):
         data = styled_pdf_fixture(
@@ -293,6 +296,90 @@ class DocumentTests(unittest.TestCase):
         )
         self.assertEqual(document.title, "Useful Paper Title")
         self.assertEqual(document.extraction_method, "pdf_text")
+
+    def test_paper_reconstructs_three_title_lines_without_appending_authors(self):
+        data = pdf_fixture(
+            "Adapting Policies to Signals: Towards\n"
+            "Lightweight, Adaptive Graph-based Threat\n"
+            "Detection\n"
+            "Alex Rivera1, Morgan Chen2, Taylor Smith3\n"
+            "1Northbridge University, 2Eastbank Institute\n"
+            "Abstract--This is the body, not the title."
+        )
+        document = extract_document(data, "research.pdf", kind="paper")
+        self.assertEqual(
+            document.title,
+            "Adapting Policies to Signals: Towards Lightweight, Adaptive Graph-based Threat Detection",
+        )
+        self.assertEqual(document.extraction_method, "pdf_text")
+        self.assertNotIn("Alex Rivera", document.title)
+
+    def test_paper_skips_generic_proceedings_cover_before_multiline_title(self):
+        data = pdf_fixture(
+            "This paper is included in the Proceedings of the\n"
+            "35th Example Security Symposium.\n"
+            "August 13-15, 2026, Harbor City\n"
+            "978-1-111111-11-1\n"
+            "Open access to the Proceedings of the\n"
+            "35th Example Security Symposium is sponsored by Example Association.\n"
+            "HERMES: Reliable Attribution in\n"
+            "Graph-based Event Analysis Systems\n"
+            "Alex Rivera, Northbridge University; Morgan Chen, Eastbank Institute\n"
+            "https://example.org/conference/paper"
+        )
+        self.assertEqual(
+            extract_document(data, "research.pdf", kind="paper").title,
+            "HERMES: Reliable Attribution in Graph-based Event Analysis Systems",
+        )
+
+    def test_paper_repairs_metadata_containing_only_the_first_title_line(self):
+        data = pdf_fixture(
+            "Adapting Policies to Signals: Towards\n"
+            "Lightweight, Adaptive Graph-based Threat\n"
+            "Detection\nAlex Rivera, Morgan Chen\nAbstract",
+            title="Adapting Policies to Signals: Towards",
+        )
+        document = extract_document(data, "research.pdf", kind="paper")
+        self.assertEqual(
+            document.title,
+            "Adapting Policies to Signals: Towards Lightweight, Adaptive Graph-based Threat Detection",
+        )
+        self.assertEqual(document.extraction_method, "pdf_text")
+
+    def test_paper_keeps_two_word_and_university_titles_and_stops_at_single_author(self):
+        for title in (
+            "Graph Learning",
+            "University Collaboration Networks",
+            "Abstract Interpretation for Secure Systems",
+            "What Are We Optimizing For",
+        ):
+            with self.subTest(title=title):
+                data = pdf_fixture(title + "\nAlex Rivera\nNorthbridge University\nAbstract")
+                self.assertEqual(extract_document(data, "research.pdf", kind="paper").title, title)
+
+    def test_paper_accepts_lowercase_continuation_after_unfinished_title(self):
+        data = pdf_fixture(
+            "A lightweight approach to\n"
+            "adapting models in production\n"
+            "A. Researcher, B. Scientist\nExample University\nAbstract"
+        )
+        self.assertEqual(
+            extract_document(data, "research.pdf", kind="paper").title,
+            "A lightweight approach to adapting models in production",
+        )
+
+    def test_paper_does_not_extend_title_with_body_sentences_or_replace_unrelated_metadata(self):
+        text = "Reliable Systems for Researchers\nThese results show how a system behaves."
+        self.assertEqual(
+            extract_document(pdf_fixture(text), "research.pdf", kind="paper").title,
+            "Reliable Systems for Researchers",
+        )
+        self.assertEqual(
+            extract_document(
+                pdf_fixture(text, title="Validated Registry Title"), "research.pdf", kind="paper"
+            ).title,
+            "Validated Registry Title",
+        )
 
     def test_pdf_preserves_useful_metadata_when_body_has_no_text(self):
         document = extract_document(pdf_fixture("", title="연구실 논문 제목"), "upload.pdf")

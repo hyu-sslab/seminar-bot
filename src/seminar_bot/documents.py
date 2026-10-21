@@ -210,6 +210,141 @@ def _title_from_text(text: str) -> str | None:
     return None
 
 
+_PAPER_AFFILIATION = re.compile(
+    r"\b(?:university|universit[eé]|institute|institution|department|faculty|"
+    r"college|laboratory|academy|school of|research (?:council|center|centre|lab))\b"
+    r"|대학교|대학원|연구소",
+    re.IGNORECASE,
+)
+_PAPER_SECTION = re.compile(
+    r"^(?:abstract|초록)\s*(?:$|[:：—–-])"
+    r"|^(?:(?:\d+|[ivx]+)[.\s]+)?(?:introduction|summary|references|bibliography|서론|참고\s*문헌)\s*[:：]?\s*$"
+    r"|^(?:keywords?|index terms)\s*(?:$|[:：—–-])",
+    re.IGNORECASE,
+)
+_TITLE_CONNECTORS = {
+    "a",
+    "an",
+    "the",
+    "and",
+    "or",
+    "of",
+    "to",
+    "in",
+    "on",
+    "for",
+    "from",
+    "with",
+    "without",
+    "by",
+    "via",
+    "toward",
+    "towards",
+    "through",
+    "using",
+    "based",
+    "under",
+}
+
+
+def _paper_boilerplate(line: str) -> bool:
+    return bool(
+        re.search(
+            r"^(?:this (?:paper|article) is (?:included|published)|open access to "
+            r"|published in |proceedings of |copyright\b|©|isbn\b|issn\b)"
+            r"|^\d+(?:st|nd|rd|th)\b.*\b(?:symposium|conference|workshop|congress)\b"
+            r"|\b(?:symposium|conference|workshop)\b.*(?:sponsored by|\b(?:19|20)\d{2}\b)"
+            r"|^(?:january|february|march|april|may|june|july|august|september|october|november|december)"
+            r"\b.*\b(?:19|20)\d{2}\b",
+            line,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _paper_author_line(line: str, following: str = "", *, allow_single_name: bool = True) -> bool:
+    if (
+        "@" in line
+        or _PAPER_AFFILIATION.search(line)
+        or re.match(r"^(?:(?:an?\s+)?authors?\b|presenter\b|by\s+)", line, re.IGNORECASE)
+    ):
+        return True
+
+    def person_name(value: str) -> bool:
+        value = re.sub(r"[\d*∗†‡§]+", "", value).strip()
+        words = value.split()
+        return (
+            2 <= len(words) <= 4
+            and all(
+                word[0].isupper() and word.casefold() not in _TITLE_CONNECTORS for word in words
+            )
+            and all(re.fullmatch(r"[^\W\d_][\w.’'\-]*", word) for word in words)
+        )
+
+    names = [name.strip() for name in re.split(r"[,;]|\s+(?:and|&)\s+", line) if name.strip()]
+    if not names or not all(person_name(name) for name in names):
+        return False
+    if len(names) == 1 and not allow_single_name:
+        return False
+    # Commas alone are insufficient: title continuations can also contain
+    # comma-separated phrases. Author markers or the next section help bound it.
+    return (
+        len(names) >= 3
+        or bool(re.search(r"[∗†‡§]|\b(?:and|&)\b", line))
+        or bool(_PAPER_AFFILIATION.search(following))
+        or "@" in following
+        or bool(_PAPER_SECTION.match(following))
+    )
+
+
+def _paper_title_from_text(text: str) -> str | None:
+    """Restore a paper's textual heading without inspecting font sizes."""
+    lines = [_clean_title(line) for line in text.splitlines()[:40]]
+    for start, line in enumerate(lines):
+        if not line or _paper_boilerplate(line):
+            continue
+        if _PAPER_SECTION.match(line):
+            return None
+        first = _title_from_text(line)
+        if not first:
+            continue
+        parts = [first]
+        for index in range(start + 1, min(start + 5, len(lines))):
+            continuation = lines[index]
+            following = lines[index + 1] if index + 1 < len(lines) else ""
+            unfinished = (
+                parts[-1].endswith((":", "-", "\u00ad"))
+                or parts[-1].split()[-1].casefold() in _TITLE_CONNECTORS
+            )
+            if (
+                not continuation
+                or _paper_boilerplate(continuation)
+                or _PAPER_SECTION.match(continuation)
+                or _paper_author_line(
+                    continuation,
+                    following,
+                    allow_single_name=not unfinished or len(continuation.split()) <= 3,
+                )
+                or not _title_from_text(continuation)
+                or re.search(r"[.!?。]$", parts[-1])
+            ):
+                break
+            words = re.findall(r"[^\W\d_][\w'’\-]*", continuation)
+            significant = [word for word in words if word.casefold() not in _TITLE_CONNECTORS]
+            title_case = (
+                significant
+                and sum(word[0].isupper() for word in significant) >= len(significant) * 0.6
+            )
+            if not title_case and not unfinished:
+                break
+            if parts[-1].endswith(("-", "\u00ad")):
+                parts[-1] = parts[-1].removesuffix("\u00ad") + continuation
+            else:
+                parts.append(continuation)
+        return _useful_title(" ".join(parts))
+    return None
+
+
 @dataclass(frozen=True)
 class _VisualLine:
     text: str
@@ -596,12 +731,24 @@ def extract_document(data: bytes, filename: str, *, kind: str = "paper") -> Docu
                 warning
                 or "본문 텍스트를 찾지 못해 파일명으로 기록했습니다. 스캔 PDF에는 OCR이 필요합니다."
             )
-        title = (
-            visual_title
-            or metadata_title
-            or _title_from_text(pages[0] if pages else "")
-            or fallback
-        )
+        text_title = _title_from_text(pages[0] if pages else "")
+        if kind == "paper" and extension == ".pdf":
+            text_title = _paper_title_from_text(pages[0] if pages else "")
+            if metadata_title and _paper_boilerplate(metadata_title):
+                metadata_title = None
+            if metadata_title and text_title:
+                metadata_key, text_key = (
+                    normalize_title(metadata_title),
+                    normalize_title(text_title),
+                )
+                if (
+                    len(metadata_key) >= 12
+                    and len(text_key) > len(metadata_key) + 5
+                    and text_key.startswith(metadata_key)
+                ):
+                    # Some PDFs store only the first title line in metadata.
+                    metadata_title = None
+        title = visual_title or metadata_title or text_title or fallback
         method = (
             f"{extension[1:]}_metadata"
             if metadata_title and not visual_title

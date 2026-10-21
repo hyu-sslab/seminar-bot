@@ -13,6 +13,7 @@ from discord.ext import tasks
 from .archive import extract_saved
 from .command_sync import sync_commands
 from .documents import MAX_FILE_BYTES, DocumentInfo
+from .paper_metadata import PaperMetadataResolver
 from .remote_parser import extract_remote
 from .rotation import apply_rotation, read_rotations
 from .scheduling import due_reminders
@@ -100,6 +101,7 @@ class SeminarBot(discord.Client):
         self.tree = SeminarCommandTree(self)
         self.schedule_lock = asyncio.Lock()
         self.upload_slots = asyncio.Semaphore(MAX_CONCURRENT_UPLOADS)
+        self.paper_metadata = PaperMetadataResolver()
         self.rotation_errors: dict[int | None, str] = {}
         self.api_runner = None
         self.relay_client = None
@@ -288,8 +290,10 @@ class SeminarBot(discord.Client):
                 "문서 분석 용량 제한을 넘어 파일명으로 기록했습니다.",
             )
         if self.settings.parser_url:
-            return await extract_remote(path, filename, data, self.settings.parser_url, kind=kind)
-        return await extract_saved(path, filename, data, kind=kind)
+            info = await extract_remote(path, filename, data, self.settings.parser_url, kind=kind)
+        else:
+            info = await extract_saved(path, filename, data, kind=kind)
+        return await self.paper_metadata.enrich(info) if kind == "paper" else info
 
     def source_url(self, record: dict) -> str:
         if record.get("source_type") in {"web", "manual"} and record.get("session_id"):
