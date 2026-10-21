@@ -50,7 +50,7 @@ class Store:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.execute("PRAGMA busy_timeout=5000")
-        if self.db.execute("PRAGMA user_version").fetchone()[0] > 7:
+        if self.db.execute("PRAGMA user_version").fetchone()[0] > 8:
             self.db.close()
             raise ValueError("데이터베이스 버전이 봇보다 새롭습니다. 봇을 업데이트해주세요.")
         self.db.executescript("""
@@ -63,6 +63,8 @@ class Store:
                 evening TEXT NOT NULL,
                 timezone TEXT NOT NULL,
                 seminar_time TEXT,
+                notifications_enabled INTEGER NOT NULL DEFAULT 0 CHECK(notifications_enabled IN (0,1)),
+                reminder_start_date TEXT,
                 rotation TEXT NOT NULL DEFAULT '[]',
                 next_date TEXT,
                 next_index INTEGER NOT NULL DEFAULT 0
@@ -153,10 +155,17 @@ class Store:
         columns = {row["name"] for row in self.db.execute("PRAGMA table_info(documents)")}
         with self.db:
             self.db.execute("BEGIN")
-            if "seminar_time" not in {
-                row["name"] for row in self.db.execute("PRAGMA table_info(guilds)")
-            }:
-                self.db.execute("ALTER TABLE guilds ADD COLUMN seminar_time TEXT")
+            guild_columns = {row["name"] for row in self.db.execute("PRAGMA table_info(guilds)")}
+            for name, definition in (
+                ("seminar_time", "TEXT"),
+                (
+                    "notifications_enabled",
+                    "INTEGER NOT NULL DEFAULT 0 CHECK(notifications_enabled IN (0,1))",
+                ),
+                ("reminder_start_date", "TEXT"),
+            ):
+                if name not in guild_columns:
+                    self.db.execute(f"ALTER TABLE guilds ADD COLUMN {name} {definition}")
             if "kind" not in columns:
                 self.db.execute(
                     "ALTER TABLE documents ADD COLUMN kind TEXT NOT NULL DEFAULT 'unknown' CHECK(kind IN ('slides','paper','unknown'))"
@@ -204,7 +213,7 @@ class Store:
                 "CREATE UNIQUE INDEX IF NOT EXISTS web_upload_key ON documents(guild_id, upload_key) "
                 "WHERE upload_key IS NOT NULL"
             )
-            self.db.execute("PRAGMA user_version=7")
+            self.db.execute("PRAGMA user_version=8")
 
     def close(self) -> None:
         self.db.close()
@@ -234,6 +243,8 @@ class Store:
         now: datetime | None = None,
         *,
         seminar_time: str | None = None,
+        notifications_enabled: bool | None = None,
+        reminder_start_date: date | None = None,
     ) -> int:
         if weekday not in range(7):
             raise UserError("요일 값이 올바르지 않습니다.")
@@ -241,6 +252,10 @@ class Store:
             if not isinstance(seminar_time, str):
                 raise UserError("세미나 시작 시간은 HH:MM 형식으로 입력해주세요.")
             parse_time(seminar_time)
+        if notifications_enabled is not None and type(notifications_enabled) is not bool:
+            raise UserError("알림 설정은 켜기 또는 끄기를 선택해주세요.")
+        if reminder_start_date is not None and type(reminder_start_date) is not date:
+            raise UserError("알림 시작일은 YYYY-MM-DD 날짜로 입력해주세요.")
         if parse_time(morning) >= parse_time(evening):
             raise UserError("아침 알림 시간은 저녁 요청 시간보다 빨라야 합니다.")
         try:
@@ -249,6 +264,32 @@ class Store:
             raise UserError("시간대를 확인해주세요. 예: Asia/Seoul, UTC") from exc
         today = (now or datetime.now(UTC)).astimezone(zone).date()
         old = self.config(guild_id)
+        enabled = bool(old["notifications_enabled"]) if old else False
+        if notifications_enabled is not None:
+            enabled = notifications_enabled
+        reminder_start = (
+            reminder_start_date.isoformat()
+            if reminder_start_date is not None
+            else old["reminder_start_date"]
+            if old
+            else None
+        )
+        if enabled and not reminder_start:
+            raise UserError(
+                "처음 알림을 켤 때는 등록된 첫 세미나 날짜를 알림시작일로 지정해주세요."
+            )
+        if (
+            reminder_start_date is not None
+            and not self.db.execute(
+                "SELECT 1 FROM sessions s WHERE s.guild_id=? AND s.seminar_date=? "
+                "AND NOT EXISTS(SELECT 1 FROM holidays h WHERE h.guild_id=s.guild_id "
+                "AND h.seminar_date=s.seminar_date)",
+                (guild_id, reminder_start),
+            ).fetchone()
+        ):
+            raise UserError(
+                "알림 시작일에 등록된 발표 회차가 없습니다. 실제 첫 세미나 기록을 확인해주세요."
+            )
         delta = (weekday - old["weekday"]) % 7 if old else 0
         with self.db:
             if old and old["upload_channel_id"] != upload_channel_id:
@@ -267,12 +308,15 @@ class Store:
             self.db.execute(
                 """
                 INSERT INTO guilds(guild_id, channel_id, upload_channel_id, weekday,
-                    morning, evening, timezone, seminar_time) VALUES(?,?,?,?,?,?,?,?)
+                    morning, evening, timezone, seminar_time, notifications_enabled,
+                    reminder_start_date) VALUES(?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(guild_id) DO UPDATE SET
                     channel_id=excluded.channel_id, upload_channel_id=excluded.upload_channel_id,
                     weekday=excluded.weekday, morning=excluded.morning,
                     evening=excluded.evening, timezone=excluded.timezone,
-                    seminar_time=COALESCE(excluded.seminar_time, guilds.seminar_time)
+                    seminar_time=COALESCE(excluded.seminar_time, guilds.seminar_time),
+                    notifications_enabled=excluded.notifications_enabled,
+                    reminder_start_date=excluded.reminder_start_date
             """,
                 (
                     guild_id,
@@ -283,6 +327,8 @@ class Store:
                     evening,
                     timezone,
                     seminar_time,
+                    int(enabled),
+                    reminder_start,
                 ),
             )
         return delta
@@ -513,7 +559,7 @@ class Store:
             )
             # If swapping today's speaker after a reminder, notify the new speaker on next tick.
             self.db.execute(
-                "DELETE FROM deliveries WHERE session_id IN (?,?) AND on_date>=?",
+                "DELETE FROM deliveries WHERE session_id IN (?,?) AND on_date>=? AND kind='morning'",
                 (one["id"], two["id"], today.isoformat()),
             )
 

@@ -253,6 +253,8 @@ class SeminarBot(discord.Client):
                 async with self.schedule_lock:
                     # Re-read inside the lock, after any settings mutation.
                     config = self.store.require_config(config["guild_id"])
+                    if not config["notifications_enabled"]:
+                        continue
                     due = due_reminders(self.store, config, datetime.now(UTC))
                     for session, kind in due:
                         channel = self.get_channel(config["channel_id"])
@@ -269,10 +271,14 @@ class SeminarBot(discord.Client):
                         if kind == "morning":
                             text = f"☀️ 오늘({session['seminar_date']}){when} 세미나 발표자는 {mention}입니다. 발표 준비 부탁드려요!"
                         else:
-                            status = self.store.submission(config["guild_id"], session["id"])
+                            status = self.store.submission(
+                                config["guild_id"],
+                                session["id"],
+                                visible_channel_ids=[config["upload_channel_id"]],
+                            )
                             if self.web_submission_enabled(config["guild_id"]):
                                 text = (
-                                    f"🌙 {mention} 오늘{when} 발표에 사용한 자료를 제출해주세요.\n"
+                                    f"🌙 {mention} {session['seminar_date']}{when} 세미나 발표 자료를 제출해주세요.\n"
                                     "`/제출` 명령을 실행해 본인 전용 임시 링크를 받은 뒤 웹페이지에서 등록해주세요.\n"
                                     "발표 자료 **PDF/PPT/PPTX 1개 이상** + 참고한 **서로 다른 논문 3편 이상**이 필요합니다.\n"
                                     "논문은 제출 페이지에 PDF를 올려 정보를 추출하거나 직접 입력할 수 있습니다.\n"
@@ -281,7 +287,7 @@ class SeminarBot(discord.Client):
                                 )
                             else:
                                 text = (
-                                    f"🌙 {mention} 오늘{when} 발표 자료 제출을 위한 웹 연동이 설정되지 않았습니다.\n"
+                                    f"🌙 {mention} {session['seminar_date']}{when} 세미나 자료 제출을 위한 웹 연동이 설정되지 않았습니다.\n"
                                     "서버 관리자에게 웹 제출 연동 설정을 요청해주세요.\n"
                                     "발표 자료는 웹 제출 페이지에서 등록합니다.\n"
                                     + submission_summary(status)
@@ -295,7 +301,8 @@ class SeminarBot(discord.Client):
                                 replied_user=False,
                             ),
                         )
-                        self.store.mark_sent(session["id"], session["seminar_date"], kind, sent.id)
+                        on_date = local_now(config, datetime.now(UTC)).date().isoformat()
+                        self.store.mark_sent(session["id"], on_date, kind, sent.id)
             except Exception:
                 # A forbidden/deleted channel or transient network error must not kill the loop.
                 log.exception(
@@ -304,6 +311,8 @@ class SeminarBot(discord.Client):
 
     async def notify_web_submission(self, session: dict, status: dict) -> int:
         config = self.store.require_config(session["guild_id"])
+        if not config["notifications_enabled"]:
+            raise UserError("알림이 비활성화되어 있습니다.")
         channel = self.get_channel(config["channel_id"])
         if channel is None:
             channel = await self.fetch_channel(config["channel_id"])
@@ -465,9 +474,15 @@ class SeminarBot(discord.Client):
         @app_commands.default_permissions(manage_guild=True)
         @app_commands.checks.has_permissions(manage_guild=True)
         @app_commands.choices(
-            weekday=[app_commands.Choice(name=name, value=i) for i, name in enumerate(WEEKDAYS)]
+            weekday=[app_commands.Choice(name=name, value=i) for i, name in enumerate(WEEKDAYS)],
+            notifications=[
+                app_commands.Choice(name="끄기", value="off"),
+                app_commands.Choice(name="켜기", value="on"),
+            ],
         )
-        @app_commands.rename(seminar_time="세미나시간")
+        @app_commands.rename(
+            seminar_time="세미나시간", notifications="알림", reminder_start_date="알림시작일"
+        )
         @app_commands.describe(
             weekday="세미나 요일",
             channel="알림을 보낼 채널",
@@ -475,6 +490,8 @@ class SeminarBot(discord.Client):
             evening="저녁 자료 요청 HH:MM",
             timezone="시간대 (기본 Asia/Seoul)",
             seminar_time="매주 세미나 시작 시각 HH:MM (필수, 예: 14:00)",
+            notifications="알림 끄기/켜기 (생략하면 기존 설정 유지, 최초 OFF)",
+            reminder_start_date="처음 알림을 켤 때 기준으로 삼을 등록된 회차 날짜 YYYY-MM-DD",
         )
         async def configure(
             interaction: discord.Interaction,
@@ -484,7 +501,14 @@ class SeminarBot(discord.Client):
             morning: str = "09:00",
             evening: str = "18:00",
             timezone: str = "Asia/Seoul",
+            notifications: str | None = None,
+            reminder_start_date: str | None = None,
         ) -> None:
+            if notifications is not None and notifications not in {"off", "on"}:
+                raise UserError("알림은 끄기 또는 켜기를 선택해주세요.")
+            start_date = (
+                parse_date(reminder_start_date) if reminder_start_date is not None else None
+            )
             if channel.guild.id != interaction.guild_id:
                 raise UserError("현재 서버의 채널을 선택해주세요.")
             permissions = channel.permissions_for(interaction.guild.me)
@@ -510,11 +534,17 @@ class SeminarBot(discord.Client):
                     evening,
                     timezone,
                     seminar_time=seminar_time,
+                    notifications_enabled=notifications == "on"
+                    if notifications is not None
+                    else None,
+                    reminder_start_date=start_date,
                 )
                 config = self.store.require_config(interaction.guild_id)
             text = (
                 f"{safe(weekly_schedule(config))}\n"
                 f"알림: 아침 {config['morning']} / 저녁 {config['evening']}\n"
+                f"알림 상태: {'ON' if config['notifications_enabled'] else 'OFF'} · "
+                f"알림 시작일: {config['reminder_start_date'] or '미설정'}\n"
                 f"알림 채널: {channel.mention}"
             )
             if delta:
@@ -866,6 +896,9 @@ class SeminarBot(discord.Client):
                 "**서버 관리자**\n"
                 "`/설정` 요일·**세미나시간**(매주 고정 시작 시각, 필수)·알림 채널 지정\n"
                 "아침 알림·저녁 자료 요청 시각은 세미나 시작 시각과 별도로 지정합니다.\n"
+                "알림은 기본 OFF. `/설정`의 `알림`(켜기/끄기)으로 변경하며 생략하면 기존 상태를 유지합니다.\n"
+                "처음 켤 때 `알림시작일`에 등록된 회차 날짜를 지정하세요.\n"
+                "미제출 요청은 시작일 이후 미완료 회차에 하루 1건, 회차별 한 번만 보냅니다.\n"
                 "발표 순서는 NAS의 `config/rotation.json`의 `presenters`에서 편집 (서버 한 곳이면 서버 ID 불필요)\n"
                 "파일 저장 후 30초 안에 적용하며 `/일정`을 열 때도 확인합니다.\n"
                 "`/스왑` 두 날짜의 발표자 교환 · `/연기` 해당 주 휴강 + 이후 전체 1주 연기"

@@ -87,6 +87,21 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             seminar_page_url="https://example.test/internal/seminars/",
         )
 
+    def enable_notifications(self):
+        config = self.bot.store.require_config(1)
+        self.bot.store.configure(
+            1,
+            config["channel_id"],
+            config["upload_channel_id"],
+            config["weekday"],
+            config["morning"],
+            config["evening"],
+            config["timezone"],
+            NOW,
+            notifications_enabled=True,
+            reminder_start_date=DAY,
+        )
+
     async def test_configure_requires_korean_seminar_time_and_exposes_only_one_channel(self):
         command = self.bot.tree.get_command("설정")
         options = command.to_dict(self.bot.tree)["options"]
@@ -107,6 +122,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             response = interaction.followup.send.await_args.args[0]
             self.assertIn("매주 목요일 14:00 (Asia/Seoul)", response)
             self.assertIn("알림: 아침 09:00 / 저녁 18:00", response)
+            self.assertIn("알림 상태: OFF", response)
             await command.callback(
                 interaction, 3, target, "15:30", morning="08:20", evening="19:10"
             )
@@ -139,6 +155,53 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("매주 목요일 14:00 (Asia/Seoul)", text)
         self.assertIn("알림: 아침 09:00 / 저녁 18:00", text)
         self.assertNotIn("자료:", text)
+        self.assertFalse(config["notifications_enabled"])
+        self.assertIsNone(config["reminder_start_date"])
+
+    async def test_configuration_toggle_is_explicit_preserves_start_date_and_never_resets_schedule(
+        self,
+    ):
+        command = self.bot.tree.get_command("설정")
+        options = {item["name"]: item for item in command.to_dict(self.bot.tree)["options"]}
+        self.assertFalse(options["알림"].get("required", False))
+        self.assertEqual(
+            {item["name"]: item["value"] for item in options["알림"]["choices"]},
+            {"끄기": "off", "켜기": "on"},
+        )
+        self.assertFalse(options["알림시작일"].get("required", False))
+        interaction, target = self.configuration_interaction()
+        before = "\n".join(self.bot.store.db.iterdump())
+        with patch.object(self.bot, "reload_rotation_file", AsyncMock()):
+            for arguments in ({"notifications": "on"}, {"reminder_start_date": "not-a-date"}):
+                with self.subTest(arguments=arguments), self.assertRaises(UserError):
+                    await command.callback(interaction, 3, target, "14:00", **arguments)
+                self.assertEqual("\n".join(self.bot.store.db.iterdump()), before)
+            calendar = [
+                dict(row) for row in self.bot.store.db.execute("SELECT * FROM sessions ORDER BY id")
+            ]
+            await command.callback(
+                interaction, 3, target, "14:00", notifications="on", reminder_start_date=str(DAY)
+            )
+            for arguments, enabled in (
+                ({}, True),
+                ({"notifications": "off"}, False),
+                ({}, False),
+                ({"notifications": "on"}, True),
+            ):
+                await command.callback(interaction, 3, target, "14:00", **arguments)
+                config = self.bot.store.require_config(1)
+                self.assertEqual(bool(config["notifications_enabled"]), enabled)
+                self.assertEqual(config["reminder_start_date"], str(DAY))
+                response = interaction.followup.send.await_args.args[0]
+                self.assertIn("알림 상태: " + ("ON" if enabled else "OFF"), response)
+                self.assertIn(str(DAY), response)
+            self.assertEqual(
+                [
+                    dict(row)
+                    for row in self.bot.store.db.execute("SELECT * FROM sessions ORDER BY id")
+                ],
+                calendar,
+            )
 
     async def test_notification_channel_change_preserves_archive_scope_progress_and_submission_grants(
         self,
@@ -152,6 +215,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         access = SubmissionAccess(self.bot.store)
         invite, _ = access.issue(1, session["id"], 101, now=1_700_000_000, scope="presenter")
         token, _ = access.redeem(invite, 1, now=1_700_000_001)
+        self.enable_notifications()
         self.enable_web_submission()
         settings = self.bot.settings
         tables = (
@@ -192,6 +256,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(self.bot.settings, settings)
 
     async def test_web_submission_notification_uses_main_channel_and_keeps_archive_scope(self):
+        self.enable_notifications()
         main = Mock(spec=discord.TextChannel)
         main.guild = SimpleNamespace(id=1)
         main.send = AsyncMock(return_value=SimpleNamespace(id=902))
@@ -211,6 +276,97 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         main.send.assert_awaited_once()
         archive.send.assert_not_awaited()
         self.assertEqual(self.bot.store.require_config(1)["upload_channel_id"], 1002)
+
+    async def test_default_off_suppresses_all_automatic_sends_without_mutating_existing_data(self):
+        self.enable_web_submission()
+        record = self.seed_legacy_document(kind="slides")
+        session = self.bot.store.session_on(1, DAY)
+        access = SubmissionAccess(self.bot.store)
+        invitation, _ = access.issue(1, session["id"], 101, now=1_700_000_000, scope="presenter")
+        token, _ = access.redeem(invitation, 1, now=1_700_000_001)
+        before = "\n".join(self.bot.store.db.iterdump())
+        path = Path(self.temp.name) / record["file_path"]
+        content = path.read_bytes()
+        with (
+            patch.object(self.bot, "reload_rotation_file", AsyncMock()),
+            patch.object(self.bot, "get_guild", return_value=SimpleNamespace(id=1)),
+            patch.object(self.bot, "get_channel") as channel,
+            patch.object(self.bot, "fetch_channel", AsyncMock()) as fetched,
+            patch("seminar_bot.bot.datetime") as clock,
+        ):
+            clock.now.return_value = datetime(2026, 10, 15, 9, tzinfo=UTC)
+            await self.bot.reminders()
+            with self.assertRaises(UserError):
+                await self.bot.notify_web_submission(
+                    session, self.bot.store.submission(1, session["id"])
+                )
+        channel.assert_not_called()
+        fetched.assert_not_awaited()
+        self.assertEqual("\n".join(self.bot.store.db.iterdump()), before)
+        self.assertEqual(path.read_bytes(), content)
+        self.assertEqual(access.validate(token, 1, now=1_700_000_002)["presenter_id"], 101)
+
+    async def test_oldest_unsubmitted_request_is_once_per_day_and_records_actual_delivery_date(
+        self,
+    ):
+        self.enable_web_submission()
+        self.enable_notifications()
+        # Complete materials in another channel must neither hide this seminar
+        # nor be counted in the progress displayed to the presenter.
+        self.seed_legacy_document(kind="slides")
+        for index in range(1, 4):
+            self.seed_legacy_document(
+                attachment_id=500 + index, title=f"Hidden Source Research Paper {index}"
+            )
+        with self.bot.store.db:
+            self.bot.store.db.execute("UPDATE documents SET source_channel_id=999")
+        channel = Mock(spec=discord.TextChannel)
+        channel.guild = SimpleNamespace(id=1)
+        channel.send = AsyncMock(return_value=SimpleNamespace(id=903))
+        first_day = date(2026, 10, 28)
+        next_day = date(2026, 10, 29)
+        with (
+            patch.object(self.bot, "reload_rotation_file", AsyncMock()),
+            patch.object(self.bot, "get_guild", return_value=SimpleNamespace(id=1)),
+            patch.object(self.bot, "get_channel", return_value=channel),
+            patch("seminar_bot.bot.datetime") as clock,
+        ):
+            clock.now.return_value = datetime(2026, 10, 28, 9, tzinfo=UTC)
+            await self.bot.reminders()
+            await self.bot.reminders()
+            self.assertEqual(channel.send.await_count, 1)
+            first_text = channel.send.await_args.args[0]
+            self.assertIn(str(DAY), first_text)
+            self.assertNotIn("오늘", first_text)
+            self.assertIn("현재: 발표 자료 0개", first_text)
+            self.assertIn("논문 0", first_text)
+            clock.now.return_value = datetime(2026, 10, 29, 9, tzinfo=UTC)
+            await self.bot.reminders()
+            await self.bot.reminders()
+        self.assertEqual(channel.send.await_count, 2)
+        second_text = channel.send.await_args.args[0]
+        self.assertIn(str(DAY + timedelta(weeks=1)), second_text)
+        deliveries = [
+            dict(row)
+            for row in self.bot.store.db.execute(
+                "SELECT session_id,on_date,kind FROM deliveries ORDER BY on_date"
+            )
+        ]
+        self.assertEqual(
+            deliveries,
+            [
+                {
+                    "session_id": self.bot.store.session_on(1, DAY)["id"],
+                    "on_date": str(first_day),
+                    "kind": "evening",
+                },
+                {
+                    "session_id": self.bot.store.session_on(1, DAY + timedelta(weeks=1))["id"],
+                    "on_date": str(next_day),
+                    "kind": "evening",
+                },
+            ],
+        )
 
     async def test_schedule_displays_seminar_time_on_presentations_but_not_cancelled_week(self):
         self.bot.store.configure(
@@ -260,6 +416,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.bot.store.configure(
             1, 1001, 1002, 3, "08:20", "19:10", "Asia/Seoul", NOW, seminar_time="14:00"
         )
+        self.enable_notifications()
         channel = Mock(spec=discord.TextChannel)
         channel.guild = SimpleNamespace(id=1)
         channel.send = AsyncMock(return_value=SimpleNamespace(id=999))
@@ -361,6 +518,8 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("자료 채널", configure)
         self.assertNotIn("자동 등록", text)
         self.assertNotIn("upload_channel", text)
+        for term in ("OFF", "알림시작일", "하루 1건", "회차별 한 번"):
+            self.assertIn(term, text)
 
     async def test_help_without_web_configuration_never_advertises_discord_attachment_submission(
         self,
@@ -961,6 +1120,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_morning_and_evening_mention_only_presenter_and_persist(self):
         self.enable_web_submission()
+        self.enable_notifications()
         channel = Mock(spec=discord.TextChannel)
         channel.guild = SimpleNamespace(id=1)
         channel.send = AsyncMock(return_value=SimpleNamespace(id=999))
@@ -987,6 +1147,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(channel.send.await_count, 2)
 
     async def test_network_error_is_retried_without_marking_sent(self):
+        self.enable_notifications()
         channel = Mock(spec=discord.TextChannel)
         channel.guild = SimpleNamespace(id=1)
         channel.send = AsyncMock(
@@ -1157,6 +1318,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self,
     ):
         self.enable_web_submission()
+        self.enable_notifications()
         channel = Mock(spec=discord.TextChannel)
         channel.guild = SimpleNamespace(id=1)
         channel.send = AsyncMock(return_value=SimpleNamespace(id=1000))
@@ -1181,6 +1343,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
     async def test_evening_without_web_configuration_requests_admin_setup_and_never_channel_upload(
         self,
     ):
+        self.enable_notifications()
         channel = Mock(spec=discord.TextChannel)
         channel.guild = SimpleNamespace(id=1)
         channel.send = AsyncMock(return_value=SimpleNamespace(id=1000))

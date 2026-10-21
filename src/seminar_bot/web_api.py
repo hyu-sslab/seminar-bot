@@ -674,8 +674,12 @@ class SeminarAPI:
                     )
                 ).encode()
             ).hexdigest()
-            notified = self.bot.store.submission_receipt(row["id"]) == signature
-            if not notified:
+            notifications_disabled = not bool(self.config().get("notifications_enabled", False))
+            notified = (
+                not notifications_disabled
+                and self.bot.store.submission_receipt(row["id"]) == signature
+            )
+            if not notifications_disabled and not notified:
                 try:
                     message_id = await self.bot.notify_web_submission(row, status)
                     self.bot.store.mark_submission_receipt(row["id"], signature, message_id)
@@ -689,8 +693,9 @@ class SeminarAPI:
             "session": self.session_data(row, names),
             "submission": progress(status),
             "notification_sent": notified,
+            "notifications_disabled": notifications_disabled,
         }
-        if not notified:
+        if not notified and not notifications_disabled:
             response["notification_warning"] = (
                 "자료 제출은 완료됐지만 Discord 알림을 보내지 못했습니다. 다시 제출을 눌러 알림을 재시도할 수 있습니다."
             )

@@ -7,7 +7,7 @@ import tempfile
 import unittest
 import uuid
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -148,6 +148,20 @@ class WebAPITests(unittest.IsolatedAsyncioTestCase):
         ]:
             response = await self.upload("paper", pdf_bytes(name), name + ".pdf")
             self.assertEqual(response.status, 201, await response.text())
+
+    def configure_notifications(self, enabled):
+        config = self.bot.store.require_config(1)
+        self.bot.store.configure(
+            1,
+            config["channel_id"],
+            config["upload_channel_id"],
+            config["weekday"],
+            config["morning"],
+            config["evening"],
+            config["timezone"],
+            notifications_enabled=enabled,
+            reminder_start_date=date.fromisoformat(self.row["seminar_date"]) if enabled else None,
+        )
 
     async def test_bearer_and_access_auth_protect_schedule_upload_and_download(self):
         for path, method in [
@@ -574,6 +588,7 @@ class WebAPITests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(hidden_path.exists())
 
     async def test_complete_submission_notifies_once_and_repeated_submit_is_idempotent(self):
+        self.configure_notifications(True)
         await self.complete_uploads()
         for _ in range(2):
             response = await self.submit()
@@ -581,9 +596,60 @@ class WebAPITests(unittest.IsolatedAsyncioTestCase):
             payload = await response.json()
             self.assertTrue(payload["submission"]["complete"])
             self.assertTrue(payload["notification_sent"])
+            self.assertFalse(payload["notifications_disabled"])
             self.assertEqual(payload["submission"]["paper_count"], 3)
         self.bot.notify_web_submission.assert_awaited_once()
         self.assertEqual(self.count_documents(), 4)
+
+    async def test_disabled_notifications_complete_submission_without_messages_or_receipts(self):
+        self.assertFalse(self.bot.store.require_config(1)["notifications_enabled"])
+        await self.complete_uploads()
+        for _ in range(2):
+            response = await self.submit()
+            self.assertEqual(response.status, 200)
+            payload = await response.json()
+            self.assertTrue(payload["submission"]["complete"])
+            self.assertFalse(payload["notification_sent"])
+            self.assertTrue(payload["notifications_disabled"])
+            self.assertNotIn("notification_warning", payload)
+        self.bot.notify_web_submission.assert_not_awaited()
+        self.assertIsNone(self.bot.store.submission_receipt(self.row["id"]))
+        self.assertEqual(self.count_documents(), 4)
+
+    async def test_submission_while_disabled_can_notify_once_after_reenabling(self):
+        await self.complete_uploads()
+        disabled = await self.submit()
+        self.assertEqual(disabled.status, 200)
+        self.assertTrue((await disabled.json())["notifications_disabled"])
+        self.assertIsNone(self.bot.store.submission_receipt(self.row["id"]))
+        self.configure_notifications(True)
+        for _ in range(2):
+            response = await self.submit()
+            self.assertEqual(response.status, 200)
+            payload = await response.json()
+            self.assertTrue(payload["notification_sent"])
+            self.assertFalse(payload["notifications_disabled"])
+            self.assertNotIn("notification_warning", payload)
+        self.bot.notify_web_submission.assert_awaited_once()
+        self.assertIsNotNone(self.bot.store.submission_receipt(self.row["id"]))
+
+    async def test_disabling_notifications_preserves_existing_receipt_without_new_message(self):
+        self.configure_notifications(True)
+        await self.complete_uploads()
+        self.assertEqual((await self.submit()).status, 200)
+        receipt = self.bot.store.submission_receipt(self.row["id"])
+        self.assertIsNotNone(receipt)
+        self.configure_notifications(False)
+        response = await self.submit()
+        self.assertEqual(response.status, 200)
+        payload = await response.json()
+        self.assertFalse(payload["notification_sent"])
+        self.assertTrue(payload["notifications_disabled"])
+        self.assertNotIn("notification_warning", payload)
+        self.assertEqual(self.bot.store.submission_receipt(self.row["id"]), receipt)
+        self.configure_notifications(True)
+        self.assertTrue((await (await self.submit()).json())["notification_sent"])
+        self.bot.notify_web_submission.assert_awaited_once()
 
     async def test_duplicate_paper_bytes_count_once_and_incomplete_submit_preserves_uploads(self):
         self.assertEqual((await self.upload()).status, 201)
@@ -601,6 +667,7 @@ class WebAPITests(unittest.IsolatedAsyncioTestCase):
     async def test_notification_failure_is_visible_and_retry_delivers_once_without_duplicate_uploads(
         self,
     ):
+        self.configure_notifications(True)
         await self.complete_uploads()
         self.bot.notify_web_submission.side_effect = [
             RuntimeError("private notification diagnostic"),

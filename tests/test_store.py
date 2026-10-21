@@ -131,7 +131,7 @@ class StoreTests(unittest.TestCase):
         self.store.close()
         self.store = Store(self.path)
         self.assertEqual(self.store.require_config(1)["seminar_time"], "14:30")
-        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 7)
+        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 8)
 
     def test_seminar_time_accepts_midnight_and_last_minute_without_reminder_order_constraints(self):
         for value in ("00:00", "23:59"):
@@ -197,7 +197,7 @@ class StoreTests(unittest.TestCase):
         )
         self.store.close()
         self.store = Store(self.path)
-        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 7)
+        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 8)
         column = next(
             row
             for row in self.store.db.execute("PRAGMA table_info(guilds)")
@@ -216,16 +216,109 @@ class StoreTests(unittest.TestCase):
         with sqlite3.connect(future) as db:
             db.execute("CREATE TABLE sentinel(value TEXT)")
             db.execute("INSERT INTO sentinel VALUES('keep')")
-            db.execute("PRAGMA user_version=8")
+            db.execute("PRAGMA user_version=9")
         with self.assertRaisesRegex(ValueError, "버전"):
             Store(future)
         with sqlite3.connect(future) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 8)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 9)
             self.assertEqual(db.execute("SELECT * FROM sentinel").fetchall(), [("keep",)])
             self.assertEqual(
                 db.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall(),
                 [("sentinel",)],
             )
+
+    def test_schema_seven_upgrade_defaults_notifications_off_and_preserves_history(self):
+        _, token = self.seed_history_and_submission_access()
+        before = self.history()
+        config = self.store.require_config(1)
+        with self.store.db:
+            self.store.db.execute("ALTER TABLE guilds DROP COLUMN notifications_enabled")
+            self.store.db.execute("ALTER TABLE guilds DROP COLUMN reminder_start_date")
+            self.store.db.execute("PRAGMA user_version=7")
+        self.store.close()
+        self.store = Store(self.path)
+        self.assertEqual(self.store.require_config(1), config)
+        self.assertEqual(self.store.require_config(1)["notifications_enabled"], 0)
+        self.assertIsNone(self.store.require_config(1)["reminder_start_date"])
+        self.assertEqual(self.history(), before)
+        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 8)
+        self.assertEqual(
+            SubmissionAccess(self.store).validate(token, 1, now=1_700_000_003)["presenter_id"], 101
+        )
+
+    def test_notification_toggle_and_omission_preserve_schedule_progress_and_access(self):
+        _, token = self.seed_history_and_submission_access()
+        before = self.history()
+        original = self.store.require_config(1)
+        self.store.configure(
+            1,
+            1001,
+            1002,
+            3,
+            "09:00",
+            "18:00",
+            "Asia/Seoul",
+            NOW,
+            notifications_enabled=True,
+            reminder_start_date=TODAY,
+        )
+        self.configure(1)
+        enabled = {**original, "notifications_enabled": 1, "reminder_start_date": str(TODAY)}
+        self.assertEqual(self.store.require_config(1), enabled)
+        self.store.configure(
+            1,
+            1001,
+            1002,
+            3,
+            "09:00",
+            "18:00",
+            "Asia/Seoul",
+            NOW,
+            notifications_enabled=False,
+        )
+        self.assertEqual(self.store.require_config(1), {**enabled, "notifications_enabled": 0})
+        self.configure(1)
+        self.assertEqual(self.store.require_config(1), {**enabled, "notifications_enabled": 0})
+        self.store.configure(
+            1,
+            1001,
+            1002,
+            3,
+            "09:00",
+            "18:00",
+            "Asia/Seoul",
+            NOW,
+            notifications_enabled=True,
+        )
+        self.assertEqual(self.store.require_config(1), enabled)
+        self.assertEqual(self.history(), before)
+        self.assertEqual(
+            SubmissionAccess(self.store).validate(token, 1, now=1_700_000_003)["presenter_id"], 101
+        )
+
+    def test_invalid_notification_settings_cannot_partially_change_guild_or_history(self):
+        before = self.history()
+        config = self.store.require_config(1)
+        for kwargs in (
+            {"notifications_enabled": True},
+            {"notifications_enabled": 1},
+            {"notifications_enabled": "on"},
+            {"notifications_enabled": True, "reminder_start_date": TODAY + timedelta(days=1)},
+            {"reminder_start_date": str(TODAY)},
+            {"reminder_start_date": NOW},
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaises(UserError):
+                self.store.configure(1, 2001, 2002, 4, "08:00", "19:00", "UTC", NOW, **kwargs)
+            self.assertEqual(self.store.require_config(1), config)
+            self.assertEqual(self.history(), before)
+
+    def test_swap_preserves_evening_request_cap_but_allows_new_morning_speaker_notice(self):
+        one = self.store.session_on(1, TODAY)
+        self.store.mark_sent(one["id"], str(TODAY), "morning", 1)
+        self.store.mark_sent(one["id"], str(TODAY), "evening", 2)
+        self.store.swap(1, TODAY, TODAY + timedelta(weeks=1), TODAY)
+        self.assertFalse(self.store.was_sent(one["id"], str(TODAY), "morning"))
+        self.assertTrue(self.store.was_sent(one["id"], str(TODAY), "evening"))
 
     def test_postpone_moves_entire_schedule_and_generation_cursor(self):
         before = self.store.upcoming(1, TODAY, 20)

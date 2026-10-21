@@ -214,7 +214,7 @@ class SubmissionAccessStoreTests(unittest.TestCase):
         self.access = SubmissionAccess(self.store)
         self.assertEqual(self.store.document(1, record_id), original)
         self.assertEqual(self.store.session(1, self.row["id"]), self.row)
-        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 7)
+        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 8)
         invitation, _ = self.issue()
         grant, _ = self.access.redeem(invitation, 1, now=101)
         self.assertEqual(self.access.validate(grant, 1, now=102)["session_id"], self.row["id"])
@@ -389,6 +389,18 @@ class SubmissionAccessAPITests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_owned_uploads_and_completed_submit_retries_preserve_scope_and_retention(self):
+        config = self.bot.store.require_config(1)
+        self.bot.store.configure(
+            1,
+            config["channel_id"],
+            config["upload_channel_id"],
+            config["weekday"],
+            config["morning"],
+            config["evening"],
+            config["timezone"],
+            notifications_enabled=True,
+            reminder_start_date=date.fromisoformat(self.row["seminar_date"]),
+        )
         grant = await self.grant()
 
         async def extract(path, filename, data):
