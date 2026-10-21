@@ -7,8 +7,10 @@ services:
       - .env
     environment:
       DATA_DIR: /app/data
+      ROTATION_FILE: /app/config/rotation.json
     volumes:
       - seminar-data:/app/data
+      - ./config:/app/config:ro
     stop_grace_period: 20s
 
 volumes:

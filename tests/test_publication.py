@@ -49,6 +49,8 @@ class PublicationTests(unittest.TestCase):
             "compose.override.yaml",
             "uploads/result.txt",
             "nested/.env.example",
+            "config/rotation.json",
+            "config/rotation.json.tmp",
         ):
             with self.subTest(name=name):
                 path = self.root / name

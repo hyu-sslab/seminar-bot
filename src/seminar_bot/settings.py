@@ -13,6 +13,7 @@ class Settings:
     data_dir: Path
     guild_id: int | None = None
     max_file_mb: int = 20
+    rotation_file: Path = Path("config/rotation.json")
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -27,4 +28,10 @@ class Settings:
         guild_id = int(guild) if guild else None
         if guild_id is not None and guild_id <= 0:
             raise ValueError("DISCORD_GUILD_ID는 양수여야 합니다.")
-        return cls(token, Path(os.getenv("DATA_DIR", "./data")).resolve(), guild_id, max_mb)
+        return cls(
+            token,
+            Path(os.getenv("DATA_DIR", "./data")).resolve(),
+            guild_id,
+            max_mb,
+            Path(os.getenv("ROTATION_FILE", "config/rotation.json")).resolve(),
+        )

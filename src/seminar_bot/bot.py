@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 
 import discord
@@ -11,9 +10,10 @@ from discord import app_commands
 from discord.ext import tasks
 
 from .archive import extract_saved
+from .rotation import apply_rotation, read_rotations
 from .scheduling import due_reminders
 from .settings import Settings
-from .store import Store, UserError, local_now, next_weekday, parse_date, parse_time
+from .store import Store, UserError, local_now, parse_date
 from .submissions import classify_document, submission_summary
 
 log = logging.getLogger(__name__)
@@ -135,6 +135,7 @@ class SeminarBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
         self.schedule_lock = asyncio.Lock()
         self.upload_slots = asyncio.Semaphore(2)
+        self.rotation_errors: dict[int | None, str] = {}
         self._register_commands()
         self.tree.error(self.on_command_error)
         self.add_dynamic_items(DocumentKindButton)
@@ -162,6 +163,10 @@ class SeminarBot(discord.Client):
 
     @tasks.loop(seconds=30)
     async def reminders(self) -> None:
+        try:
+            await self.reload_rotation_file()
+        except Exception:
+            log.exception("Presenter JSON reload failed; keeping existing schedule and retrying")
         for config in self.store.all_configs():
             if self.get_guild(config["guild_id"]) is None:
                 continue
@@ -205,6 +210,57 @@ class SeminarBot(discord.Client):
                 log.exception(
                     "Reminder failed for guild %s; will retry next tick", config["guild_id"]
                 )
+
+    async def reload_rotation_file(self) -> None:
+        try:
+            rotations = await asyncio.to_thread(read_rotations, self.settings.rotation_file)
+        except (UserError, OSError) as exc:
+            message = str(exc)
+            if self.rotation_errors.get(None) != message:
+                log.warning("Presenter JSON not applied; keeping existing schedule: %s", message)
+                self.rotation_errors[None] = message
+            return
+        self.rotation_errors.pop(None, None)
+        for rotation in rotations:
+            guild_id = rotation.guild_id
+            if self.store.rotation_fingerprint(guild_id) == rotation.fingerprint:
+                self.rotation_errors.pop(guild_id, None)
+                continue
+            guild = self.get_guild(guild_id)
+            if guild is None:
+                message = "JSON의 서버 ID를 확인하고 해당 서버에 봇을 초대해주세요."
+                if self.rotation_errors.get(guild_id) != message:
+                    log.warning("Presenter JSON not applied for guild %s: %s", guild_id, message)
+                    self.rotation_errors[guild_id] = message
+                continue
+            try:
+                self.store.require_config(guild_id)
+                # Resolve only configured members; no privileged member-list intent.
+                for user_id in rotation.presenters:
+                    member = guild.get_member(user_id)
+                    if member is None:
+                        try:
+                            member = await guild.fetch_member(user_id)
+                        except discord.NotFound as exc:
+                            raise UserError(
+                                "발표자 user_id 중 서버에 없는 계정이 있습니다."
+                            ) from exc
+                    if member.bot:
+                        raise UserError("봇 계정은 발표자로 등록할 수 없습니다.")
+                async with self.schedule_lock:
+                    start = apply_rotation(self.store, rotation, datetime.now(UTC))
+                self.rotation_errors.pop(guild_id, None)
+                if start is not None:
+                    log.info("Presenter JSON applied for guild %s from %s", guild_id, start)
+            except (UserError, discord.HTTPException) as exc:
+                message = str(exc)
+                if self.rotation_errors.get(guild_id) != message:
+                    log.warning(
+                        "Presenter JSON not applied for guild %s; keeping existing schedule: %s",
+                        guild_id,
+                        message,
+                    )
+                    self.rotation_errors[guild_id] = message
 
     @reminders.before_loop
     async def before_reminders(self) -> None:
@@ -392,66 +448,19 @@ class SeminarBot(discord.Client):
             text = f"{WEEKDAYS[weekday]} · {morning}/{evening} ({safe(timezone)})\n알림: {channel.mention} · 자료: {upload_channel.mention}"
             if delta:
                 text += f"\n기존 미래 일정도 새 요일에 맞춰 {delta}일 뒤로 이동했습니다."
-            text += "\n/순서설정 으로 발표자를 순서대로 등록해주세요."
+            await self.reload_rotation_file()
+            text += "\n발표 순서는 NAS의 config/rotation.json에서 관리합니다. 파일 저장 후 30초 안에 반영됩니다."
+            if self.rotation_errors.get(None) or self.rotation_errors.get(interaction.guild_id):
+                text += "\n⚠️ 발표 순서 파일을 적용하지 못했습니다. NAS의 봇 로그를 확인해주세요."
             await interaction.followup.send(text, ephemeral=True)
-
-        @tree.command(
-            name="순서설정", description="발표자를 멘션 순서대로 반복 등록합니다 (미래 순서 재설정)"
-        )
-        @app_commands.guild_only()
-        @app_commands.default_permissions(manage_guild=True)
-        @app_commands.checks.has_permissions(manage_guild=True)
-        @app_commands.describe(
-            presenters="발표 순서대로 @멤버를 나열하세요",
-            start_date="첫 발표일 YYYY-MM-DD (생략: 가장 가까운 세미나 요일)",
-        )
-        async def rotation(
-            interaction: discord.Interaction, presenters: str, start_date: str | None = None
-        ) -> None:
-            config = self.store.require_config(interaction.guild_id)
-            matches = re.findall(r"<@!?(\d+)>", presenters)
-            if not matches or re.sub(r"<@!?\d+>", "", presenters).strip(" ,\n\t"):
-                raise UserError("발표자는 @멤버 멘션을 공백으로 구분해 입력해주세요.")
-            member_ids = [int(value) for value in matches]
-            if len(member_ids) > 100 or len(set(member_ids)) != len(member_ids):
-                raise UserError("발표자는 중복 없이 1~100명까지 등록할 수 있습니다.")
-            await interaction.response.defer(ephemeral=True)
-            # Slash string mentions need no privileged member-list intent; fetch only given IDs.
-            for user_id in member_ids:
-                member = interaction.guild.get_member(user_id)
-                if member is None:
-                    try:
-                        member = await interaction.guild.fetch_member(user_id)
-                    except discord.NotFound as exc:
-                        raise UserError(
-                            f"이 서버에서 <@{user_id}> 멤버를 찾을 수 없습니다."
-                        ) from exc
-                if member.bot:
-                    raise UserError("봇 계정은 발표자로 등록할 수 없습니다.")
-            async with self.schedule_lock:
-                config = self.store.require_config(interaction.guild_id)
-                current = local_now(config)
-                today = current.date()
-                start = (
-                    parse_date(start_date) if start_date else next_weekday(today, config["weekday"])
-                )
-                if (
-                    not start_date
-                    and start == today
-                    and current.time() >= parse_time(config["evening"])
-                ):
-                    start += timedelta(weeks=1)
-                self.store.set_rotation(interaction.guild_id, member_ids, start, today)
-            await interaction.followup.send(
-                f"{start.isoformat()}부터 {len(member_ids)}명이 입력 순서대로 매주 반복 발표합니다. /일정 에서 확인하세요.",
-                ephemeral=True,
-            )
 
         @tree.command(name="일정", description="다가오는 발표자와 휴강일을 확인합니다")
         @app_commands.guild_only()
         async def schedule(
             interaction: discord.Interaction, weeks: app_commands.Range[int, 1, 20] = 8
         ) -> None:
+            await interaction.response.defer()
+            await self.reload_rotation_file()
             config = self.store.require_config(interaction.guild_id)
             today = local_now(config).date()
             async with self.schedule_lock:
@@ -459,7 +468,7 @@ class SeminarBot(discord.Client):
                 holidays = self.store.holidays(interaction.guild_id, today)
             if not rows:
                 raise UserError(
-                    "아직 발표 순서가 없습니다. 서버 관리자가 /순서설정 을 사용해주세요."
+                    "아직 발표 순서가 없습니다. 서버의 config/rotation.json에 발표자를 등록해주세요."
                 )
             items = [(row["seminar_date"], f"<@{row['presenter_id']}>") for row in rows]
             items.extend(
@@ -471,8 +480,14 @@ class SeminarBot(discord.Client):
             embed = discord.Embed(title="🗓️ 세미나 일정", description=text, color=0x5B8DEF)
             embed.set_footer(
                 text=f"{config['timezone']} · 아침 {config['morning']} / 저녁 {config['evening']}"
+                + (
+                    " · 발표 순서 파일 적용 오류: NAS 로그 확인"
+                    if self.rotation_errors.get(None)
+                    or self.rotation_errors.get(interaction.guild_id)
+                    else ""
+                )
             )
-            await interaction.response.send_message(embed=embed)
+            await interaction.followup.send(embed=embed)
 
         @tree.command(name="스왑", description="두 날짜의 발표자를 교환합니다 (해당 회차만)")
         @app_commands.guild_only()
@@ -686,7 +701,7 @@ class SeminarBot(discord.Client):
             text = (
                 "**서버 관리자**\n"
                 "`/설정` 요일·시간·알림/자료 채널 지정\n"
-                "`/순서설정` 발표자를 @멘션 순서대로 등록 (반복)\n"
+                "발표 순서는 NAS의 `config/rotation.json`에서 편집 (저장 후 30초 안에 적용)\n"
                 "`/스왑` 두 날짜의 발표자 교환\n"
                 "`/연기` 해당 주 휴강 + 이후 전체 1주 연기\n\n"
                 "**모든 멤버**\n"

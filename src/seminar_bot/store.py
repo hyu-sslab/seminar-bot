@@ -50,7 +50,7 @@ class Store:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.execute("PRAGMA busy_timeout=5000")
-        if self.db.execute("PRAGMA user_version").fetchone()[0] > 2:
+        if self.db.execute("PRAGMA user_version").fetchone()[0] > 3:
             self.db.close()
             raise ValueError("데이터베이스 버전이 봇보다 새롭습니다. 봇을 업데이트해주세요.")
         self.db.executescript("""
@@ -112,6 +112,10 @@ class Store:
             );
             CREATE INDEX IF NOT EXISTS document_guild ON documents(guild_id, id);
             CREATE INDEX IF NOT EXISTS document_session ON documents(session_id);
+            CREATE TABLE IF NOT EXISTS rotation_file_state (
+                guild_id INTEGER PRIMARY KEY REFERENCES guilds(guild_id),
+                fingerprint TEXT NOT NULL
+            );
         """)
         columns = {row["name"] for row in self.db.execute("PRAGMA table_info(documents)")}
         with self.db:
@@ -139,7 +143,7 @@ class Store:
                         "UPDATE documents SET kind=?, classification_reason=? WHERE id=?",
                         (classification.kind, classification.reason, record["id"]),
                     )
-            self.db.execute("PRAGMA user_version=2")
+            self.db.execute("PRAGMA user_version=3")
 
     def close(self) -> None:
         self.db.close()
@@ -234,7 +238,38 @@ class Store:
             )
         return len(rows)
 
-    def set_rotation(self, guild_id: int, presenters: list[int], start: date, today: date) -> None:
+    def rotation_fingerprint(self, guild_id: int) -> str | None:
+        row = self.db.execute(
+            "SELECT fingerprint FROM rotation_file_state WHERE guild_id=?", (guild_id,)
+        ).fetchone()
+        return row["fingerprint"] if row else None
+
+    def session_has_activity(self, session_id: int) -> bool:
+        row = self.db.execute(
+            "SELECT EXISTS(SELECT 1 FROM documents WHERE session_id=?) "
+            "OR EXISTS(SELECT 1 FROM deliveries WHERE session_id=?)",
+            (session_id, session_id),
+        ).fetchone()
+        return bool(row[0])
+
+    def remember_rotation_file(self, guild_id: int, fingerprint: str) -> None:
+        # Caller owns the transaction, so the imported rotation and fingerprint
+        # commit together. Unchanged files must not undo swaps or holidays.
+        self.db.execute(
+            "INSERT INTO rotation_file_state(guild_id, fingerprint) VALUES(?,?) "
+            "ON CONFLICT(guild_id) DO UPDATE SET fingerprint=excluded.fingerprint",
+            (guild_id, fingerprint),
+        )
+
+    def set_rotation(
+        self,
+        guild_id: int,
+        presenters: list[int],
+        start: date,
+        today: date,
+        *,
+        fingerprint: str | None = None,
+    ) -> None:
         config = self.require_config(guild_id)
         if not presenters or len(presenters) > 100 or len(set(presenters)) != len(presenters):
             raise UserError("발표자는 중복 없이 1~100명까지 등록할 수 있습니다.")
@@ -267,6 +302,8 @@ class Store:
                 "UPDATE guilds SET rotation=?, next_date=?, next_index=0 WHERE guild_id=?",
                 (json.dumps(presenters), start.isoformat(), guild_id),
             )
+            if fingerprint is not None:
+                self.remember_rotation_file(guild_id, fingerprint)
         self.ensure_horizon(guild_id, today)
 
     def ensure_horizon(self, guild_id: int, today: date, count: int = 12) -> None:
@@ -346,7 +383,7 @@ class Store:
     ) -> tuple[date, int]:
         upcoming = self.upcoming(guild_id, today)
         if not upcoming:
-            raise UserError("먼저 /순서설정 명령어로 발표자를 등록해주세요.")
+            raise UserError("먼저 서버의 config/rotation.json 파일에 발표 순서를 등록해주세요.")
         start = from_date or date.fromisoformat(upcoming[0]["seminar_date"])
         if start < today or self.session_on(guild_id, start) is None:
             raise UserError(

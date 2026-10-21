@@ -62,3 +62,6 @@ logs
 *.sql
 *.log
 *.out
+config
+rotation.json
+rotation.*.json

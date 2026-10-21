@@ -70,3 +70,9 @@ logs/
 *.out
 *.coverage
 htmlcov/
+
+# Real presenter IDs/names stay on the deployment host.
+rotation.json
+rotation.*.json
+!rotation.example.json
+/config/rotation.json*

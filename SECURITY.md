@@ -4,6 +4,9 @@
 GitHub 토큰, SSH 키, NAS 접속 주소·계정, 운영 DB, 업로드한 논문·발표 자료,
 로그와 백업은 넣지 마세요. 이슈·PR·로그 캡처에도 같은 원칙을 적용합니다.
 
+실제 발표자의 Discord ID·이름이 담긴 `config/rotation.json`과 임시 파일도
+Git과 이미지에서 제외합니다. 공개 예시에는 실제 연구실 명단을 쓰지 마세요.
+
 `.gitignore`와 `.dockerignore`는 로컬 설정, 키, DB, PDF/PPT/PPTX, 업로드·백업
 디렉터리를 제외합니다. `.env.example`은 공개 가능한 고정 예시만 허용합니다.
 이미 추적 중인 파일이나 `git add -f`로 추가한 파일은 ignore만으로 막을 수

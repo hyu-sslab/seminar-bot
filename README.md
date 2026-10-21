@@ -7,7 +7,7 @@
 1. [Discord Developer Portal](https://discord.com/developers/applications)에서 애플리케이션을 만들고 **Bot** 페이지에서 봇 토큰을 발급합니다.
 2. **Bot → Privileged Gateway Intents → Message Content Intent**를 켭니다. 이 봇은 일반 채널 메시지의 첨부파일을 받아야 하므로 이 설정이 필요합니다. [Discord의 Message Content Intent 설명](https://docs.discord.com/developers/events/gateway#message-content-intent)
 3. **Installation** 또는 **OAuth2 → URL Generator**에서 서버 설치 링크를 만듭니다. 범위는 `bot`, `applications.commands`를 선택합니다. 봇 권한은 **View Channels, Send Messages, Read Message History, Embed Links**를 허용합니다. 알림 채널과 업로드 채널에서도 이 권한이 있어야 합니다. Administrator 권한은 필요하지 않습니다. [Discord 공식 설치 안내](https://docs.discord.com/developers/quick-start/getting-started#installing-your-app)
-4. 링크로 연구실 서버에 봇을 초대합니다. 서버 설정과 발표 순서를 바꿀 사람에게는 Discord의 **서버 관리(Manage Server)** 권한이 있어야 합니다.
+4. 링크로 연구실 서버에 봇을 초대합니다. Discord에서 설정·스왑·연기를 사용할 사람에게는 **서버 관리(Manage Server)** 권한이 있어야 합니다. 전체 발표 순서는 NAS 파일 편집 권한이 있는 사람이 JSON으로 관리합니다.
 
 이 프로젝트는 Discord Gateway에 연결하므로 공개 웹 서버나 Interactions Endpoint URL을 설정하지 않아도 됩니다. 서버 멤버는 명령어를 사용할 채널에서 **Use Application Commands** 권한이 있어야 합니다.
 
@@ -37,6 +37,7 @@ python -m seminar_bot
 | `DATA_DIR` | `./data` | SQLite, 원본 첨부파일, 실행 잠금 저장 위치 |
 | `MAX_FILE_MB` | `20` | 파일 1개당 보관 한도(MiB), 1~100 설정 가능. Discord 업로드 한도는 별도 |
 | `LOG_LEVEL` | `INFO` | 로그 수준 |
+| `ROTATION_FILE` | `config/rotation.json` | 발표 순서 JSON 경로. Compose에서는 `/app/config/rotation.json`으로 지정 |
 
 ## 처음 설정하기
 
@@ -44,20 +45,59 @@ python -m seminar_bot
 
 ```text
 /설정 weekday:목요일 channel:#세미나 upload_channel:#발표자료 morning:09:00 evening:18:00 timezone:Asia/Seoul
-/순서설정 presenters:@철수 @영희 @민수 start_date:2026-10-22
-/일정 weeks:8
 ```
 
-발표자는 입력한 순서로 매주 한 명씩 돌아갑니다. `start_date`는 오늘 이후이면서 설정한 세미나 요일이어야 합니다. 생략하면 가장 가까운 세미나 요일부터 시작합니다. 오늘이 세미나 요일이고 저녁 요청 시간 전이면 오늘부터, 저녁 요청 시간이 지났으면 다음 주부터 시작합니다.
+발표 순서는 `/순서설정` 명령어 대신 NAS 프로젝트 폴더의 **`config/rotation.json`**에서 관리합니다. 처음 한 번 아래 절차로 파일을 만들고, 이후에는 VS Code로 JSON만 수정하면 됩니다. 봇이 파일 저장 후 **30초 안에 변경을 확인**하며 `/일정`을 열 때도 확인합니다. 재시작이나 이미지 재빌드는 필요하지 않습니다.
 
-이미 운영 중인 상태에서 `/순서설정`을 다시 사용하면 지정한 시작일 이후의 발표 순서와 휴강 설정을 새로 만듭니다. 그보다 앞선 일정은 유지합니다. 변경 대상 회차에 연결된 자료나 발송 이력이 있으면 재설정을 거절하므로 그 이후의 시작일을 지정하세요. 시간대는 `Asia/Seoul` 같은 IANA 이름을 사용하고, 시간은 24시간제 `HH:MM`으로 입력합니다. 아침 알림 시간은 저녁 요청 시간보다 빨라야 합니다.
+NAS에서 최신 코드를 받은 뒤 최초 한 번 실행합니다. 기존 봇을 잠시 중지하고 기존 DB의 순서를 JSON으로 내보냅니다. 기존 일정·스왑·휴강·자료는 유지하며 이미 JSON이 있으면 덮어쓰지 않습니다. 기존 명단이 없으면 `{"guilds": {}}`로 생성됩니다.
+
+```bash
+cd "$HOME/seminar-bot"
+sudo docker compose build
+sudo docker compose stop seminar-bot
+if [ ! -f config/rotation.json ]; then
+  sudo docker compose run --rm --no-deps -T seminar-bot python -m seminar_bot.rotation > config/rotation.json.tmp &&
+    mv config/rotation.json.tmp config/rotation.json
+fi
+sudo docker compose up -d
+```
+
+로컬 Python 실행 환경에서는 `python -m seminar_bot.rotation > config/rotation.json`으로 내보낼 수 있습니다. 먼저 봇을 중지하고 기존 JSON을 덮어쓰지 않도록 확인하세요. 빈 명단으로 처음 시작할 경우 `cp -n config/rotation.example.json config/rotation.json`으로 만들 수도 있습니다.
+
+JSON의 예시입니다. 아래 ID는 예시이므로 실제 서버 ID와 사용자 ID로 바꾸세요. Discord **사용자 설정 → 고급 → 개발자 모드**를 켠 뒤 서버 아이콘과 사용자 프로필의 우클릭 메뉴에서 각각 **서버 ID 복사**, **사용자 ID 복사**로 확인할 수 있습니다.
+
+```json
+{
+  "guilds": {
+    "123456789012345678": {
+      "start_date": null,
+      "presenters": [
+        {"user_id": "234567890123456789", "name": "철수"},
+        {"user_id": "345678901234567890", "name": "영희"},
+        {"user_id": "456789012345678901", "name": "민수"}
+      ]
+    }
+  }
+}
+```
+
+- `guilds`의 키는 Discord 서버 ID입니다. `/설정`을 마친 서버에 적용되며 여러 서버도 각각 등록할 수 있습니다.
+- `presenters`의 배열 순서대로 매주 한 명씩 반복합니다. **변경 후 첫 발표자로 삼을 사람을 배열 맨 앞**에 둡니다. `user_id`는 숫자 문자열이어야 하며 중복·봇 계정·해당 서버에 없는 계정은 거절합니다. `name`은 생략 가능한 관리용 이름으로, 멘션과 일정에는 ID를 사용합니다.
+- `start_date: null` 또는 항목 생략 시 다음 예정 회차부터 새 배열을 적용합니다. 기존 휴강일은 건너뜁니다. 오늘 발표의 알림을 이미 보냈거나 자료가 연결되어 있으면 다음 회차부터, 오늘 저녁 요청 시간이 지났으면 다음 주부터 적용합니다.
+- 적용일을 직접 정하려면 `start_date`를 `"2026-10-22"`처럼 지정합니다. 오늘 이후이며 설정한 세미나 요일이어야 합니다. 전체 순서를 다시 바꾸는 시점에 지난 날짜가 남아 있으면 수정하거나 `null`로 바꾸세요.
+- **전체 순서가 바뀌면 적용일 이후 발표 일정과 휴강 설정을 새로 만듭니다.** 변경 범위에 자료나 발송 이력이 있으면 적용을 거절하므로 그 이후 날짜를 지정하세요. 적용일 이전의 일정·자료는 유지합니다.
+- 파일의 명단·적용일이 같으면 재적용하지 않습니다. 파일 저장·재시작·이름 수정만으로 기존 `/스왑`, `/연기` 결과를 되돌리지 않습니다. 서버 항목을 파일에서 지우는 것만으로 기존 일정을 삭제하지 않습니다.
+- JSON 문법, ID, 적용일 등에 오류가 있으면 해당 변경을 적용하지 않고 기존 일정으로 운영합니다. `sudo docker compose logs --tail=100 seminar-bot`에서 이유를 확인하세요. `/일정`에도 파일 적용 오류 여부를 표시합니다.
+
+실제 `config/rotation.json`과 임시 파일은 Git과 이미지에서 제외합니다. 호스트의 `config` 디렉터리 전체를 컨테이너에 읽기 전용으로 연결하여 VS Code의 파일 교체 저장도 반영합니다. 명단은 DB·자료와 함께 별도로 백업하세요.
+
+등록 후 Discord에서 `/일정 weeks:8`로 확인합니다. 시간대는 `Asia/Seoul` 같은 IANA 이름을 사용하고, 시간은 24시간제 `HH:MM`으로 입력합니다. 아침 알림 시간은 저녁 요청 시간보다 빨라야 합니다.
 
 `/설정`에서 요일을 바꾸면 오늘을 포함한 앞으로의 발표와 휴강일을 새 요일에 맞춰 0~6일 뒤로 이동합니다. 발표 순서와 연결된 자료는 유지합니다.
 
 | 명령어 | 기능 | 권한 |
 | --- | --- | --- |
 | `/설정` | 요일, 채널, 알림 시간, 시간대 지정 | 서버 관리 |
-| `/순서설정 presenters start_date` | 발표자 멘션 목록으로 반복 순서 설정 | 서버 관리 |
 | `/일정 weeks` | 앞으로 1~20주 표시, 기본 8주 | 모든 멤버 |
 | `/스왑 first_date second_date` | 두 날짜의 발표자 교환 | 서버 관리 |
 | `/연기 from_date` | 해당 회차를 한 주 휴강하고 이후 일정을 모두 7일 이동 | 서버 관리 |
@@ -68,7 +108,7 @@ python -m seminar_bot
 | `/자료분류 record_id kind` | 발표 자료·논문 PDF·분류 미확정으로 수정 | 업로더 또는 서버 관리 |
 | `/도움말` | 사용법 표시 | 모든 멤버 |
 
-날짜는 `YYYY-MM-DD` 형식입니다. `presenters`는 한 입력란에 실제 사용자 멘션을 공백으로 구분해서 입력합니다. 스왑은 선택한 두 회차에만 적용되고 반복 명단 자체는 유지합니다. 미리 올려 연결한 자료도 발표자를 따라 교환된 날짜로 이동합니다.
+날짜는 `YYYY-MM-DD` 형식입니다. 스왑은 선택한 두 회차에만 적용되고 JSON의 반복 명단 자체는 유지합니다. 미리 올려 연결한 자료도 발표자를 따라 교환된 날짜로 이동합니다.
 
 ```text
 /스왑 first_date:2026-10-22 second_date:2026-10-29
@@ -124,7 +164,7 @@ python -m seminar_bot
 
 Discord 전송 직후 이력을 저장하기 전에 프로세스가 강제로 종료되면 드물게 중복될 수 있습니다. 동일한 데이터 디렉터리를 사용하는 프로세스는 운영체제 파일 잠금으로 한 개만 실행합니다. 여러 복제본이나 별도 데이터 디렉터리로 같은 토큰을 동시에 실행하지 마세요. 예약 시각에 알림을 보내려면 호스트와 봇이 실행 중이어야 합니다.
 
-기존 v1 데이터베이스는 시작할 때 v2로 자동 갱신합니다. 일정과 자료를 삭제하지 않고 기존 파일 정보를 바탕으로 분류를 추정합니다. 기존 PDF가 잘못 분류되거나 분류 미확정이면 `/자료분류`로 정리할 수 있습니다.
+기존 v1/v2 데이터베이스는 시작할 때 v3로 자동 갱신합니다. 일정과 자료를 유지하며, 이전 자료의 분류 정보가 없으면 파일 정보를 바탕으로 분류를 추정합니다. 기존 PDF가 잘못 분류되거나 분류 미확정이면 `/자료분류`로 정리할 수 있습니다. v3에는 JSON 적용 이력을 추가해 재시작 시 같은 명단을 다시 적용하지 않습니다.
 
 ## 검증
 

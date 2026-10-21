@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import re
 import tempfile
 import unittest
@@ -35,13 +36,97 @@ def pdf_bytes(title="한글 연구 논문 Attention Study"):
 class BotTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
-        self.bot = SeminarBot(Settings("test-token-not-used", Path(self.temp.name)))
+        self.bot = SeminarBot(
+            Settings(
+                "test-token-not-used",
+                Path(self.temp.name),
+                rotation_file=Path(self.temp.name) / "rotation.json",
+            )
+        )
         self.bot.store.configure(1, 1001, 1002, 3, "09:00", "18:00", "Asia/Seoul", NOW)
         self.bot.store.set_rotation(1, [101, 102], DAY, DAY)
 
     async def asyncTearDown(self):
         await self.bot.close()
         self.temp.cleanup()
+
+    def write_rotation(self, ids=(102, 101)):
+        self.bot.settings.rotation_file.write_text(
+            json.dumps(
+                {"guilds": {"1": {"presenters": [{"user_id": str(user_id)} for user_id in ids]}}}
+            )
+        )
+
+    async def test_rotation_command_is_replaced_by_file(self):
+        self.assertIsNone(self.bot.tree.get_command("순서설정"))
+        self.assertEqual(len(self.bot.tree.get_commands()), 10)
+
+    async def test_schedule_acknowledges_before_json_member_validation(self):
+        interaction = SimpleNamespace(
+            guild_id=1,
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+
+        async def reload():
+            interaction.response.defer.assert_awaited_once()
+
+        with patch.object(self.bot, "reload_rotation_file", side_effect=reload):
+            await self.bot.tree.get_command("일정").callback(interaction)
+        self.assertIn("embed", interaction.followup.send.await_args.kwargs)
+
+    async def test_json_hot_reload_validates_members_and_applies_order(self):
+        self.write_rotation()
+        guild = SimpleNamespace(
+            get_member=Mock(return_value=None),
+            fetch_member=AsyncMock(return_value=SimpleNamespace(bot=False)),
+        )
+        with (
+            patch.object(self.bot, "get_guild", return_value=guild),
+            patch("seminar_bot.bot.datetime") as clock,
+        ):
+            clock.now.return_value = NOW
+            await self.bot.reload_rotation_file()
+            self.assertEqual(self.bot.store.session_on(1, DAY)["presenter_id"], 102)
+            self.assertEqual(guild.fetch_member.await_count, 2)
+            self.bot.store.postpone(1, DAY)
+            await self.bot.reload_rotation_file()
+            self.assertIsNone(self.bot.store.session_on(1, DAY))
+            self.assertEqual(guild.fetch_member.await_count, 2)
+
+    async def test_invalid_json_keeps_existing_schedule_and_logs_once(self):
+        self.bot.settings.rotation_file.write_text("{")
+        before = self.bot.store.upcoming(1, DAY)
+        with self.assertLogs("seminar_bot.bot", level="WARNING") as logs:
+            await self.bot.reload_rotation_file()
+            await self.bot.reload_rotation_file()
+        self.assertEqual(len(logs.output), 1)
+        self.assertEqual(self.bot.store.upcoming(1, DAY), before)
+
+    async def test_bot_presenter_is_rejected_without_changing_schedule(self):
+        self.write_rotation()
+        before = self.bot.store.upcoming(1, DAY)
+        guild = SimpleNamespace(get_member=Mock(return_value=SimpleNamespace(bot=True)))
+        with (
+            patch.object(self.bot, "get_guild", return_value=guild),
+            self.assertLogs("seminar_bot.bot", level="WARNING"),
+        ):
+            await self.bot.reload_rotation_file()
+        self.assertEqual(self.bot.store.upcoming(1, DAY), before)
+
+    async def test_nonmember_presenter_is_rejected_without_changing_schedule(self):
+        self.write_rotation()
+        before = self.bot.store.upcoming(1, DAY)
+        error = discord.NotFound(SimpleNamespace(status=404, reason="Not Found"), "unknown member")
+        guild = SimpleNamespace(
+            get_member=Mock(return_value=None), fetch_member=AsyncMock(side_effect=error)
+        )
+        with (
+            patch.object(self.bot, "get_guild", return_value=guild),
+            self.assertLogs("seminar_bot.bot", level="WARNING"),
+        ):
+            await self.bot.reload_rotation_file()
+        self.assertEqual(self.bot.store.upcoming(1, DAY), before)
 
     def message(self, data=None, filename="paper.pdf", attachment_id=500):
         data = data if data is not None else pdf_bytes()

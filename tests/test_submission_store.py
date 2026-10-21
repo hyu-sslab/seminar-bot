@@ -141,8 +141,8 @@ class SubmissionStoreTests(unittest.TestCase):
         self.assertEqual(self.store.document(1, paper_id)["file_path"], old_file)
         self.assertEqual(self.store.document(1, paper_id)["session_id"], self.session["id"])
         self.assertTrue(self.store.was_sent(self.session["id"], DAY.isoformat(), "morning"))
-        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 2)
-        # Opening v2 again must preserve manual corrections.
+        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 3)
+        # Opening the migrated database again must preserve manual corrections.
         self.store.classify(1, paper_id, "slides", 101, False)
         self.store.close()
         self.store = Store(self.path)
