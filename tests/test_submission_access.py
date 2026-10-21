@@ -214,7 +214,7 @@ class SubmissionAccessStoreTests(unittest.TestCase):
         self.access = SubmissionAccess(self.store)
         self.assertEqual(self.store.document(1, record_id), original)
         self.assertEqual(self.store.session(1, self.row["id"]), self.row)
-        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 5)
+        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 6)
         invitation, _ = self.issue()
         grant, _ = self.access.redeem(invitation, 1, now=101)
         self.assertEqual(self.access.validate(grant, 1, now=102)["session_id"], self.row["id"])
@@ -306,6 +306,14 @@ class SubmissionAccessAPITests(unittest.IsolatedAsyncioTestCase):
                 "session_id": self.row["id"],
                 "version": session_version(self.row),
                 "expires_at": data["expires_at"],
+                "sessions": [
+                    {
+                        "id": self.row["id"],
+                        "seminar_date": self.row["seminar_date"],
+                        "version": session_version(self.row),
+                    }
+                ],
+                "max_file_mb": 20,
             },
         )
         self.assertEqual(context.headers["Cache-Control"], "private, no-store")

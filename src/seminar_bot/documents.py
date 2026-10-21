@@ -12,7 +12,9 @@ import re
 import unicodedata
 import zipfile
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import PurePosixPath
+from urllib.parse import unquote, urlsplit
 from xml.etree import ElementTree
 
 from pypdf import PdfReader
@@ -65,6 +67,68 @@ class DocumentInfo:
     sha256: str
     extraction_method: str
     warning: str | None = None
+
+
+def validate_paper_fields(payload: dict, *, slides: bool = False) -> dict:
+    """Validate user-entered metadata without fetching any DOI or URL."""
+    allowed = {"title"} if slides else {"title", "venue", "year", "doi", "link"}
+    if not isinstance(payload, dict) or not set(payload) <= allowed or "title" not in payload:
+        raise ValueError("논문 제목과 올바른 정보 항목을 입력해주세요.")
+
+    def text(name: str, limit: int, required: bool = False) -> str | None:
+        value = payload.get(name)
+        if value is None and not required:
+            return None
+        if not isinstance(value, str) or any(
+            ord(char) < 32 or ord(char) == 127 or 0xD800 <= ord(char) <= 0xDFFF for char in value
+        ):
+            raise ValueError("정보에 제어 문자 또는 잘못된 값을 사용할 수 없습니다.")
+        value = " ".join(value.split())
+        if len(value) > limit or required and not value:
+            raise ValueError(f"{name} 항목의 길이를 확인해주세요.")
+        return value or None
+
+    result = {"title": text("title", 500, True)}
+    if slides:
+        return result
+    # PATCH is a full metadata form: omitted optional fields are cleared.
+    result["venue"] = text("venue", 200)
+    year = payload.get("year")
+    if year in (None, ""):
+        year = None
+    elif type(year) is not int or not 1000 <= year <= datetime.now(UTC).year + 2:
+        raise ValueError("발표 연도는 1000년부터 현재 연도 + 2년 사이의 정수로 입력해주세요.")
+    result["year"] = year
+    doi = text("doi", 2048)
+    if doi:
+        doi = unquote(
+            re.sub(r"^(?:https?://(?:dx\.)?doi\.org/|doi\s*:\s*)", "", doi, flags=re.I)
+        ).casefold()
+        if (
+            len(doi) > 255
+            or not re.fullmatch(r"10\.[0-9]{4,9}/[^\s<>\"\\]+", doi)
+            or any(ord(char) < 32 or ord(char) == 127 for char in doi)
+        ):
+            raise ValueError("DOI 형식을 확인해주세요. 예: 10.1234/paper")
+    result["doi"] = doi
+    link = text("link", 2048)
+    if link:
+        try:
+            parsed = urlsplit(link)
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError("논문 링크를 확인해주세요.") from exc
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username
+            or parsed.password
+            or port not in {None, 443}
+            or any(char.isspace() for char in link)
+        ):
+            raise ValueError("논문 링크는 계정 정보가 없는 HTTPS 주소로 입력해주세요.")
+    result["link"] = link
+    return result
 
 
 class _ExtractionLimit(ValueError):

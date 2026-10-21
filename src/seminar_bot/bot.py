@@ -252,7 +252,7 @@ class SeminarBot(discord.Client):
                                     if destination
                                     else f"<#{config['upload_channel_id']}>에 공유해주세요.\n"
                                 )
-                                + "발표 자료 **PDF/PPT/PPTX 1개 이상** + 참고한 **서로 다른 논문 PDF 3개 이상**이 필요합니다.\n"
+                                + "발표 자료 **PDF/PPT/PPTX 1개 이상** + 참고한 **서로 다른 논문 3편 이상**이 필요합니다. 논문은 PDF 업로드 또는 웹에서 직접 입력할 수 있습니다.\n"
                                 "한 번에 올리거나 나누어 올려도 회차별로 누적합니다.\n"
                                 + submission_summary(status)
                             )
@@ -304,7 +304,7 @@ class SeminarBot(discord.Client):
         return await extract_saved(path, filename, data)
 
     def source_url(self, record: dict) -> str:
-        if record.get("source_type") == "web" and record.get("session_id"):
+        if record.get("source_type") in {"web", "manual"} and record.get("session_id"):
             return self.settings.submission_url(record["session_id"]) or record["message_url"]
         return record["message_url"]
 
@@ -718,8 +718,16 @@ class SeminarBot(discord.Client):
                     linked = f"{status}: {row['seminar_date']} · <@{row['presenter_id']}>"
                 else:
                     linked = "발표 회차 미연결"
-                author = "회차 발표자" if row.get("source_type") == "web" else "업로더"
-                value = f"구분: {KIND_LABELS[row['kind']]}\n{linked}\n파일: {safe(row['filename'], 160)}\n[원본 업로드]({self.source_url(row)}) · {author} <@{row['uploader_id']}>"
+                author = "회차 발표자" if row.get("source_type") in {"web", "manual"} else "업로더"
+                manual = row.get("source_type") == "manual"
+                source = (
+                    "직접 입력한 논문 정보" if manual else f"파일: {safe(row['filename'], 160)}"
+                )
+                value = f"구분: {'논문 정보' if manual else KIND_LABELS[row['kind']]}\n{linked}\n{source}\n[발표 회차]({self.source_url(row)}) · {author} <@{row['uploader_id']}>"
+                if row.get("venue") or row.get("year"):
+                    value += "\n" + safe(
+                        " · ".join(str(row[key]) for key in ("venue", "year") if row.get(key)), 220
+                    )
                 if row["doi"]:
                     value += f"\nDOI: {safe(row['doi'], 255)}"
                 if row["arxiv_id"]:
@@ -826,7 +834,9 @@ class SeminarBot(discord.Client):
                     local_now(config).date(),
                     parse_date(seminar_date) if seminar_date else None,
                 )
-                token, _ = access.issue(interaction.guild_id, session["id"], interaction.user.id)
+                token, _ = access.issue(
+                    interaction.guild_id, session["id"], interaction.user.id, scope="presenter"
+                )
             view = discord.ui.View()
             view.add_item(
                 discord.ui.Button(
@@ -836,15 +846,16 @@ class SeminarBot(discord.Client):
             )
             await interaction.followup.send(
                 f"**{session['seminar_date']} 발표 자료 제출**\n"
-                "아래 버튼으로 본인 제출 페이지를 바로 열 수 있습니다.\n"
+                "아래 버튼으로 본인 발표 회차를 선택하고 자료를 제출·수정할 수 있습니다.\n"
                 "링크는 15분 안에 한 번만 열 수 있고, 열린 페이지는 1시간 동안 사용할 수 있습니다.\n"
-                "새 링크를 발급하면 같은 회차의 이전 링크와 제출 페이지는 만료됩니다. 링크를 다른 사람에게 공유하지 마세요.",
+                "새 링크를 발급하면 이전 링크와 제출 페이지는 만료됩니다. 링크를 다른 사람에게 공유하지 마세요.",
                 view=view,
                 ephemeral=True,
             )
 
         @tree.command(
-            name="제출현황", description="발표 자료 1개와 논문 PDF 3개 이상이 제출됐는지 확인합니다"
+            name="제출현황",
+            description="발표 자료 1개와 서로 다른 논문 3편 이상이 제출됐는지 확인합니다",
         )
         @app_commands.guild_only()
         @app_commands.describe(seminar_date="발표 날짜 YYYY-MM-DD (생략: 오늘 또는 최근/다음 회차)")
@@ -899,7 +910,8 @@ class SeminarBot(discord.Client):
                 "**모든 멤버**\n"
                 "`/일정` 발표자와 휴강일 확인\n"
                 "`/제출` 본인 회차의 임시 웹 제출 링크 받기 (로그인 없이 파일 업로드)\n"
-                "자료 채널에 **발표 자료 PDF/PPT/PPTX + 논문 PDF 3개 이상** 업로드 → 회차별 누적 기록\n"
+                "발표 자료 **PDF/PPT/PPTX 1개 이상** + **서로 다른 논문 3편 이상** 제출\n"
+                "논문은 자료 채널에 PDF 업로드하거나 웹에서 제목·학회·연도·DOI·링크 직접 입력\n"
                 "구분이 애매한 PDF는 업로드 아래 버튼으로 **발표 자료 / 논문 PDF** 선택\n"
                 "`/제출현황` 부족한 자료 확인 · `/자료분류` 구분 수정\n"
                 "`/검색` 논문 검색 (kind:전체 로 발표 자료도 검색)\n"

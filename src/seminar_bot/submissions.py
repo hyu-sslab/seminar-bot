@@ -78,6 +78,8 @@ def _extension(record: dict) -> str:
 
 
 def _sha(record: dict) -> str:
+    if record.get("source_type") == "manual":
+        return ""
     return str(record.get("sha256") or "").strip().casefold()
 
 
@@ -92,7 +94,20 @@ def _paper_identity_keys(record: dict, index: int) -> set[tuple[str, str]]:
         arxiv = re.sub(r"^(?:https?://arxiv\.org/(?:abs|pdf)/|arxiv\s*:\s*)", "", arxiv)
         arxiv = re.sub(r"(?:v\d+)?(?:\.pdf)?$", "", arxiv)
         keys.add(("arxiv", arxiv))
-    if record.get("extraction_method") == "pdf_metadata":
+    if link := str(record.get("link") or "").strip().casefold():
+        match = re.fullmatch(
+            r"https://arxiv\.org/(?:abs|pdf)/((?:\d{4}\.\d{4,5}|[a-z][a-z.\-]+/\d{7}))(?:v\d+)?(?:\.pdf)?(?:[?#].*)?",
+            link,
+        )
+        if match:
+            keys.add(("arxiv", match.group(1)))
+    if record.get("source_type") == "manual" or record.get("extraction_method") == "user_metadata":
+        if title := (
+            normalize_title(str(record.get("title") or ""))
+            or str(record.get("title") or "").strip().casefold()
+        ):
+            keys.add(("title", title))
+    elif record.get("extraction_method") == "pdf_metadata":
         raw_title = str(record.get("title") or "").strip()
         title = normalize_title(raw_title)
         if (
@@ -172,18 +187,19 @@ def submission_summary(status: dict) -> str:
     complete = slides >= 1 and missing_papers == 0
 
     lines = [
-        f"제출 기준: 발표 자료 1개 이상 + 서로 다른 논문 PDF {MIN_PAPERS}개 이상",
-        f"현재: 발표 자료 {slides}개 · 논문 PDF {papers}개",
+        f"제출 기준: 발표 자료 1개 이상 + 서로 다른 논문 {MIN_PAPERS}편 이상 (PDF 또는 직접 입력)",
+        f"현재: 발표 자료 {slides}개 · 논문 {papers}편",
     ]
     if complete:
-        lines.append("제출 완료: 발표 자료와 논문 PDF 제출 기준을 충족했습니다.")
+        lines.append("제출 완료: 발표 자료와 논문 제출 기준을 충족했습니다.")
     else:
         missing = []
         if not slides:
             missing.append("발표 자료 1개")
         if missing_papers:
-            missing.append(f"서로 다른 논문 PDF {missing_papers}개")
-        lines.append("제출 대기: " + ", ".join(missing) + "가 더 필요합니다.")
+            missing.append(f"서로 다른 논문 {missing_papers}편")
+        particle = "가" if missing[-1].endswith("개") else "이"
+        lines.append("제출 대기: " + ", ".join(missing) + particle + " 더 필요합니다.")
     if unknown:
         lines.append(f"분류 확인 대기: {unknown}개 (제출 수에 포함되지 않음)")
     return "\n".join(lines)

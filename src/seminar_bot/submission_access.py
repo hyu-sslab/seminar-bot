@@ -97,30 +97,54 @@ class SubmissionAccess:
             (guild_id, presenter_id, today.isoformat()),
         ).fetchone()
         if not row:
-            raise UserError(
-                "본인의 발표 일정이 없습니다. 서버 관리자에게 발표 순서를 확인해주세요."
-            )
+            row = self.store.db.execute(
+                "SELECT * FROM sessions WHERE guild_id=? AND presenter_id=? ORDER BY seminar_date DESC LIMIT 1",
+                (guild_id, presenter_id),
+            ).fetchone()
+            if not row:
+                raise UserError(
+                    "본인의 발표 일정이 없습니다. 서버 관리자에게 발표 순서를 확인해주세요."
+                )
         return dict(row)
 
+    def sessions(self, grant: dict) -> list[dict]:
+        if grant["scope"] == "session":
+            return [self.store.session(grant["guild_id"], grant["session_id"])]
+        return [
+            dict(row)
+            for row in self.store.db.execute(
+                "SELECT * FROM sessions WHERE guild_id=? AND presenter_id=? ORDER BY seminar_date",
+                (grant["guild_id"], grant["presenter_id"]),
+            )
+        ]
+
     def issue(
-        self, guild_id: int, session_id: int, presenter_id: int, *, now: int | None = None
+        self,
+        guild_id: int,
+        session_id: int,
+        presenter_id: int,
+        *,
+        now: int | None = None,
+        scope: str = "session",
     ) -> tuple[str, int]:
         stamp = int(time.time()) if now is None else now
         row = self.store.session(guild_id, session_id)
         config = self.store.require_config(guild_id)
         if row["presenter_id"] != presenter_id:
             raise UserError("본인의 발표 회차에만 제출 링크를 만들 수 있습니다.")
+        if scope not in {"session", "presenter"}:
+            raise ValueError("Invalid submission scope")
         token = secrets.token_urlsafe(32)
         expires_at = stamp + INVITATION_TTL
         with self.store.db:
             self._prune(stamp)
             for table in ("submission_invitations", "submission_grants"):
                 self.store.db.execute(
-                    f"DELETE FROM {table} WHERE guild_id=? AND presenter_id=? AND session_id=?",
-                    (guild_id, presenter_id, session_id),
+                    f"DELETE FROM {table} WHERE guild_id=? AND presenter_id=?",
+                    (guild_id, presenter_id),
                 )
             self.store.db.execute(
-                "INSERT INTO submission_invitations VALUES(?,?,?,?,?,?,?)",
+                "INSERT INTO submission_invitations(token_hash,guild_id,session_id,presenter_id,upload_channel_id,session_version,expires_at,scope) VALUES(?,?,?,?,?,?,?,?)",
                 (
                     self._hash(token),
                     guild_id,
@@ -129,6 +153,7 @@ class SubmissionAccess:
                     config["upload_channel_id"],
                     session_version(row),
                     expires_at,
+                    scope,
                 ),
             )
         return token, expires_at
@@ -152,7 +177,7 @@ class SubmissionAccess:
             access_token = secrets.token_urlsafe(32)
             expires_at = stamp + GRANT_TTL
             self.store.db.execute(
-                "INSERT INTO submission_grants VALUES(?,?,?,?,?,?,?)",
+                "INSERT INTO submission_grants(token_hash,guild_id,session_id,presenter_id,upload_channel_id,session_version,expires_at,scope) VALUES(?,?,?,?,?,?,?,?)",
                 (
                     self._hash(access_token),
                     guild_id,
@@ -161,6 +186,7 @@ class SubmissionAccess:
                     grant["upload_channel_id"],
                     grant["session_version"],
                     expires_at,
+                    grant["scope"],
                 ),
             )
         return access_token, expires_at

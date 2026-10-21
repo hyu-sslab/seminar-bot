@@ -490,7 +490,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             "2026-10-22",
         )
         self.assertIn("발표 자료", interaction.followup.send.await_args.args[0])
-        self.assertIn("논문 PDF 3개", interaction.followup.send.await_args.args[0])
+        self.assertIn("논문 3편", interaction.followup.send.await_args.args[0])
 
     async def test_other_member_cannot_classify_with_button(self):
         message, _ = self.message(filename="ambiguous.pdf")
@@ -544,7 +544,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             await self.bot.reminders()
         text = channel.send.await_args.args[0]
         self.assertIn("PDF/PPT/PPTX 1개 이상", text)
-        self.assertIn("논문 PDF 3개 이상", text)
+        self.assertIn("논문 3편 이상", text)
         self.assertIn("현재: 발표 자료 0개", text)
         self.assertIn("<@101>", text)
 

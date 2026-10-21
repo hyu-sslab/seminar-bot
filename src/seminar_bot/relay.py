@@ -40,6 +40,7 @@ _REQUEST_HEADERS = {
     "idempotency-key",
     "x-seminar-version",
     "x-seminar-submission-token",
+    "x-document-version",
 }
 _RESPONSE_HEADERS = {
     "content-type",
@@ -67,6 +68,13 @@ def validated_request(method: object, path: object, headers: object) -> tuple[di
         allowed_method, query_keys, maximum = "PUT", {"kind"}, MAX_BODY_BYTES
     elif re.fullmatch(rf"/v1/sessions/{_ID}/submit", parsed.path):
         allowed_method, query_keys, maximum = "POST", set(), 4096
+    elif re.fullmatch(rf"/v1/sessions/{_ID}/papers", parsed.path):
+        allowed_method, query_keys, maximum = "POST", set(), 8192
+    elif re.fullmatch(rf"/v1/sessions/{_ID}/documents/{_ID}", parsed.path):
+        if method not in {"PATCH", "DELETE"}:
+            raise RelayProtocolError("Invalid request")
+        allowed_method, query_keys = method, set()
+        maximum = 8192 if method == "PATCH" else 1024
     elif parsed.path == "/v1/submission/redeem":
         allowed_method, query_keys, maximum = "POST", set(), 4096
     elif parsed.path == "/v1/search":

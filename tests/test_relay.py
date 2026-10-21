@@ -35,6 +35,27 @@ class _Peer:
 
 
 class RelayValidationTests(unittest.TestCase):
+    def test_document_edits_are_limited_to_fixed_routes_and_bounded_bodies(self):
+        for method, path, maximum in (
+            ("POST", "/v1/sessions/1/papers", 8192),
+            ("PATCH", "/v1/sessions/1/documents/2", 8192),
+            ("DELETE", "/v1/sessions/1/documents/2", 1024),
+        ):
+            with self.subTest(method=method):
+                headers, limit = validated_request(method, path, {"x-document-version": "a" * 64})
+                self.assertEqual(limit, maximum)
+                self.assertEqual(headers["x-document-version"], "a" * 64)
+        for method, path in (
+            ("PUT", "/v1/sessions/1/papers"),
+            ("POST", "/v1/sessions/1/documents/2"),
+            ("PATCH", "/v1/sessions/1/documents/2?target=http://other-host"),
+            ("DELETE", "/v1/documents/2"),
+            ("PATCH", "/v1/sessions/1/documents/0"),
+            ("DELETE", "/v1/sessions/1/documents/../2"),
+        ):
+            with self.subTest(method=method, path=path), self.assertRaises(RelayProtocolError):
+                validated_request(method, path, {})
+
     def test_submission_routes_are_small_and_do_not_accept_destinations(self):
         token = "A" * 43
         headers, maximum = validated_request(

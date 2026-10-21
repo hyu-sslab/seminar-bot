@@ -18,6 +18,7 @@ from urllib.parse import quote, unquote
 from aiohttp import web
 
 from .access import AccessUnavailable, AccessVerifier
+from .documents import DocumentInfo, validate_paper_fields
 from .rotation import read_rotations
 from .store import UserError, local_now
 from .submission_access import SubmissionAccess, SubmissionAccessDenied, session_version
@@ -39,6 +40,40 @@ def check_version(request, row: dict) -> None:
         raise APIError(
             409, "발표 일정이 변경되었습니다. 회차와 발표자를 다시 확인해주세요.", "session_changed"
         )
+
+
+def document_version(record: dict) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            {
+                key: record.get(key)
+                for key in (
+                    "id",
+                    "attachment_id",
+                    "upload_key",
+                    "uploaded_at",
+                    "source_type",
+                    "filename",
+                    "session_id",
+                    "presenter_id",
+                    "seminar_date",
+                    "uploader_id",
+                    "source_channel_id",
+                    "title",
+                    "venue",
+                    "year",
+                    "doi",
+                    "arxiv_id",
+                    "link",
+                    "kind",
+                    "sha256",
+                    "edit_revision",
+                )
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+        ).encode()
+    ).hexdigest()
 
 
 def progress(status: dict) -> dict:
@@ -101,6 +136,15 @@ class SeminarAPI:
                 web.get("/v1/sessions/{session_id:[1-9][0-9]{0,18}}", self.session),
                 web.put("/v1/sessions/{session_id:[1-9][0-9]{0,18}}/documents", self.upload),
                 web.post("/v1/sessions/{session_id:[1-9][0-9]{0,18}}/submit", self.submit),
+                web.post("/v1/sessions/{session_id:[1-9][0-9]{0,18}}/papers", self.manual_paper),
+                web.patch(
+                    "/v1/sessions/{session_id:[1-9][0-9]{0,18}}/documents/{document_id:[1-9][0-9]{0,18}}",
+                    self.edit_document,
+                ),
+                web.delete(
+                    "/v1/sessions/{session_id:[1-9][0-9]{0,18}}/documents/{document_id:[1-9][0-9]{0,18}}",
+                    self.delete_document,
+                ),
                 web.get("/v1/search", self.search),
                 web.get("/v1/documents/{document_id:[1-9][0-9]{0,18}}/file", self.download),
             ]
@@ -129,20 +173,23 @@ class SeminarAPI:
             if "X-Seminar-Submission-Token" in request.headers:
                 await self.bot.reload_rotation_file()
                 async with self.bot.schedule_lock:
-                    grant = self._submission_scope(request)
+                    self._submission_scope(request)
                     allowed = (
                         request.method == "GET" and request.path == "/v1/submission/context"
                     ) or any(
-                        request.method == method
-                        and request.path == f"/v1/sessions/{grant['session_id']}{suffix}"
-                        for method, suffix in (
-                            ("GET", ""),
-                            ("PUT", "/documents"),
-                            ("POST", "/submit"),
+                        request.method == method and re.fullmatch(pattern, request.path)
+                        for method, pattern in (
+                            ("GET", r"/v1/sessions/[1-9][0-9]{0,18}"),
+                            ("PUT", r"/v1/sessions/[1-9][0-9]{0,18}/documents"),
+                            ("POST", r"/v1/sessions/[1-9][0-9]{0,18}/(?:submit|papers)"),
+                            ("PATCH", r"/v1/sessions/[1-9][0-9]{0,18}/documents/[1-9][0-9]{0,18}"),
+                            ("DELETE", r"/v1/sessions/[1-9][0-9]{0,18}/documents/[1-9][0-9]{0,18}"),
                         )
                     )
                     if not allowed:
                         raise APIError(403, "이 링크로는 본인의 자료만 제출할 수 있습니다.")
+                    if request.path != "/v1/submission/context":
+                        self._session(request)
             response = await handler(request)
         except SubmissionAccessDenied as exc:
             response = web.json_response({"error": str(exc)}, status=401)
@@ -177,6 +224,64 @@ class SeminarAPI:
     def config(self) -> dict:
         return self.bot.store.require_config(self.guild_id)
 
+    def _check_upload_deleted(self, key: str) -> None:
+        if self.bot.store.web_upload_deleted(self.guild_id, key):
+            raise APIError(
+                409,
+                "이 자료는 삭제되었습니다. 새 파일 또는 새 논문으로 등록해주세요.",
+                "document_changed",
+            )
+
+    def _require_submission(self, request) -> dict:
+        grant = self._submission_scope(request)
+        if grant is None:
+            raise SubmissionAccessDenied()
+        return grant
+
+    async def _json_body(self, request, maximum: int = 8192) -> dict:
+        if request.content_type != "application/json":
+            raise APIError(415, "JSON 형식으로 요청해주세요.")
+        if request.content_length is not None and request.content_length > maximum:
+            raise APIError(413, "요청이 너무 큽니다.")
+        body = bytearray()
+        async with asyncio.timeout(10):
+            async for chunk in request.content.iter_chunked(1024):
+                body.extend(chunk)
+                if len(body) > maximum:
+                    raise APIError(413, "요청이 너무 큽니다.")
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (ValueError, UnicodeError) as exc:
+            raise APIError(400, "요청 형식을 확인해주세요.") from exc
+        if not isinstance(payload, dict):
+            raise APIError(400, "요청 형식을 확인해주세요.")
+        return payload
+
+    def _editable_document(self, request, session: dict, grant: dict) -> dict:
+        try:
+            document_id = int(request.match_info["document_id"])
+            if document_id > 2**63 - 1:
+                raise ValueError
+            record = self.bot.store.document(self.guild_id, document_id)
+        except (ValueError, UserError) as exc:
+            raise APIError(404, "자료를 찾을 수 없습니다.") from exc
+        if (
+            record["session_id"] != session["id"]
+            or record["source_channel_id"] != self.config()["upload_channel_id"]
+        ):
+            raise APIError(404, "자료를 찾을 수 없습니다.")
+        if record["uploader_id"] != grant["presenter_id"]:
+            raise APIError(
+                409, "직접 등록한 자료만 수정하거나 삭제할 수 있습니다.", "document_not_editable"
+            )
+        if request.headers.get("X-Document-Version") != document_version(record):
+            raise APIError(
+                409,
+                "자료 정보가 변경되었습니다. 새로고침 후 다시 확인해주세요.",
+                "document_changed",
+            )
+        return record
+
     def _submission_scope(self, request) -> dict | None:
         if "X-Seminar-Submission-Token" not in request.headers:
             return None
@@ -190,9 +295,14 @@ class SeminarAPI:
             value = int(request.match_info["session_id"])
             if value > 2**63 - 1:
                 raise ValueError
-            if grant is not None and grant["session_id"] != value:
+            row = self.bot.store.session(self.guild_id, value)
+            if grant is not None and (
+                row["presenter_id"] != grant["presenter_id"]
+                or grant["scope"] == "session"
+                and grant["session_id"] != value
+            ):
                 raise APIError(403, "이 링크로는 본인의 자료만 제출할 수 있습니다.")
-            return self.bot.store.session(self.guild_id, value)
+            return row
         except (UserError, ValueError) as exc:
             raise APIError(404, "해당 발표 회차를 찾을 수 없습니다.") from exc
 
@@ -227,7 +337,9 @@ class SeminarAPI:
             "version": session_version(row),
         }
 
-    def document_data(self, record: dict, names: dict[int, str]) -> dict:
+    def document_data(
+        self, record: dict, names: dict[int, str], presenter_id: int | None = None
+    ) -> dict:
         result = {
             key: record.get(key)
             for key in (
@@ -240,11 +352,16 @@ class SeminarAPI:
                 "warning",
                 "session_id",
                 "seminar_date",
+                "venue",
+                "year",
+                "link",
             )
         }
         result["source"] = record.get("source_type", "discord")
         result["file_available"] = bool(record.get("file_path"))
         result["presenter_name"] = names.get(record.get("presenter_id"), "")
+        result["revision"] = document_version(record)
+        result["editable"] = record.get("uploader_id") == presenter_id
         return result
 
     async def health(self, request):
@@ -277,11 +394,21 @@ class SeminarAPI:
             grant = self._submission_scope(request)
             if grant is None:
                 raise SubmissionAccessDenied()
+            rows = self.submission_access.sessions(grant)
         return web.json_response(
             {
                 "session_id": grant["session_id"],
                 "version": grant["session_version"],
                 "expires_at": grant["expires_at"],
+                "sessions": [
+                    {
+                        "id": row["id"],
+                        "seminar_date": row["seminar_date"],
+                        "version": session_version(row),
+                    }
+                    for row in rows
+                ],
+                "max_file_mb": self.max_bytes // (1024 * 1024),
             }
         )
 
@@ -319,7 +446,16 @@ class SeminarAPI:
             {
                 "session": self.session_data(row, names),
                 "submission": progress(status),
-                "documents": [self.document_data(doc, names) for doc in documents],
+                "documents": [
+                    self.document_data(
+                        doc,
+                        names,
+                        row["presenter_id"]
+                        if "X-Seminar-Submission-Token" in request.headers
+                        else None,
+                    )
+                    for doc in documents
+                ],
             }
         )
 
@@ -349,6 +485,7 @@ class SeminarAPI:
         async with self.bot.schedule_lock:
             original = self._session(request)
             check_version(request, original)
+            self._check_upload_deleted(key)
         directory = (
             self.settings.data_dir / "files" / str(self.guild_id)
             if kind == "slides"
@@ -386,6 +523,7 @@ class SeminarAPI:
                     if not valid_header:
                         raise APIError(400, "파일 확장자와 실제 문서 형식이 일치하지 않습니다.")
                     async with self.bot.schedule_lock:
+                        self._check_upload_deleted(key)
                         existing = self.bot.store.web_upload(self.guild_id, key)
                         if existing:
                             check_version(request, self._session(request))
@@ -405,7 +543,13 @@ class SeminarAPI:
                             names = await self.names()
                             return web.json_response(
                                 {
-                                    "document": self.document_data(existing, names),
+                                    "document": self.document_data(
+                                        existing,
+                                        names,
+                                        original["presenter_id"]
+                                        if "X-Seminar-Submission-Token" in request.headers
+                                        else None,
+                                    ),
                                     "submission": progress(status),
                                     "duplicate": True,
                                 }
@@ -415,6 +559,7 @@ class SeminarAPI:
                     async with self.bot.schedule_lock:
                         current = self._session(request)
                         check_version(request, current)
+                        self._check_upload_deleted(key)
                         if (
                             current["presenter_id"] != original["presenter_id"]
                             or current["seminar_date"] != original["seminar_date"]
@@ -465,7 +610,13 @@ class SeminarAPI:
                     names = await self.names()
                     return web.json_response(
                         {
-                            "document": self.document_data(record, names),
+                            "document": self.document_data(
+                                record,
+                                names,
+                                current["presenter_id"]
+                                if "X-Seminar-Submission-Token" in request.headers
+                                else None,
+                            ),
                             "submission": progress(status),
                             "duplicate": not saved,
                         },
@@ -493,7 +644,7 @@ class SeminarAPI:
             if not status["complete"]:
                 return web.json_response(
                     {
-                        "error": "발표 자료 1개 이상과 서로 다른 논문 PDF 3편 이상이 필요합니다. 업로드한 파일은 저장되었습니다.",
+                        "error": "발표 자료 1개 이상과 서로 다른 논문 3편 이상(PDF 또는 직접 입력)이 필요합니다. 등록한 자료는 저장되었습니다.",
                         "submission": progress(status),
                     },
                     status=409,
@@ -503,7 +654,7 @@ class SeminarAPI:
                     (
                         row["presenter_id"],
                         row["seminar_date"],
-                        [(d["id"], d["kind"]) for d in status["documents"]],
+                        [(d["id"], document_version(d)) for d in status["documents"]],
                     )
                 ).encode()
             ).hexdigest()
@@ -528,6 +679,139 @@ class SeminarAPI:
                 "자료 제출은 완료됐지만 Discord 알림을 보내지 못했습니다. 다시 제출을 눌러 알림을 재시도할 수 있습니다."
             )
         return web.json_response(response)
+
+    async def manual_paper(self, request):
+        payload = await self._json_body(request)
+        try:
+            fields = validate_paper_fields(payload)
+            key = str(uuid.UUID(request.headers.get("Idempotency-Key", "")))
+            if request.headers.get("Idempotency-Key", "").lower() != key:
+                raise ValueError("업로드 ID를 확인해주세요.")
+        except ValueError as exc:
+            raise APIError(400, str(exc) or "논문 정보를 확인해주세요.") from exc
+        digest = hashlib.sha256(
+            json.dumps(fields, sort_keys=True, ensure_ascii=False).encode()
+        ).hexdigest()
+        async with self.bot.schedule_lock:
+            grant = self._require_submission(request)
+            row = self._session(request)
+            check_version(request, row)
+            self._check_upload_deleted(key)
+            existing = self.bot.store.web_upload(self.guild_id, key)
+            if existing:
+                if (
+                    existing["session_id"] != row["id"]
+                    or existing["source_channel_id"] != self.config()["upload_channel_id"]
+                    or existing["source_type"] != "manual"
+                    or existing["sha256"] != digest
+                ):
+                    raise APIError(
+                        409,
+                        "업로드 ID가 다른 자료에 사용되었습니다. 다시 등록해주세요.",
+                        "document_changed",
+                    )
+                record = existing
+            else:
+                record_id, _ = self.bot.store.add_document(
+                    self.guild_id,
+                    -(uuid.UUID(key).int % (2**63 - 1) + 1),
+                    grant["presenter_id"],
+                    DocumentInfo(fields["title"], "", fields["doi"], None, digest, "manual"),
+                    "manual-paper.pdf",
+                    "",
+                    self.settings.submission_url(row["id"]),
+                    datetime.now(UTC),
+                    kind="paper",
+                    classification_reason="발표자가 직접 입력한 논문 정보",
+                    session_id=row["id"],
+                    source_type="manual",
+                    upload_key=key,
+                    venue=fields["venue"],
+                    year=fields["year"],
+                    link=fields["link"],
+                )
+                record = self.bot.store.document(self.guild_id, record_id)
+            status = self.status(row["id"])
+        return web.json_response(
+            {
+                "document": self.document_data(record, await self.names(), grant["presenter_id"]),
+                "submission": progress(status),
+                "duplicate": bool(existing),
+            },
+            status=200 if existing else 201,
+        )
+
+    async def edit_document(self, request):
+        payload = await self._json_body(request)
+        async with self.bot.schedule_lock:
+            grant = self._require_submission(request)
+            row = self._session(request)
+            check_version(request, row)
+            record = self._editable_document(request, row, grant)
+            if record["kind"] not in {"paper", "slides"}:
+                raise APIError(
+                    409, "먼저 발표 자료 또는 논문으로 분류해주세요.", "document_not_editable"
+                )
+            try:
+                fields = validate_paper_fields(payload, slides=record["kind"] == "slides")
+            except ValueError as exc:
+                raise APIError(400, str(exc)) from exc
+            record = self.bot.store.update_document_metadata(self.guild_id, record["id"], fields)
+            status = self.status(row["id"])
+        return web.json_response(
+            {
+                "document": self.document_data(record, await self.names(), grant["presenter_id"]),
+                "submission": progress(status),
+            }
+        )
+
+    async def delete_document(self, request):
+        if await self._json_body(request, 1024) != {}:
+            raise APIError(400, "삭제 요청 형식을 확인해주세요.")
+        async with self.bot.schedule_lock:
+            grant = self._require_submission(request)
+            row = self._session(request)
+            check_version(request, row)
+            record = self._editable_document(request, row, grant)
+            quarantined = None
+            path = None
+            if record["file_path"] and not self.bot.store.other_documents_use_file(
+                record["id"], record["file_path"]
+            ):
+                path = (self.settings.data_dir / record["file_path"]).resolve()
+                if not path.is_relative_to((self.settings.data_dir / "files").resolve()):
+                    raise APIError(
+                        503, "보관 파일 경로를 확인할 수 없습니다. 관리자에게 문의해주세요."
+                    )
+                if path.exists():
+                    if not path.is_file():
+                        raise APIError(
+                            503, "보관 파일을 확인할 수 없습니다. 관리자에게 문의해주세요."
+                        )
+                    quarantined = path.with_name(".deleting-" + str(uuid.uuid4()))
+                    try:
+                        path.replace(quarantined)
+                    except OSError as exc:
+                        raise APIError(
+                            503, "보관 파일을 삭제할 수 없습니다. 저장 공간 권한을 확인해주세요."
+                        ) from exc
+            try:
+                self.bot.store.delete_document(self.guild_id, record["id"])
+            except Exception:
+                if quarantined is not None:
+                    quarantined.replace(path)
+                raise
+            if quarantined is not None:
+                try:
+                    quarantined.unlink()
+                except OSError:
+                    log.error("Could not remove quarantined seminar archive file")
+                    raise APIError(
+                        503,
+                        "자료 기록은 삭제됐지만 보관 파일 정리가 필요합니다. 관리자에게 문의해주세요.",
+                    ) from None
+            status = self.status(row["id"])
+        return web.json_response({"submission": progress(status)})
 
     async def search(self, request):
         try:

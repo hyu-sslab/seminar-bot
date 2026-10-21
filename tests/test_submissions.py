@@ -97,10 +97,10 @@ class ClassificationTests(unittest.TestCase):
 class SubmissionSummaryTests(unittest.TestCase):
     def test_empty_submission_requests_both_requirements(self):
         result = submission_summary({})
-        self.assertIn("발표 자료 1개 이상 + 서로 다른 논문 PDF 3개 이상", result)
-        self.assertIn("현재: 발표 자료 0개 · 논문 PDF 0개", result)
+        self.assertIn("발표 자료 1개 이상 + 서로 다른 논문 3편 이상", result)
+        self.assertIn("현재: 발표 자료 0개 · 논문 0편", result)
         self.assertIn("제출 대기", result)
-        self.assertIn("서로 다른 논문 PDF 3개", result)
+        self.assertIn("서로 다른 논문 3편", result)
 
     def test_three_papers_and_slides_complete_submission(self):
         result = submission_summary({"slides": 1, "papers": MIN_PAPERS, "unknown": 0})
@@ -109,7 +109,7 @@ class SubmissionSummaryTests(unittest.TestCase):
 
     def test_unknown_files_do_not_replace_missing_papers(self):
         result = submission_summary({"slides": 1, "papers": 2, "unknown": 4})
-        self.assertIn("서로 다른 논문 PDF 1개가 더 필요", result)
+        self.assertIn("서로 다른 논문 1편이 더 필요", result)
         self.assertIn("분류 확인 대기: 4개", result)
         self.assertNotIn("제출 완료", result)
 

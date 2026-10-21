@@ -50,7 +50,7 @@ class Store:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.execute("PRAGMA busy_timeout=5000")
-        if self.db.execute("PRAGMA user_version").fetchone()[0] > 5:
+        if self.db.execute("PRAGMA user_version").fetchone()[0] > 6:
             self.db.close()
             raise ValueError("데이터베이스 버전이 봇보다 새롭습니다. 봇을 업데이트해주세요.")
         self.db.executescript("""
@@ -121,6 +121,11 @@ class Store:
                 fingerprint TEXT NOT NULL,
                 message_id INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS web_upload_tombstones (
+                guild_id INTEGER NOT NULL REFERENCES guilds(guild_id) ON DELETE CASCADE,
+                upload_key TEXT NOT NULL,
+                PRIMARY KEY(guild_id, upload_key)
+            );
             CREATE TABLE IF NOT EXISTS submission_invitations (
                 token_hash TEXT PRIMARY KEY,
                 guild_id INTEGER NOT NULL REFERENCES guilds(guild_id) ON DELETE CASCADE,
@@ -175,11 +180,26 @@ class Store:
                     "ALTER TABLE documents ADD COLUMN source_type TEXT NOT NULL DEFAULT 'discord'"
                 )
                 self.db.execute("ALTER TABLE documents ADD COLUMN upload_key TEXT")
+            for name, definition in (
+                ("venue", "TEXT"),
+                ("year", "INTEGER"),
+                ("link", "TEXT"),
+                ("edit_revision", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                if name not in columns:
+                    self.db.execute(f"ALTER TABLE documents ADD COLUMN {name} {definition}")
+            for table in ("submission_invitations", "submission_grants"):
+                if "scope" not in {
+                    row["name"] for row in self.db.execute(f"PRAGMA table_info({table})")
+                }:
+                    self.db.execute(
+                        f"ALTER TABLE {table} ADD COLUMN scope TEXT NOT NULL DEFAULT 'session' CHECK(scope IN ('session','presenter'))"
+                    )
             self.db.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS web_upload_key ON documents(guild_id, upload_key) "
                 "WHERE upload_key IS NOT NULL"
             )
-            self.db.execute("PRAGMA user_version=5")
+            self.db.execute("PRAGMA user_version=6")
 
     def close(self) -> None:
         self.db.close()
@@ -330,6 +350,15 @@ class Store:
                 raise UserError(
                     "변경할 일정에 자료 또는 발송 기록이 있습니다. 그 이후 날짜부터 순서를 설정해주세요."
                 )
+            self._revoke_submission_sessions(
+                [
+                    row["id"]
+                    for row in self.db.execute(
+                        "SELECT id FROM sessions WHERE guild_id=? AND seminar_date>=?",
+                        (guild_id, start.isoformat()),
+                    )
+                ]
+            )
             self.db.execute(
                 "DELETE FROM sessions WHERE guild_id=? AND seminar_date>=?",
                 (guild_id, start.isoformat()),
@@ -470,6 +499,12 @@ class Store:
     def _revoke_submission_sessions(self, session_ids: list[int]) -> None:
         """Caller owns the schedule transaction; old links never revive after a swap back."""
         for table in ("submission_invitations", "submission_grants"):
+            for value in session_ids:
+                self.db.execute(
+                    f"DELETE FROM {table} WHERE scope='presenter' AND guild_id IN "
+                    "(SELECT guild_id FROM sessions WHERE id=?)",
+                    (value,),
+                )
             self.db.executemany(
                 f"DELETE FROM {table} WHERE session_id=?", ((value,) for value in session_ids)
             )
@@ -524,10 +559,19 @@ class Store:
         return row["id"]
 
     @staticmethod
-    def _search_text(title: str, filename: str, doi: str | None, arxiv_id: str | None) -> str:
+    def _search_text(
+        title: str,
+        filename: str,
+        doi: str | None,
+        arxiv_id: str | None,
+        venue: str | None = None,
+        year: int | None = None,
+        link: str | None = None,
+    ) -> str:
         # Keep field boundaries so queries cannot accidentally span two field values.
         return "\n".join(
-            normalize_search(value or "") for value in (title, filename, doi, arxiv_id)
+            normalize_search(str(value or ""))
+            for value in (title, filename, doi, arxiv_id, venue, year, link)
         )
 
     def add_document(
@@ -547,14 +591,19 @@ class Store:
         session_id: int | None = None,
         source_type: str = "discord",
         upload_key: str | None = None,
+        venue: str | None = None,
+        year: int | None = None,
+        link: str | None = None,
     ) -> tuple[int, list[dict]]:
         config = self.require_config(guild_id)
         self._validate_kind(kind, filename)
         source_channel_id = source_channel_id or config["upload_channel_id"]
         uploaded_date = local_now(config, uploaded_at).date()
-        if source_type not in {"discord", "web"}:
+        if source_type not in {"discord", "web", "manual"}:
             raise UserError("자료 출처를 확인해주세요.")
-        if source_type == "web":
+        if source_type == "manual" and (kind != "paper" or file_path or info.text):
+            raise UserError("직접 입력은 원본 파일이 없는 논문 정보에만 사용할 수 있습니다.")
+        if source_type in {"web", "manual"}:
             if session_id is None or not upload_key:
                 raise UserError("웹 제출에는 발표 회차와 업로드 ID가 필요합니다.")
             session = self.session(guild_id, session_id)
@@ -595,8 +644,8 @@ class Store:
                 INSERT INTO documents(guild_id, attachment_id, uploader_id, source_channel_id, session_id,
                     title, filename, doi, arxiv_id, sha256, search_text, extracted_text,
                     extraction_method, warning, file_path, message_url, uploaded_at, kind, classification_reason,
-                    source_type, upload_key)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    source_type, upload_key, venue, year, link)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
                 (
                     guild_id,
@@ -609,7 +658,7 @@ class Store:
                     info.doi,
                     info.arxiv_id,
                     info.sha256,
-                    self._search_text(title, filename, info.doi, info.arxiv_id),
+                    self._search_text(title, filename, info.doi, info.arxiv_id, venue, year, link),
                     ""
                     if kind == "paper"
                     or (kind == "unknown" and filename.casefold().endswith(".pdf"))
@@ -623,6 +672,9 @@ class Store:
                     classification_reason,
                     source_type,
                     upload_key,
+                    venue,
+                    year,
+                    link,
                 ),
             )
         return cursor.lastrowid, duplicates
@@ -632,6 +684,15 @@ class Store:
             "SELECT id FROM documents WHERE guild_id=? AND upload_key=?", (guild_id, upload_key)
         ).fetchone()
         return self.document(guild_id, row["id"]) if row else None
+
+    def web_upload_deleted(self, guild_id: int, upload_key: str) -> bool:
+        return (
+            self.db.execute(
+                "SELECT 1 FROM web_upload_tombstones WHERE guild_id=? AND upload_key=?",
+                (guild_id, upload_key),
+            ).fetchone()
+            is not None
+        )
 
     def submission_receipt(self, session_id: int) -> str | None:
         row = self.db.execute(
@@ -723,10 +784,19 @@ class Store:
             raise UserError("제목은 1~500자 사이로 입력해주세요.")
         with self.db:
             self.db.execute(
-                "UPDATE documents SET title=?, search_text=? WHERE id=? AND guild_id=?",
+                "UPDATE documents SET title=?, search_text=?, edit_revision=edit_revision+1, "
+                "extraction_method=CASE WHEN kind='paper' THEN 'user_metadata' ELSE extraction_method END WHERE id=? AND guild_id=?",
                 (
                     title,
-                    self._search_text(title, record["filename"], record["doi"], record["arxiv_id"]),
+                    self._search_text(
+                        title,
+                        record["filename"],
+                        record["doi"],
+                        record["arxiv_id"],
+                        record["venue"],
+                        record["year"],
+                        record["link"],
+                    ),
                     record_id,
                     guild_id,
                 ),
@@ -751,7 +821,7 @@ class Store:
             )
         with self.db:
             self.db.execute(
-                "UPDATE documents SET session_id=? WHERE guild_id=? AND id=?",
+                "UPDATE documents SET session_id=?, edit_revision=edit_revision+1 WHERE guild_id=? AND id=?",
                 (session["id"], guild_id, record_id),
             )
 
@@ -770,16 +840,82 @@ class Store:
     ) -> dict:
         record = self.document(guild_id, record_id)
         self._can_edit(record, user_id, manager)
+        if record["source_type"] == "manual" and kind != "paper":
+            raise UserError("직접 입력한 논문 정보는 발표 자료로 분류할 수 없습니다.")
         self._validate_kind(kind, record["filename"])
         with self.db:
             self.db.execute(
                 "UPDATE documents SET kind=?, classification_reason='사용자가 확인한 구분', "
                 "file_path=CASE WHEN ?='paper' THEN '' ELSE file_path END, "
-                "extracted_text=CASE WHEN ?='paper' THEN '' ELSE extracted_text END "
+                "extracted_text=CASE WHEN ?='paper' THEN '' ELSE extracted_text END, edit_revision=edit_revision+1 "
                 "WHERE guild_id=? AND id=?",
                 (kind, kind, kind, guild_id, record_id),
             )
         return self.document(guild_id, record_id)
+
+    def update_document_metadata(self, guild_id: int, record_id: int, fields: dict) -> dict:
+        record = self.document(guild_id, record_id)
+        with self.db:
+            if record["kind"] == "slides":
+                self.db.execute(
+                    "UPDATE documents SET title=?, search_text=?, edit_revision=edit_revision+1 WHERE guild_id=? AND id=?",
+                    (
+                        fields["title"],
+                        self._search_text(
+                            fields["title"],
+                            record["filename"],
+                            record["doi"],
+                            record["arxiv_id"],
+                            record["venue"],
+                            record["year"],
+                            record["link"],
+                        ),
+                        guild_id,
+                        record_id,
+                    ),
+                )
+            else:
+                self.db.execute(
+                    "UPDATE documents SET title=?,venue=?,year=?,doi=?,link=?,search_text=?, "
+                    "extraction_method='user_metadata',edit_revision=edit_revision+1 WHERE guild_id=? AND id=?",
+                    (
+                        fields["title"],
+                        fields["venue"],
+                        fields["year"],
+                        fields["doi"],
+                        fields["link"],
+                        self._search_text(
+                            fields["title"],
+                            record["filename"],
+                            fields["doi"],
+                            record["arxiv_id"],
+                            fields["venue"],
+                            fields["year"],
+                            fields["link"],
+                        ),
+                        guild_id,
+                        record_id,
+                    ),
+                )
+            self.db.execute(
+                "DELETE FROM web_submission_receipts WHERE session_id=?", (record["session_id"],)
+            )
+        return self.document(guild_id, record_id)
+
+    def delete_document(self, guild_id: int, record_id: int) -> None:
+        record = self.document(guild_id, record_id)
+        with self.db:
+            if record["upload_key"]:
+                self.db.execute(
+                    "INSERT OR IGNORE INTO web_upload_tombstones VALUES(?,?)",
+                    (guild_id, record["upload_key"]),
+                )
+            self.db.execute(
+                "DELETE FROM documents WHERE guild_id=? AND id=?", (guild_id, record_id)
+            )
+            self.db.execute(
+                "DELETE FROM web_submission_receipts WHERE session_id=?", (record["session_id"],)
+            )
 
     def other_documents_use_file(self, record_id: int, file_path: str) -> bool:
         return (
