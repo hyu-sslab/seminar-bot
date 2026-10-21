@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lab-seminar-bot"
+version = "0.1.0"
+description = "Discord lab seminar rotation, reminders, and automatic paper archive"
+requires-python = ">=3.12"
+dependencies = [
+  "discord.py>=2.6,<3",
+  "pypdf>=6,<7",
+  "python-dotenv>=1,<2",
+  "tzdata>=2025.1",
+]
+
+[project.optional-dependencies]
+dev = ["ruff>=0.12,<1"]
+
+[project.scripts]
+seminar-bot = "seminar_bot.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]

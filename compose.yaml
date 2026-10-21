@@ -1,0 +1,15 @@
+services:
+  seminar-bot:
+    build: .
+    restart: unless-stopped
+    init: true
+    env_file:
+      - .env
+    environment:
+      DATA_DIR: /app/data
+    volumes:
+      - seminar-data:/app/data
+    stop_grace_period: 20s
+
+volumes:
+  seminar-data:

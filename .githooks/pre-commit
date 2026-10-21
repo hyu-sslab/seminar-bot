@@ -1,0 +1,13 @@
+#!/bin/sh
+set -eu
+cd "$(git rev-parse --show-toplevel)"
+python3 scripts/check_publication.py
+if command -v gitleaks >/dev/null 2>&1; then
+    scanner=gitleaks
+elif [ -x "$HOME/.local/bin/gitleaks" ]; then
+    scanner="$HOME/.local/bin/gitleaks"
+else
+    echo 'Install Gitleaks before committing; see SECURITY.md.' >&2
+    exit 1
+fi
+"$scanner" git --staged --pre-commit --config .gitleaks.toml --redact --no-banner --ignore-gitleaks-allow .

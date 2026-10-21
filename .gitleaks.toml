@@ -1,0 +1,22 @@
+title = "Seminar bot public source checks"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "discord-token-shape"
+description = "Discord token, including values without a variable name"
+regex = '''\b[A-Za-z0-9_-]{20,30}\.[A-Za-z0-9_-]{6,7}\.[A-Za-z0-9_-]{27,}\b'''
+
+[[rules]]
+id = "nas-ddns-address"
+description = "Private NAS DDNS address"
+regex = '''(?i)\b[a-z0-9][a-z0-9-]*\.(?:myds\.me|synology\.me)\b'''
+
+[[rules]]
+id = "private-user-home"
+description = "Machine-specific user home directory"
+regex = '''/(?:var/services/homes|home|Users)/([a-zA-Z0-9_.-]+)(?:/|\b)'''
+# Extract the username so the default allowlist for generic filesystem paths
+# does not suppress this privacy rule.
+secretGroup = 1
