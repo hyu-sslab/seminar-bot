@@ -65,3 +65,8 @@ logs
 config
 rotation.json
 rotation.*.json
+
+# Deployment and handoff notes stay local.
+/WEB_SETUP.md
+/WEB_ACCESS_SETUP.md
+/NAS_HANDOFF.md
