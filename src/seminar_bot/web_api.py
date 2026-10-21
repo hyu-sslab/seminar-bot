@@ -706,7 +706,7 @@ class SeminarAPI:
                     diagnostic_stage(request, "nas_storage")
                     data = await asyncio.to_thread(path.read_bytes)
                     diagnostic_stage(request, "nas_parse")
-                    info = await self.bot.extract_document(path, filename, data)
+                    info = await self.bot.extract_document(path, filename, data, kind=kind)
                     diagnostic_stage(request, "nas_store")
                     async with self.bot.schedule_lock:
                         current = self._session(request)

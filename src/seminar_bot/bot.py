@@ -25,6 +25,7 @@ from .web_api import SeminarAPI
 log = logging.getLogger(__name__)
 WEEKDAYS = ["월요일", "화요일", "수요일", "목요일", "금요일", "토요일", "일요일"]
 KIND_LABELS = {"slides": "발표 자료", "paper": "논문 PDF", "unknown": "분류 미확정"}
+MAX_CONCURRENT_UPLOADS = 4
 
 
 def safe(value: str, limit: int = 300) -> str:
@@ -98,7 +99,7 @@ class SeminarBot(discord.Client):
         self.store = Store(settings.data_dir / "seminar.sqlite3")
         self.tree = SeminarCommandTree(self)
         self.schedule_lock = asyncio.Lock()
-        self.upload_slots = asyncio.Semaphore(2)
+        self.upload_slots = asyncio.Semaphore(MAX_CONCURRENT_UPLOADS)
         self.rotation_errors: dict[int | None, str] = {}
         self.api_runner = None
         self.relay_client = None
@@ -273,7 +274,9 @@ class SeminarBot(discord.Client):
         )
         return message.id
 
-    async def extract_document(self, path: Path, filename: str, data: bytes):
+    async def extract_document(
+        self, path: Path, filename: str, data: bytes, *, kind: str = "paper"
+    ):
         if len(data) > MAX_FILE_BYTES:
             return DocumentInfo(
                 Path(filename.replace("\\", "/")).stem[:500] or "이름 없는 문서",
@@ -285,8 +288,8 @@ class SeminarBot(discord.Client):
                 "문서 분석 용량 제한을 넘어 파일명으로 기록했습니다.",
             )
         if self.settings.parser_url:
-            return await extract_remote(path, filename, data, self.settings.parser_url)
-        return await extract_saved(path, filename, data)
+            return await extract_remote(path, filename, data, self.settings.parser_url, kind=kind)
+        return await extract_saved(path, filename, data, kind=kind)
 
     def source_url(self, record: dict) -> str:
         if record.get("source_type") in {"web", "manual"} and record.get("session_id"):

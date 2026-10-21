@@ -26,6 +26,7 @@ from .remote_parser import MAX_PARSER_RESPONSE_BYTES, validated_document
 MAX_PARSER_FILE_BYTES = MAX_FILE_BYTES
 PARSER_REQUEST_TIMEOUT_SECONDS = 40
 PARSER_CHILD_TIMEOUT_SECONDS = 25
+MAX_CONCURRENT_PARSERS = 4
 _SEMAPHORE = web.AppKey("parser_semaphore", asyncio.Semaphore)
 _SAFE_ENV = {
     "PATH": os.defpath,
@@ -56,7 +57,19 @@ def _filename(raw: str) -> str:
     return name
 
 
-async def _stop(process: asyncio.subprocess.Process) -> None:
+async def _wait_cleanup(task: asyncio.Task) -> None:
+    interrupted = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            interrupted = True
+    task.result()
+    if interrupted:
+        raise asyncio.CancelledError
+
+
+async def _stop_process(process: asyncio.subprocess.Process) -> None:
     if process.returncode is None:
         try:
             if hasattr(os, "killpg"):
@@ -73,19 +86,44 @@ async def _stop(process: asyncio.subprocess.Process) -> None:
     await process.wait()
 
 
-async def _extract_saved_isolated(path: Path, filename: str, digest: str) -> DocumentInfo:
-    process = await asyncio.create_subprocess_exec(
-        sys.executable,
-        "-I",
-        "-m",
-        "seminar_bot.extract_worker",
-        str(path),
-        filename,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
-        env=_SAFE_ENV.copy(),
-        start_new_session=True,
+async def _stop(process: asyncio.subprocess.Process) -> None:
+    # Repeated request cancellation must not interrupt kill/drain/wait and
+    # release the semaphore while an old child is still consuming resources.
+    await _wait_cleanup(asyncio.create_task(_stop_process(process)))
+
+
+async def _extract_saved_isolated(
+    path: Path, filename: str, digest: str, *, kind: str = "paper"
+) -> DocumentInfo:
+    spawning = asyncio.create_task(
+        asyncio.create_subprocess_exec(
+            sys.executable,
+            "-I",
+            "-m",
+            "seminar_bot.extract_worker",
+            str(path),
+            filename,
+            kind,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=_SAFE_ENV.copy(),
+            start_new_session=True,
+        )
     )
+    try:
+        process = await asyncio.shield(spawning)
+    except asyncio.CancelledError:
+        # A process may exist before asyncio finishes creating its transport.
+        # Keep the semaphore until that child is found, killed and reaped.
+        async def reap_spawn() -> None:
+            try:
+                process = await spawning
+            except Exception:
+                return
+            await _stop_process(process)
+
+        await _wait_cleanup(asyncio.create_task(reap_spawn()))
+        raise
     try:
         async with asyncio.timeout(PARSER_CHILD_TIMEOUT_SECONDS):
             result = bytearray()
@@ -117,6 +155,9 @@ async def _extract_saved_isolated(path: Path, filename: str, digest: str) -> Doc
 async def _extract(request: web.Request) -> web.Response:
     if request.content_type != "application/octet-stream":
         return _json({"error": "Raw document bytes are required."}, 415)
+    kind = request.headers.get("X-Document-Kind", "paper")
+    if kind not in {"slides", "paper"}:
+        return _json({"error": "Invalid document kind."}, 400)
     try:
         filename = _filename(request.headers.get("X-Filename", ""))
     except (ValueError, UnicodeError):
@@ -143,7 +184,7 @@ async def _extract(request: web.Request) -> web.Response:
                         return _json({"error": "Document is empty."}, 400)
                     saved.flush()
                     result = await _extract_saved_isolated(
-                        Path(saved.name), filename, digest.hexdigest()
+                        Path(saved.name), filename, digest.hexdigest(), kind=kind
                     )
                 return _json(asdict(result))
     except Exception:
@@ -154,7 +195,7 @@ async def _extract(request: web.Request) -> web.Response:
 
 def create_parser_app() -> web.Application:
     app = web.Application(client_max_size=MAX_PARSER_FILE_BYTES)
-    app[_SEMAPHORE] = asyncio.Semaphore(2)
+    app[_SEMAPHORE] = asyncio.Semaphore(MAX_CONCURRENT_PARSERS)
     app.router.add_post("/extract", _extract)
     return app
 

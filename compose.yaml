@@ -20,7 +20,7 @@ services:
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
     tmpfs:
-      - /tmp:rw,noexec,nosuid,nodev,size=67108864,mode=1777
+      - /tmp:rw,noexec,nosuid,nodev,size=268435456,mode=1777
     depends_on:
       - document-parser
     networks:
@@ -38,10 +38,10 @@ services:
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
     tmpfs:
-      - /tmp:rw,noexec,nosuid,nodev,size=100663296,mode=1777
-    mem_limit: 768m
+      - /tmp:rw,noexec,nosuid,nodev,size=268435456,mode=1777
+    mem_limit: ${DOCUMENT_PARSER_MEMORY_LIMIT:-2560m}
     pids_limit: 64
-    cpus: ${DOCUMENT_PARSER_CPUS:-1.0}
+    cpus: ${DOCUMENT_PARSER_CPUS:-0}
     networks:
       - parser
 

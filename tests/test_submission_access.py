@@ -372,7 +372,7 @@ class SubmissionAccessAPITests(unittest.IsolatedAsyncioTestCase):
     async def test_revoked_grant_during_parser_does_not_commit_or_leave_original(self):
         grant = await self.grant()
 
-        async def revoke(path, filename, data):
+        async def revoke(path, filename, data, *, kind="paper"):
             self.access.issue(1, self.row["id"], 101)
             return DocumentInfo(
                 "Presentation", "", None, None, hashlib.sha256(data).hexdigest(), "filename"
@@ -403,7 +403,7 @@ class SubmissionAccessAPITests(unittest.IsolatedAsyncioTestCase):
         )
         grant = await self.grant()
 
-        async def extract(path, filename, data):
+        async def extract(path, filename, data, *, kind="paper"):
             return DocumentInfo(
                 filename.removesuffix(".pdf"),
                 "temporary body",

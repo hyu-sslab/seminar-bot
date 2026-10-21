@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import hashlib
 import io
 import json
 import sqlite3
@@ -151,6 +152,81 @@ class WebAPITests(unittest.IsolatedAsyncioTestCase):
         ]:
             response = await self.upload("paper", pdf_bytes(name), name + ".pdf")
             self.assertEqual(response.status, 201, await response.text())
+
+    async def test_three_presenters_share_four_upload_slots_and_queries_remain_available(self):
+        self.bot.store.set_rotation(1, [101, 102, 103], self.day, self.today)
+        sessions = self.bot.store.upcoming(1, self.today, 3)
+        gate = asyncio.Event()
+        four_started = asyncio.Event()
+        active = maximum = started = 0
+        kinds = []
+
+        async def extract(path, filename, data, *, kind="paper"):
+            nonlocal active, maximum, started
+            active += 1
+            started += 1
+            maximum = max(maximum, active)
+            kinds.append(kind)
+            if started == 4:
+                four_started.set()
+            try:
+                await gate.wait()
+                return DocumentInfo(
+                    filename.removesuffix(".pdf"),
+                    "",
+                    None,
+                    None,
+                    hashlib.sha256(data).hexdigest(),
+                    "filename",
+                )
+            finally:
+                active -= 1
+
+        self.bot.extract_document = extract
+        requests = []
+        for presenter, session in enumerate(sessions):
+            for index in range(4):
+                kind = "slides" if index == 0 else "paper"
+                filename = f"Presenter-{presenter}-Research-Study-{index}.pdf"
+                requests.append(
+                    asyncio.create_task(
+                        self.client.put(
+                            f"/v1/sessions/{session['id']}/documents?kind={kind}",
+                            data=pdf_bytes(filename),
+                            headers=self.headers(
+                                **{
+                                    "Content-Type": "application/octet-stream",
+                                    "X-Filename": filename,
+                                    "Idempotency-Key": str(uuid.uuid4()),
+                                    "X-Seminar-Version": session_version(session),
+                                }
+                            ),
+                        )
+                    )
+                )
+        try:
+            await asyncio.wait_for(four_started.wait(), 2)
+            await asyncio.sleep(0.02)
+            self.assertEqual(started, 4)
+            for endpoint in ("/v1/health", "/v1/archive?kind=paper"):
+                response = await asyncio.wait_for(
+                    self.client.get(endpoint, headers=self.headers()), 1
+                )
+                self.assertEqual(response.status, 200, await response.text())
+        finally:
+            gate.set()
+        responses = await asyncio.gather(*requests)
+        self.assertEqual([response.status for response in responses], [201] * 12)
+        self.assertEqual(started, 12)
+        self.assertEqual(maximum, 4)
+        self.assertEqual(active, 0)
+        self.assertEqual(kinds.count("slides"), 3)
+        self.assertEqual(kinds.count("paper"), 9)
+        for session in sessions:
+            status = self.api.status(session["id"])
+            self.assertEqual(status["slides"], 1)
+            self.assertEqual(status["papers"], 3)
+            self.assertTrue(status["complete"])
 
     def configure_notifications(self, enabled):
         config = self.bot.store.require_config(1)
@@ -345,8 +421,8 @@ class WebAPITests(unittest.IsolatedAsyncioTestCase):
         extracted = []
         actual_extract = self.bot.extract_document
 
-        async def capture_extraction(*args):
-            info = await actual_extract(*args)
+        async def capture_extraction(*args, **kwargs):
+            info = await actual_extract(*args, **kwargs)
             extracted.append(info.text)
             return info
 
@@ -839,8 +915,8 @@ class WebAPITests(unittest.IsolatedAsyncioTestCase):
     async def test_schedule_change_during_parsing_rejects_commit_and_cleans_file(self):
         actual_extract = self.bot.extract_document
 
-        async def change_after_parsing(*args):
-            result = await actual_extract(*args)
+        async def change_after_parsing(*args, **kwargs):
+            result = await actual_extract(*args, **kwargs)
             self.bot.store.postpone(1, self.today, self.day)
             return result
 

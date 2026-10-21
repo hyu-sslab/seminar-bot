@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import math
 import re
 import unicodedata
 import zipfile
@@ -17,7 +18,7 @@ from pathlib import PurePosixPath
 from urllib.parse import unquote, urlsplit
 from xml.etree import ElementTree
 
-from pypdf import PdfReader
+from pypdf import PdfReader, mult
 
 MAX_FILE_BYTES = 25 * 1024 * 1024
 MAX_TEXT_CHARACTERS = 50_000
@@ -28,6 +29,8 @@ MAX_ZIP_MEMBERS = 2_000
 MAX_ZIP_EXPANDED_BYTES = 100 * 1024 * 1024
 MAX_XML_BYTES = 2 * 1024 * 1024
 MAX_SELECTED_XML_BYTES = 12 * 1024 * 1024
+MAX_VISUAL_FRAGMENTS = 2_000
+MAX_VISUAL_LINES = 600
 
 _DRAWING_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
 _PRESENTATION_NS = "http://schemas.openxmlformats.org/presentationml/2006/main"
@@ -207,6 +210,183 @@ def _title_from_text(text: str) -> str | None:
     return None
 
 
+@dataclass(frozen=True)
+class _VisualLine:
+    text: str
+    size: float
+    x: float
+    y: float  # Distance from the top, in points.
+
+
+def _visual_text(text: str) -> str | None:
+    candidate = _useful_title(text)
+    if not candidate or len(candidate) > 240 or _title_from_text(candidate) != candidate:
+        return None
+    letters = "".join(character for character in candidate if character.isalpha())
+    # A giant logo/acronym must not outrank a substantive title beneath it.
+    if len(letters) <= 5 and letters.isascii() and letters.isupper():
+        return None
+    return candidate
+
+
+def _largest_title(
+    lines: list[_VisualLine], width: float, height: float, *, minimum_size: float = 0
+) -> str | None:
+    """Pick a prominent, coherent text block, rather than a single large glyph."""
+    minimum_size = max(minimum_size, 12.0, min(width, height) * 0.025)
+    candidates = [
+        line
+        for line in lines[:MAX_VISUAL_LINES]
+        if (
+            minimum_size <= line.size <= min(144.0, height * 0.25)
+            and 0.04 * height <= line.y <= 0.9 * height
+            and -0.02 * width <= line.x <= 1.02 * width
+            and _visual_text(line.text)
+        )
+    ]
+    if not candidates:
+        return None
+    largest = max(line.size for line in candidates)
+    prominent = sorted(
+        (line for line in candidates if line.size >= largest * 0.8),
+        key=lambda line: (line.y, line.x),
+    )
+    blocks: list[list[_VisualLine]] = []
+    for line in prominent:
+        if blocks:
+            previous = blocks[-1][-1]
+            if (
+                len(blocks[-1]) < 3
+                and 0 < line.y - previous.y <= max(line.size, previous.size) * 1.8
+                and abs(line.x - previous.x) <= width * 0.22
+            ):
+                blocks[-1].append(line)
+                continue
+        blocks.append([line])
+    block = max(
+        blocks,
+        key=lambda group: (
+            max(line.size for line in group),
+            min(sum(len(normalize_search(line.text)) for line in group), 120),
+            -group[0].y,
+        ),
+    )
+    return _useful_title(" ".join(line.text for line in block))
+
+
+def _pdf_visual_title(fragments: list[_VisualLine], width: float, height: float) -> str | None:
+    # PDF fragments may split one visual line into several font runs. Merge
+    # equal-baseline runs before rejecting short logo-like text fragments.
+    rows: list[list[_VisualLine]] = []
+    for fragment in sorted(fragments, key=lambda line: (line.y, line.x)):
+        if rows:
+            previous = rows[-1][-1]
+            if (
+                abs(fragment.y - previous.y) <= max(2, min(fragment.size, previous.size) * 0.2)
+                and max(fragment.size, previous.size) <= min(fragment.size, previous.size) * 1.35
+            ):
+                rows[-1].append(fragment)
+                continue
+        if len(rows) >= MAX_VISUAL_LINES:
+            break
+        rows.append([fragment])
+    lines = []
+    for row in rows:
+        row.sort(key=lambda fragment: fragment.x)
+        text = _clean_title(" ".join(fragment.text for fragment in row))
+        sizes = [(fragment.size, max(1, len(normalize_search(fragment.text)))) for fragment in row]
+        lines.append(_VisualLine(text, _weighted_size(sizes), row[0].x, row[0].y))
+    return _largest_title(lines, width, height)
+
+
+def _weighted_size(sizes: list[tuple[float, int]]) -> float:
+    """Character-weighted median keeps an oversized initial from dominating."""
+    sizes = sorted((size, count) for size, count in sizes if 0 < size <= 144)
+    halfway = sum(count for _, count in sizes) / 2
+    cumulative = 0
+    for size, count in sizes:
+        cumulative += count
+        if cumulative >= halfway:
+            return size
+    return 0
+
+
+def _pptx_visual_title(slide: ElementTree.Element, width: float, height: float) -> str | None:
+    lines: list[_VisualLine] = []
+    title_shapes: list[tuple[str, float]] = []
+
+    def font_size(properties: ElementTree.Element | None) -> float:
+        try:
+            return float(properties.get("sz", "0")) / 100 if properties is not None else 0
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+    for shape_number, shape in enumerate(slide.iter(f"{{{_PRESENTATION_NS}}}sp")):
+        if shape_number >= MAX_VISUAL_LINES:
+            break
+        nonvisual = shape.find(f"{{{_PRESENTATION_NS}}}nvSpPr/{{{_PRESENTATION_NS}}}cNvPr")
+        if nonvisual is not None and nonvisual.get("hidden") in {"1", "true"}:
+            continue
+        body = shape.find(f"{{{_PRESENTATION_NS}}}txBody")
+        if body is None:
+            continue
+        placeholder = shape.find(f".//{{{_PRESENTATION_NS}}}ph")
+        is_title = placeholder is not None and placeholder.get("type") in {"title", "ctrTitle"}
+        offset = shape.find(
+            f"{{{_PRESENTATION_NS}}}spPr/{{{_DRAWING_NS}}}xfrm/{{{_DRAWING_NS}}}off"
+        )
+        try:
+            x = float(offset.get("x", "0")) / 12700 if offset is not None else 0
+            y = float(offset.get("y", "0")) / 12700 if offset is not None else height * 0.1
+        except (ValueError, OverflowError):
+            continue
+        if not all(math.isfinite(value) for value in (x, y)):
+            continue
+        shape_default = font_size(
+            body.find(f"{{{_DRAWING_NS}}}lstStyle/{{{_DRAWING_NS}}}lvl1pPr/{{{_DRAWING_NS}}}defRPr")
+        )
+        shape_text: list[str] = []
+        shape_sizes: list[tuple[float, int]] = []
+        for paragraph in body.findall(f"{{{_DRAWING_NS}}}p")[:MAX_VISUAL_LINES]:
+            default = (
+                font_size(paragraph.find(f"{{{_DRAWING_NS}}}pPr/{{{_DRAWING_NS}}}defRPr"))
+                or shape_default
+            )
+            parts: list[str] = []
+            sizes: list[tuple[float, int]] = []
+            for run in list(paragraph)[:MAX_VISUAL_FRAGMENTS]:
+                if run.tag == f"{{{_DRAWING_NS}}}br":
+                    parts.append(" ")
+                    continue
+                text = "".join(node.text or "" for node in run.iter(f"{{{_DRAWING_NS}}}t"))
+                if text:
+                    parts.append(text)
+                    size = font_size(run.find(f"{{{_DRAWING_NS}}}rPr")) or default
+                    sizes.append((size, max(1, len(normalize_search(text)))))
+            text = _clean_title("".join(parts))
+            size = _weighted_size(sizes)
+            if text:
+                shape_text.append(text)
+                shape_sizes.extend(sizes)
+                if len(lines) < MAX_VISUAL_LINES:
+                    lines.append(_VisualLine(text, size, x, y))
+                y += max(size, 12) * 1.2
+        title = _visual_text(" ".join(shape_text))
+        if is_title and title:
+            title_shapes.append((title, _weighted_size(shape_sizes)))
+    # Known font sizes remain the primary visual evidence. An explicitly small
+    # placeholder may just be the deck's recurring seminar label. If its size
+    # is inherited/unknown, the placeholder is still a useful cover-title hint.
+    if title_shapes:
+        title, size = max(title_shapes, key=lambda candidate: (candidate[1], len(candidate[0])))
+        if size:
+            larger = _largest_title(lines, width, height, minimum_size=size + 0.5)
+            if larger:
+                return larger
+        return title
+    return _largest_title(lines, width, height)
+
+
 def _identifiers(text: str) -> tuple[str | None, str | None]:
     # A references slide/page must not turn an unrelated citation into the
     # uploaded paper's identity. Ambiguous identifiers are left unset.
@@ -232,24 +412,63 @@ def _identifiers(text: str) -> tuple[str | None, str | None]:
     )
 
 
-def _pdf(data: bytes) -> tuple[str | None, list[str], str | None]:
+def _pdf(
+    data: bytes, *, visual: bool = False
+) -> tuple[str | None, list[str], str | None, str | None]:
     reader = PdfReader(io.BytesIO(data), strict=False)
     if reader.is_encrypted:
-        return None, [], "암호화된 PDF는 파일명으로 기록했습니다."
+        return None, [], "암호화된 PDF는 파일명으로 기록했습니다.", None
     metadata_title = _useful_title(reader.metadata.title if reader.metadata else None)
     pages: list[str] = []
     expanded_bytes = 0
-    for page in reader.pages[:MAX_PDF_PAGES]:
+    visual_title = None
+    for page_number, page in enumerate(reader.pages[:MAX_PDF_PAGES]):
         contents = page.get_contents()
         if contents is not None:
             expanded_bytes += len(contents.get_data())
             if expanded_bytes > MAX_PDF_CONTENT_BYTES:
                 raise _ExtractionLimit("PDF expanded content limit exceeded")
-        pages.append((page.extract_text() or "")[:MAX_TEXT_CHARACTERS])
-    return metadata_title, pages, None
+        if visual and page_number == 0:
+            fragments: list[_VisualLine] = []
+            collected_characters = 0
+            width, height = float(page.mediabox.width), float(page.mediabox.height)
+
+            def collect(text, cm, tm, font, font_size, *, fragments=fragments, page=page):
+                nonlocal collected_characters
+                if (
+                    len(fragments) >= MAX_VISUAL_FRAGMENTS
+                    or collected_characters >= MAX_TEXT_CHARACTERS
+                ):
+                    return
+                try:
+                    matrix = mult(tm, cm)
+                    size = abs(float(font_size)) * math.hypot(matrix[2], matrix[3])
+                    x = matrix[4] - float(page.mediabox.left)
+                    y = float(page.mediabox.top) - matrix[5]
+                    if not all(math.isfinite(value) for value in (size, x, y)) or size <= 0:
+                        return
+                    for offset, line in enumerate(text.splitlines()):
+                        if len(fragments) >= MAX_VISUAL_FRAGMENTS:
+                            break
+                        line = line[: MAX_TEXT_CHARACTERS - collected_characters]
+                        collected_characters += len(line)
+                        if line.strip():
+                            fragments.append(
+                                _VisualLine(line.strip(), size, x, y + offset * size * 1.2)
+                            )
+                except (TypeError, ValueError, OverflowError, IndexError):
+                    return
+
+            pages.append((page.extract_text(visitor_text=collect) or "")[:MAX_TEXT_CHARACTERS])
+            visual_title = _pdf_visual_title(fragments, width, height)
+        else:
+            pages.append((page.extract_text() or "")[:MAX_TEXT_CHARACTERS])
+    return metadata_title, pages, None, visual_title
 
 
-def _pptx(data: bytes) -> tuple[str | None, list[str], str | None]:
+def _pptx(
+    data: bytes, *, visual: bool = False
+) -> tuple[str | None, list[str], str | None, str | None]:
     with zipfile.ZipFile(io.BytesIO(data)) as archive:
         members = archive.infolist()
         if len(members) > MAX_ZIP_MEMBERS:
@@ -287,8 +506,19 @@ def _pptx(data: bytes) -> tuple[str | None, list[str], str | None]:
         # Follow presentation relationships: slide file numbers do not
         # necessarily match their visible order after a deck is rearranged.
         slide_names: list[str] = []
+        width, height = 720.0, 540.0
         if "ppt/presentation.xml" in member_map and "ppt/_rels/presentation.xml.rels" in member_map:
             presentation = read_xml("ppt/presentation.xml")
+            slide_size = presentation.find(f"{{{_PRESENTATION_NS}}}sldSz")
+            if slide_size is not None:
+                try:
+                    dimensions = tuple(
+                        float(slide_size.get(name, "0")) / 12700 for name in ("cx", "cy")
+                    )
+                    if all(math.isfinite(value) and 1 <= value <= 10000 for value in dimensions):
+                        width, height = dimensions
+                except (ValueError, OverflowError):
+                    pass
             relationships = read_xml("ppt/_rels/presentation.xml.rels")
             targets: dict[str, str] = {}
             for relation in relationships.findall(f"{{{_PACKAGE_REL_NS}}}Relationship"):
@@ -310,19 +540,24 @@ def _pptx(data: bytes) -> tuple[str | None, list[str], str | None]:
             )[:MAX_SLIDES]
 
         pages: list[str] = []
-        for name in slide_names:
+        visual_title = None
+        for slide_number, name in enumerate(slide_names):
             slide = read_xml(name)
+            if visual and slide_number == 0:
+                visual_title = _pptx_visual_title(slide, width, height)
             paragraphs = []
             for paragraph in slide.iter(f"{{{_DRAWING_NS}}}p"):
                 paragraphs.append(
                     "".join(node.text or "" for node in paragraph.iter(f"{{{_DRAWING_NS}}}t"))
                 )
             pages.append("\n".join(paragraphs)[:MAX_TEXT_CHARACTERS])
-        return metadata_title, pages, None
+        return metadata_title, pages, None, visual_title
 
 
-def extract_document(data: bytes, filename: str) -> DocumentInfo:
+def extract_document(data: bytes, filename: str, *, kind: str = "paper") -> DocumentInfo:
     """Read PDF/PPTX text; retain legacy PPT uploads as filename records."""
+    if kind not in {"paper", "slides"}:
+        raise ValueError("문서 종류는 paper 또는 slides여야 합니다.")
     extension = PurePosixPath(filename.replace("\\", "/")).suffix.casefold()
     if extension not in {".pdf", ".ppt", ".pptx"}:
         raise ValueError("PDF, PPT, PPTX 파일만 등록할 수 있습니다.")
@@ -339,7 +574,11 @@ def extract_document(data: bytes, filename: str) -> DocumentInfo:
             ".ppt 원본을 보관했습니다. 본문 분석은 PDF/PPTX 형식에서 지원합니다."
         )
     try:
-        metadata_title, pages, warning = _pdf(data) if extension == ".pdf" else _pptx(data)
+        metadata_title, pages, warning, visual_title = (
+            _pdf(data, visual=kind == "slides")
+            if extension == ".pdf"
+            else _pptx(data, visual=kind == "slides")
+        )
         text = "\n\n".join(pages)[:MAX_TEXT_CHARACTERS].strip()
         if not text:
             if metadata_title:
@@ -357,9 +596,18 @@ def extract_document(data: bytes, filename: str) -> DocumentInfo:
                 warning
                 or "본문 텍스트를 찾지 못해 파일명으로 기록했습니다. 스캔 PDF에는 OCR이 필요합니다."
             )
-        title = metadata_title or _title_from_text(pages[0] if pages else "") or fallback
-        method = f"{extension[1:]}_metadata" if metadata_title else f"{extension[1:]}_text"
-        if title == fallback and not metadata_title:
+        title = (
+            visual_title
+            or metadata_title
+            or _title_from_text(pages[0] if pages else "")
+            or fallback
+        )
+        method = (
+            f"{extension[1:]}_metadata"
+            if metadata_title and not visual_title
+            else f"{extension[1:]}_text"
+        )
+        if title == fallback and not metadata_title and not visual_title:
             method = "filename"
         doi, arxiv_id = _identifiers(text)
         return DocumentInfo(title, text, doi, arxiv_id, digest, method, warning)

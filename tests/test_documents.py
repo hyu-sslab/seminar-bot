@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import hashlib
 import io
+import tempfile
 import unittest
 import zipfile
+from pathlib import Path
 from xml.sax.saxutils import escape
 
 from pypdf import PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
+from seminar_bot.archive import extract_saved
 from seminar_bot.documents import (
     MAX_XML_BYTES,
     extract_document,
@@ -82,7 +85,195 @@ def pptx_fixture(
     return result.getvalue()
 
 
+def styled_pdf_fixture(
+    lines: list[tuple[str, int, int, int]],
+    *,
+    title: str | None = "Old Template Title",
+    later_lines: list[tuple[str, int, int, int]] | None = None,
+) -> bytes:
+    writer = PdfWriter()
+    for fragments in [lines, *([later_lines] if later_lines else [])]:
+        page = writer.add_blank_page(width=612, height=792)
+        page[NameObject("/Resources")] = DictionaryObject(
+            {
+                NameObject("/Font"): DictionaryObject(
+                    {
+                        NameObject("/F1"): DictionaryObject(
+                            {
+                                NameObject("/Type"): NameObject("/Font"),
+                                NameObject("/Subtype"): NameObject("/Type1"),
+                                NameObject("/BaseFont"): NameObject("/Helvetica"),
+                            }
+                        )
+                    }
+                )
+            }
+        )
+        stream = DecodedStreamObject()
+        commands = []
+        for text, size, x, y in fragments:
+            literal = text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+            commands.append(f"BT /F1 {size} Tf 1 0 0 1 {x} {y} Tm ({literal}) Tj ET")
+        stream.set_data("\n".join(commands).encode("latin1"))
+        page[NameObject("/Contents")] = writer._add_object(stream)
+    if title:
+        writer.add_metadata({"/Title": title})
+    result = io.BytesIO()
+    writer.write(result)
+    return result.getvalue()
+
+
+def pptx_shape(
+    paragraphs: list[tuple[str, int | None]],
+    *,
+    default_size: int | None = None,
+    placeholder: str | None = None,
+    y: int = 100,
+) -> str:
+    ph = f'<p:ph type="{placeholder}"/>' if placeholder else ""
+    content = []
+    for text, size in paragraphs:
+        default = f'<a:pPr><a:defRPr sz="{default_size * 100}"/></a:pPr>' if default_size else ""
+        properties = f'<a:rPr sz="{size * 100}"/>' if size else ""
+        content.append(f"<a:p>{default}<a:r>{properties}<a:t>{escape(text)}</a:t></a:r></a:p>")
+    return (
+        f'<p:sp><p:nvSpPr><p:cNvPr id="1" name="Text"/><p:cNvSpPr>{ph}</p:cNvSpPr></p:nvSpPr>'
+        f'<p:spPr><a:xfrm><a:off x="914400" y="{y * 12700}"/></a:xfrm></p:spPr>'
+        "<p:txBody><a:bodyPr/><a:lstStyle/>" + "".join(content) + "</p:txBody></p:sp>"
+    )
+
+
+def styled_pptx_fixture(*shapes: str, title: str = "Old Template Title") -> bytes:
+    result = io.BytesIO()
+    with zipfile.ZipFile(result, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "docProps/core.xml",
+            '<properties xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>'
+            + escape(title)
+            + "</dc:title></properties>",
+        )
+        archive.writestr(
+            "ppt/slides/slide1.xml",
+            '<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" '
+            'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree>'
+            + "".join(shapes)
+            + "</p:spTree></p:cSld></p:sld>",
+        )
+    return result.getvalue()
+
+
 class DocumentTests(unittest.TestCase):
+    def test_slides_pdf_uses_large_cover_title_before_metadata_and_joins_lines(self):
+        data = styled_pdf_fixture(
+            [
+                ("LAB", 96, 20, 730),
+                ("Presenter Name", 12, 80, 520),
+                ("Robust Learning", 36, 80, 650),
+                ("for Changing Data", 34, 80, 606),
+                ("This is a normal body sentence.", 12, 80, 560),
+            ]
+        )
+        document = extract_document(data, "slides.pdf", kind="slides")
+        self.assertEqual(document.title, "Robust Learning for Changing Data")
+        self.assertEqual(document.extraction_method, "pdf_text")
+        self.assertEqual(extract_document(data, "paper.pdf").title, "Old Template Title")
+
+    def test_slides_pdf_joins_separate_font_runs_on_one_line(self):
+        data = styled_pdf_fixture(
+            [
+                ("Learning", 36, 60, 650),
+                ("Systems", 34, 235, 650),
+                ("A Presenter", 12, 80, 520),
+            ]
+        )
+        self.assertEqual(
+            extract_document(data, "slides.pdf", kind="slides").title,
+            "Learning Systems",
+        )
+
+    def test_slides_pdf_only_uses_first_page_for_visual_title(self):
+        data = styled_pdf_fixture(
+            [("First Cover Title", 28, 80, 650)],
+            later_lines=[("Much Larger Later Title", 72, 80, 650)],
+        )
+        self.assertEqual(
+            extract_document(data, "slides.pdf", kind="slides").title,
+            "First Cover Title",
+        )
+
+    def test_slides_pdf_does_not_promote_body_text_over_metadata(self):
+        data = styled_pdf_fixture([("This is a normal body sentence.", 12, 80, 650)])
+        document = extract_document(data, "slides.pdf", kind="slides")
+        self.assertEqual(document.title, "Old Template Title")
+        self.assertEqual(document.extraction_method, "pdf_metadata")
+
+    def test_slides_pdf_text_and_filename_fallbacks_still_work(self):
+        document = extract_document(
+            pdf_fixture("Useful Cover Title\nPresenter Name"), "slides.pdf", kind="slides"
+        )
+        self.assertEqual(document.title, "Useful Cover Title")
+        blank = extract_document(pdf_fixture(""), "발표_자료.pdf", kind="slides")
+        self.assertEqual(blank.title, "발표 자료")
+        self.assertTrue(blank.warning)
+
+    def test_slides_pptx_large_runs_override_metadata_and_ignore_large_logo(self):
+        data = styled_pptx_fixture(
+            pptx_shape([("LAB", 96)], y=35),
+            pptx_shape([("발표자 이름", 12)], y=300),
+            pptx_shape([("변화하는 데이터에서", 40), ("안정적인 학습 방법", 36)]),
+        )
+        document = extract_document(data, "slides.pptx", kind="slides")
+        self.assertEqual(document.title, "변화하는 데이터에서 안정적인 학습 방법")
+        self.assertEqual(document.extraction_method, "pptx_text")
+        self.assertEqual(extract_document(data, "paper.pptx").title, "Old Template Title")
+
+    def test_slides_pptx_uses_paragraph_default_size(self):
+        data = styled_pptx_fixture(
+            pptx_shape([("Small decoration", 14)], y=60),
+            pptx_shape([("Default Styled Cover Title", None)], default_size=36),
+        )
+        self.assertEqual(
+            extract_document(data, "slides.pptx", kind="slides").title,
+            "Default Styled Cover Title",
+        )
+
+    def test_slides_pptx_soft_line_break_does_not_join_title_words(self):
+        shape = pptx_shape([("Robust Learning", 36)], placeholder="title")
+        shape = shape.replace(
+            "</a:r></a:p>",
+            '</a:r><a:br/><a:r><a:rPr sz="3600"/><a:t>for Changing Data</a:t></a:r></a:p>',
+        )
+        self.assertEqual(
+            extract_document(styled_pptx_fixture(shape), "slides.pptx", kind="slides").title,
+            "Robust Learning for Changing Data",
+        )
+
+    def test_slides_pptx_prefers_title_placeholder_without_explicit_size(self):
+        for placeholder in ("title", "ctrTitle"):
+            with self.subTest(placeholder=placeholder):
+                data = styled_pptx_fixture(
+                    pptx_shape([("Oversized Decorative Label", 90)], y=30),
+                    pptx_shape([("Actual Cover Title", None)], placeholder=placeholder),
+                )
+                self.assertEqual(
+                    extract_document(data, "slides.pptx", kind="slides").title,
+                    "Actual Cover Title",
+                )
+
+    def test_slides_pptx_small_explicit_placeholder_does_not_override_large_title(self):
+        data = styled_pptx_fixture(
+            pptx_shape([("Weekly seminar", 12)], placeholder="title", y=35),
+            pptx_shape([("Visible Research Title", 36)]),
+        )
+        self.assertEqual(
+            extract_document(data, "slides.pptx", kind="slides").title,
+            "Visible Research Title",
+        )
+
+    def test_invalid_document_kind_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "paper.*slides"):
+            extract_document(b"example", "slides.pdf", kind="unknown")
+
     def test_pdf_uses_metadata_and_extracts_identifiers(self):
         data = pdf_fixture(
             "Text Title\nhttps://doi.org/10.1234/ABC.123).\narXiv:2401.12345v3",
@@ -229,6 +420,19 @@ class DocumentTests(unittest.TestCase):
     def test_unsupported_file_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "PDF, PPT, PPTX"):
             extract_document(b"example", "note.txt")
+
+
+class DocumentWorkerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_local_subprocess_preserves_paper_default_and_slides_visual_policy(self):
+        data = styled_pdf_fixture([("Visible Cover Title", 36, 80, 650)])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "document.pdf"
+            path.write_bytes(data)
+            paper = await extract_saved(path, "document.pdf", data)
+            slides = await extract_saved(path, "document.pdf", data, kind="slides")
+        self.assertEqual(paper.title, "Old Template Title")
+        self.assertEqual(slides.title, "Visible Cover Title")
+        self.assertEqual(paper.sha256, slides.sha256)
 
 
 if __name__ == "__main__":

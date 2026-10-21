@@ -77,12 +77,16 @@ def _parser_endpoint(parser_url: str) -> str:
         ) from None
 
 
-async def extract_remote(path: Path, filename: str, data: bytes, parser_url: str) -> DocumentInfo:
+async def extract_remote(
+    path: Path, filename: str, data: bytes, parser_url: str, *, kind: str = "paper"
+) -> DocumentInfo:
     """Send bytes to the isolated parser, never falling back to local parsing.
 
     ``path`` matches the existing archive helper's interface. No local path,
     Discord token, NAS API token, or environment credentials are transmitted.
     """
+    if kind not in {"slides", "paper"}:
+        raise ValueError("Invalid document kind")
     endpoint = _parser_endpoint(parser_url)
     expected = hashlib.sha256(data).hexdigest()
     try:
@@ -97,6 +101,7 @@ async def extract_remote(path: Path, filename: str, data: bytes, parser_url: str
                 headers={
                     "Content-Type": "application/octet-stream",
                     "X-Filename": quote(filename, safe=""),
+                    "X-Document-Kind": kind,
                     "Accept": "application/json",
                     "Accept-Encoding": "identity",
                 },

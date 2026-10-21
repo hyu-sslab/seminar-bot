@@ -14,15 +14,18 @@ log = logging.getLogger(__name__)
 
 
 async def extract_saved(
-    path: Path, filename: str, data: bytes, timeout: float = 25
+    path: Path, filename: str, data: bytes, timeout: float = 25, *, kind: str = "paper"
 ) -> DocumentInfo:
     """Keep PDF/ZIP parsing and any runaway parser away from the Discord event loop."""
+    if kind not in {"slides", "paper"}:
+        raise ValueError("Invalid document kind")
     process = await asyncio.create_subprocess_exec(
         sys.executable,
         "-m",
         "seminar_bot.extract_worker",
         str(path),
         filename,
+        kind,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
         env={

@@ -478,7 +478,7 @@ class RelayPoolIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         async def relay_handler(request):
             slot = request.headers.get("X-Seminar-Relay-Slot")
-            self.assertIn(slot, {"0", "1", "2", "3"})
+            self.assertIn(slot, {str(number) for number in range(CONNECTION_SLOTS)})
             self.assertEqual(request.headers.get("Authorization"), "Bearer " + "c" * 64)
             self.seen_slots.append(slot)
             socket = web.WebSocketResponse(max_msg_size=CHUNK_BYTES + 1)
@@ -566,13 +566,18 @@ class RelayPoolIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(message.json(), {"type": "response_end", "id": request["id"]})
                 return b"".join(chunks)
 
-    async def test_four_slots_forward_independent_uploads_to_loopback_concurrently(self):
-        self.assertEqual(CONNECTION_SLOTS, 4)
-        self.assertEqual(set(self.peers), {0, 1, 2, 3})
-        requests = [self.request(slot, body=True) for slot in range(CONNECTION_SLOTS)]
-        payloads = [bytes([65 + slot]) * (slot + 1) for slot in range(CONNECTION_SLOTS)]
+    async def test_pool_forwards_four_uploads_and_two_queries_to_loopback_concurrently(self):
+        self.assertEqual(CONNECTION_SLOTS, 6)
+        self.assertEqual(set(self.peers), set(range(CONNECTION_SLOTS)))
+        requests = [self.request(slot, body=slot < 4) for slot in range(CONNECTION_SLOTS)]
+        payloads = [
+            bytes([65 + slot]) * (slot + 1) if slot < 4 else b"" for slot in range(CONNECTION_SLOTS)
+        ]
         await asyncio.gather(
-            *(self.begin(slot, request, payloads[slot]) for slot, request in enumerate(requests))
+            *(
+                self.begin(slot, request, payloads[slot] if slot < 4 else None)
+                for slot, request in enumerate(requests)
+            )
         )
         await asyncio.gather(
             *(
@@ -580,13 +585,13 @@ class RelayPoolIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 for slot, request in enumerate(requests)
             )
         )
-        # All four HTTP handlers must start before any response is released.
-        # A shared single-connection client would leave three calls waiting.
+        # Four uploads and two queries must enter the loopback independently.
+        # A shared single-connection client would leave five calls waiting.
         started = await asyncio.wait_for(
             asyncio.gather(*(self.started.get() for _ in range(CONNECTION_SLOTS))), 2
         )
         self.assertEqual(set(started), {request["id"] for request in requests})
-        self.assertEqual(len({id(connection.local) for connection in self.connections}), 4)
+        self.assertEqual(len({id(connection.local) for connection in self.connections}), 6)
         for path, headers, body in self.calls:
             slot = int(path.split("/")[3]) - 1
             self.assertEqual(body, payloads[slot])
@@ -605,7 +610,7 @@ class RelayPoolIntegrationTests(unittest.IsolatedAsyncioTestCase):
         await self.peers[0].send_json({"type": "response_pull", "id": str(uuid.uuid4())})
         closed = await self.peers[0].receive()
         self.assertIn(closed.type, {aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED})
-        requests = {slot: self.request(slot) for slot in (1, 2, 3)}
+        requests = {slot: self.request(slot) for slot in range(1, CONNECTION_SLOTS)}
         await asyncio.gather(*(self.begin(slot, request) for slot, request in requests.items()))
         await asyncio.gather(
             *(
@@ -621,8 +626,8 @@ class RelayPoolIntegrationTests(unittest.IsolatedAsyncioTestCase):
         slot, replacement = await asyncio.wait_for(self.ready.get(), 3)
         self.assertEqual(slot, 0)
         self.assertIsNot(replacement, self.peers[0])
-        self.assertEqual(sorted(self.seen_slots), ["0", "0", "1", "2", "3"])
-        for healthy in (1, 2, 3):
+        self.assertEqual(sorted(self.seen_slots), ["0", "0", "1", "2", "3", "4", "5"])
+        for healthy in range(1, CONNECTION_SLOTS):
             self.assertFalse(self.peers[healthy].socket.closed)
 
     async def test_close_cancels_all_slots_http_work_and_anonymous_spools(self):
@@ -644,7 +649,7 @@ class RelayPoolIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     {"type": "request_end", "id": requests[slot]["id"]}
                 )
             await asyncio.wait_for(asyncio.gather(self.started.get(), self.started.get()), 2)
-            self.assertEqual(len(spools), 4)
+            self.assertEqual(len(spools), CONNECTION_SLOTS)
             self.assertTrue(all(not spool.closed for spool in spools))
             await self.relay.close()
         self.assertTrue(all(spool.closed for spool in spools))
@@ -661,7 +666,7 @@ class RelayPoolIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         await self.relay.close()
 
-    async def test_direct_run_uses_four_slots_and_close_waits_for_the_whole_pool(self):
+    async def test_direct_run_uses_six_slots_and_close_waits_for_the_whole_pool(self):
         await self.relay.close()
         direct = asyncio.create_task(self.relay.run())
         await asyncio.gather(

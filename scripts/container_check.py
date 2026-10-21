@@ -98,18 +98,14 @@ def _inspect_parser(project: str) -> None:
     _require(size is not None, "Parser temporary storage must have a finite size limit.")
     size_bytes = int(size[1]) * {"": 1, "k": 1024, "m": 1024**2, "g": 1024**3}[size[2].lower()]
     _require(
-        0 < size_bytes <= 96 * 1024 * 1024,
-        "Parser temporary storage must be limited to at most 96 MiB.",
+        0 < size_bytes <= 256 * 1024 * 1024,
+        "Parser temporary storage must be limited to at most 256 MiB.",
     )
     _require(
-        0 < host.get("Memory", 0) <= 768 * 1024 * 1024,
-        "Parser memory must be limited to at most 768 MiB.",
+        0 < host.get("Memory", 0) <= 2560 * 1024 * 1024,
+        "Parser memory must be limited to at most 2560 MiB.",
     )
     _require(0 < host.get("PidsLimit", 0) <= 64, "Parser must limit process count to at most 64.")
-    _require(
-        0 < host.get("NanoCpus", 0) <= 1_000_000_000,
-        "Parser CPU must be limited to at most one core.",
-    )
 
     names = [entry.split("=", 1)[0].upper() for entry in config.get("Env") or []]
     _require(
@@ -154,6 +150,31 @@ else:
 temporary = Path('/tmp/container-ci-write-probe')
 temporary.write_bytes(b'probe')
 temporary.unlink()
+""",
+    )
+    _docker(
+        "exec",
+        container_id,
+        "python",
+        "-c",
+        """
+import resource
+from unittest.mock import patch
+from seminar_bot.extract_worker import main
+from seminar_bot.parser_service import MAX_CONCURRENT_PARSERS
+if MAX_CONCURRENT_PARSERS != 4:
+    raise SystemExit('Parser concurrency must be bounded to four analysis jobs')
+def check_limits(*args, **kwargs):
+    if resource.getrlimit(resource.RLIMIT_CPU) != (15, 15):
+        raise SystemExit('Parser child CPU time limit is missing')
+    expected = 512 * 1024 * 1024
+    if resource.getrlimit(resource.RLIMIT_AS) != (expected, expected):
+        raise SystemExit('Parser child address-space limit is missing')
+    raise SystemExit(0)
+with patch('sys.argv', ['parser-probe', 'unused.pdf', 'probe.pdf', 'slides']), \\
+     patch('pathlib.Path.read_bytes', return_value=b'probe'), \\
+     patch('seminar_bot.documents.extract_document', side_effect=check_limits):
+    main()
 """,
     )
     _docker(

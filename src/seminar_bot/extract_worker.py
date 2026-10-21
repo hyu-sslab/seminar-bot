@@ -19,7 +19,8 @@ def main() -> None:
 
     from .documents import extract_document
 
-    result = extract_document(Path(sys.argv[1]).read_bytes(), sys.argv[2])
+    kind = sys.argv[3] if len(sys.argv) > 3 else "paper"
+    result = extract_document(Path(sys.argv[1]).read_bytes(), sys.argv[2], kind=kind)
     print(json.dumps(asdict(result), ensure_ascii=False))
 
 
