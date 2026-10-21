@@ -18,12 +18,11 @@ from pypdf import PdfWriter
 
 from seminar_bot.__main__ import instance_lock
 from seminar_bot.archive import extract_saved
-from seminar_bot.bot import DocumentKindButton, SeminarBot, classification_view, safe
+from seminar_bot.bot import DocumentKindButton, SeminarBot, safe
 from seminar_bot.documents import DocumentInfo
 from seminar_bot.settings import Settings
 from seminar_bot.store import UserError
 from seminar_bot.submission_access import SubmissionAccess
-from seminar_bot.web_api import APIError, SeminarAPI
 
 DAY = date(2026, 10, 15)
 NOW = datetime(2026, 10, 15, 0, tzinfo=UTC)
@@ -206,7 +205,8 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
     async def test_notification_channel_change_preserves_archive_scope_progress_and_submission_grants(
         self,
     ):
-        record, path = await self.retained_slides_fixture()
+        record = self.seed_legacy_document(kind="slides")
+        path = Path(self.temp.name) / record["file_path"]
         self.bot.store.postpone(1, DAY, DAY + timedelta(weeks=2))
         session = self.bot.store.session_on(1, DAY)
         self.bot.store.mark_sent(session["id"], str(DAY), "morning", 901)
@@ -598,9 +598,13 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(mentions["users"], [101])
             self.assertEqual(mentions["parse"], [])
 
-    async def test_rotation_command_is_replaced_by_file(self):
-        self.assertIsNone(self.bot.tree.get_command("순서설정"))
-        self.assertEqual(len(self.bot.tree.get_commands()), 11)
+    async def test_only_current_web_workflow_commands_are_registered(self):
+        self.assertEqual(
+            {command.name for command in self.bot.tree.get_commands()},
+            {"설정", "일정", "스왑", "연기", "검색", "제출", "제출현황", "도움말"},
+        )
+        for retired in ("순서설정", "자료분류", "자료수정", "자료연결"):
+            self.assertIsNone(self.bot.tree.get_command(retired))
 
     async def help_response(self):
         interaction = SimpleNamespace(
@@ -676,7 +680,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
 
     def assert_latest_guild_commands(self, guild_id):
         commands = self.bot.tree.get_commands(guild=discord.Object(id=guild_id))
-        self.assertEqual(len(commands), 11)
+        self.assertEqual(len(commands), 8)
         self.assertEqual(
             {command.name for command in commands},
             {command.name for command in self.bot.tree.get_commands()},
@@ -686,45 +690,31 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             "세미나시간", {option["name"] for option in settings.to_dict(self.bot.tree)["options"]}
         )
 
-    async def test_command_sync_respects_explicit_guild_without_global_or_other_guild_requests(
-        self,
-    ):
-        self.bot.settings = replace(self.bot.settings, guild_id=9)
-        settings = self.bot.settings
+    async def test_startup_publishes_only_current_guild_commands_and_clears_old_globals(self):
+        self.bot.settings = replace(self.bot.settings, guild_id=9, api_guild_id=2)
+        commands = {command.name for command in self.bot.tree.get_commands()}
+        remote = {None: commands | {"자료수정", "자료연결", "자료분류"}, 9: {"unrelated"}}
+        before = "\n".join(self.bot.store.db.iterdump())
 
         async def sync(*, guild=None):
-            self.assertEqual(guild.id, 9)
-            self.assert_latest_guild_commands(9)
-            return []
+            key = guild.id if guild else None
+            definitions = self.bot.tree.get_commands(guild=guild)
+            remote[key] = {command.name for command in definitions}
+            return definitions
 
         with (
-            patch.object(
-                self.bot.tree, "copy_global_to", wraps=self.bot.tree.copy_global_to
-            ) as copy,
-            patch.object(self.bot.tree, "sync", AsyncMock(side_effect=sync)) as synced,
+            patch.object(self.bot.tree, "sync", AsyncMock(side_effect=sync)),
             patch.object(self.bot.tree, "fetch_commands", AsyncMock()) as fetched,
         ):
             await self.bot.sync_commands()
-        copy.assert_called_once()
-        self.assertEqual(copy.call_args.kwargs["guild"].id, 9)
-        synced.assert_awaited_once()
-        fetched.assert_not_awaited()
-        self.assertIs(self.bot.settings, settings)
-        self.assertEqual((settings.guild_id, settings.api_guild_id), (9, None))
-        self.assertEqual(self.bot.tree.get_commands(guild=discord.Object(id=1)), [])
-
-    async def test_seminar_guild_overrides_old_command_target_and_stale_db_servers(self):
-        self.bot.settings = replace(self.bot.settings, guild_id=9, api_guild_id=2)
-        before = "\n".join(self.bot.store.db.iterdump())
-        with (
-            patch.object(self.bot.tree, "sync", AsyncMock(return_value=[])) as synced,
-            patch.object(self.bot.tree, "fetch_commands", AsyncMock()) as fetched,
-        ):
             await self.bot.sync_commands()
-        self.assertEqual(synced.await_args.kwargs["guild"].id, 2)
-        fetched.assert_not_awaited()
+        self.assertEqual(remote, {None: set(), 2: commands, 9: {"unrelated"}})
         self.assert_latest_guild_commands(2)
-        self.assertEqual(self.bot.tree.get_commands(guild=discord.Object(id=9)), [])
+        self.assertEqual({command.name for command in self.bot.tree.get_commands()}, commands)
+        self.assertEqual(len(commands), 8)
+        for retired in ("자료분류", "자료수정", "자료연결"):
+            self.assertNotIn(retired, commands)
+        fetched.assert_not_awaited()
         self.assertEqual("\n".join(self.bot.store.db.iterdump()), before)
 
     async def test_commands_reject_inactive_servers_before_any_state_change(self):
@@ -740,117 +730,6 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(interaction.response.send_message.await_args.kwargs["ephemeral"])
         self.assertTrue(await self.bot.tree.interaction_check(SimpleNamespace(guild_id=1)))
         self.assertEqual("\n".join(self.bot.store.db.iterdump()), before)
-
-    async def test_global_command_sync_refreshes_only_existing_guild_scopes_in_sorted_unique_targets(
-        self,
-    ):
-        events = []
-
-        async def sync(*, guild=None):
-            events.append(("sync", guild.id if guild else None))
-            if guild:
-                self.assert_latest_guild_commands(guild.id)
-            return []
-
-        async def fetch(*, guild):
-            events.append(("fetch", guild.id))
-            return [] if guild.id == 1 else [SimpleNamespace(name="설정")]
-
-        with (
-            patch.object(
-                self.bot.store,
-                "all_configs",
-                return_value=[
-                    {"guild_id": 3},
-                    {"guild_id": 2},
-                    {"guild_id": 1},
-                    {"guild_id": 3},
-                ],
-            ),
-            patch.object(
-                self.bot.tree, "copy_global_to", wraps=self.bot.tree.copy_global_to
-            ) as copy,
-            patch.object(self.bot.tree, "sync", AsyncMock(side_effect=sync)),
-            patch.object(self.bot.tree, "fetch_commands", AsyncMock(side_effect=fetch)) as fetched,
-        ):
-            await self.bot.sync_commands()
-        self.assertEqual(
-            events,
-            [
-                ("sync", None),
-                ("fetch", 1),
-                ("fetch", 2),
-                ("sync", 2),
-                ("fetch", 3),
-                ("sync", 3),
-            ],
-        )
-        self.assertEqual(fetched.await_count, 3)
-        self.assertEqual([call.kwargs["guild"].id for call in copy.call_args_list], [2, 3])
-        self.assertEqual(self.bot.tree.get_commands(guild=discord.Object(id=1)), [])
-        self.assertIsNone(self.bot.settings.api_guild_id)
-
-    async def test_command_sync_continues_after_individual_guild_fetch_and_sync_http_errors(self):
-        for guild_id in (2, 3):
-            self.bot.store.configure(guild_id, 2001, 2002, 3, "09:00", "18:00", "Asia/Seoul", NOW)
-        events = []
-
-        def forbidden():
-            return discord.HTTPException(SimpleNamespace(status=403, reason="Forbidden"), "denied")
-
-        async def sync(*, guild=None):
-            events.append(("sync", guild.id if guild else None))
-            if guild and guild.id == 2:
-                raise forbidden()
-            if guild:
-                self.assert_latest_guild_commands(guild.id)
-            return []
-
-        async def fetch(*, guild):
-            events.append(("fetch", guild.id))
-            if guild.id == 1:
-                raise forbidden()
-            return [SimpleNamespace(name="old-command")]
-
-        with (
-            patch.object(
-                self.bot.tree, "copy_global_to", wraps=self.bot.tree.copy_global_to
-            ) as copy,
-            patch.object(self.bot.tree, "sync", AsyncMock(side_effect=sync)),
-            patch.object(self.bot.tree, "fetch_commands", AsyncMock(side_effect=fetch)),
-            self.assertLogs("seminar_bot.bot", level="WARNING") as logs,
-        ):
-            await self.bot.sync_commands()
-        self.assertEqual(
-            events,
-            [
-                ("sync", None),
-                ("fetch", 1),
-                ("fetch", 2),
-                ("sync", 2),
-                ("fetch", 3),
-                ("sync", 3),
-            ],
-        )
-        self.assertEqual([call.kwargs["guild"].id for call in copy.call_args_list], [2, 3])
-        self.assertEqual(len(logs.output), 2)
-        self.assert_latest_guild_commands(3)
-
-    async def test_global_command_sync_failure_propagates_without_touching_guild_scopes(self):
-        failure = discord.HTTPException(SimpleNamespace(status=503, reason="Unavailable"), "retry")
-        with (
-            patch.object(
-                self.bot.tree, "copy_global_to", wraps=self.bot.tree.copy_global_to
-            ) as copy,
-            patch.object(self.bot.tree, "sync", AsyncMock(side_effect=failure)) as synced,
-            patch.object(self.bot.tree, "fetch_commands", AsyncMock()) as fetched,
-            self.assertRaises(discord.HTTPException) as raised,
-        ):
-            await self.bot.sync_commands()
-        self.assertIs(raised.exception, failure)
-        synced.assert_awaited_once_with()
-        copy.assert_not_called()
-        fetched.assert_not_awaited()
 
     async def test_schedule_acknowledges_before_json_member_validation(self):
         interaction = SimpleNamespace(
@@ -1246,92 +1125,6 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual("\n".join(self.bot.store.db.iterdump()), before)
                     self.assertFalse(list(Path(self.temp.name).glob("files/**/*")))
 
-    async def retained_slides_fixture(self):
-        info = DocumentInfo(
-            "Research Slides Reclassified As A Paper",
-            "Sensitive extracted paper body",
-            "10.1000/reference",
-            None,
-            "classification-fixture-sha",
-            "pdf_text",
-        )
-        record = self.seed_legacy_document(kind="slides", info=info)
-        return record, Path(self.temp.name) / record["file_path"]
-
-    async def test_reclassification_command_deletes_paper_original_and_body_and_blocks_download(
-        self,
-    ):
-        record, path = await self.retained_slides_fixture()
-        self.assertTrue(path.is_file())
-        interaction = SimpleNamespace(
-            guild_id=1,
-            user=SimpleNamespace(id=101),
-            response=SimpleNamespace(send_message=AsyncMock()),
-        )
-        command = self.bot.tree.get_command("자료분류")
-        await command.callback(interaction, record["id"], "paper")
-        paper = self.bot.store.document(1, record["id"])
-        self.assertEqual(
-            (paper["kind"], paper["file_path"], paper["extracted_text"]), ("paper", "", "")
-        )
-        self.assertEqual(paper["doi"], "10.1000/reference")
-        self.assertFalse(path.exists())
-        self.assertIn(
-            "원본은 복구되지 않습니다", interaction.response.send_message.await_args.args[0]
-        )
-        api = object.__new__(SeminarAPI)
-        api.bot, api.guild_id, api.settings = self.bot, 1, self.bot.settings
-        self.assertFalse(api.document_data(paper, {})["file_available"])
-        with self.assertRaises(APIError) as denied:
-            await api.download(SimpleNamespace(match_info={"document_id": str(record["id"])}))
-        self.assertEqual(denied.exception.status, 404)
-        await command.callback(interaction, record["id"], "slides")
-        restored = self.bot.store.document(1, record["id"])
-        self.assertEqual((restored["file_path"], restored["extracted_text"]), ("", ""))
-        self.assertIn("/제출", interaction.response.send_message.await_args.args[0])
-        self.assertIn("웹페이지", interaction.response.send_message.await_args.args[0])
-
-    async def test_reclassification_keeps_an_original_referenced_by_another_document(self):
-        record, path = await self.retained_slides_fixture()
-        other_id, _ = self.bot.store.add_document(
-            1,
-            501,
-            101,
-            DocumentInfo(
-                "Shared Slides", "Other slides body", None, None, "shared-sha", "pdf_text"
-            ),
-            "shared-slides.pdf",
-            record["file_path"],
-            "https://discord.com/channels/1/1002/501",
-            NOW,
-            kind="slides",
-        )
-        async with self.bot.schedule_lock:
-            paper = await self.bot.classify_document_record(1, record["id"], "paper", 101, False)
-        self.assertEqual((paper["file_path"], paper["extracted_text"]), ("", ""))
-        self.assertTrue(path.is_file())
-        other = self.bot.store.document(1, other_id)
-        self.assertEqual(
-            (other["kind"], other["file_path"], other["extracted_text"]),
-            ("slides", record["file_path"], "Other slides body"),
-        )
-
-    async def test_failed_or_unauthorized_original_deletion_preserves_the_existing_record(self):
-        record, path = await self.retained_slides_fixture()
-        async with self.bot.schedule_lock:
-            with self.assertRaises(UserError):
-                await self.bot.classify_document_record(1, record["id"], "paper", 999, False)
-            self.assertTrue(path.is_file())
-            with patch.object(Path, "unlink", side_effect=PermissionError("fixture denial")):
-                with self.assertRaises(UserError):
-                    await self.bot.classify_document_record(1, record["id"], "paper", 101, False)
-        current = self.bot.store.document(1, record["id"])
-        self.assertEqual(
-            (current["kind"], current["file_path"], current["extracted_text"]),
-            (record["kind"], record["file_path"], record["extracted_text"]),
-        )
-        self.assertTrue(path.is_file())
-
     async def test_document_over_parser_limit_uses_metadata_without_network(self):
         self.bot.settings = Settings(
             "test-token-not-used", Path(self.temp.name), parser_url="http://document-parser:8081"
@@ -1506,58 +1299,34 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("제출 완료", status_response.kwargs["embed"].description)
         self.assertTrue(status_response.kwargs["ephemeral"])
 
-    async def test_classification_button_survives_restart_and_recalculates_progress(self):
-        record = self.seed_legacy_document(kind="unknown")
-        view = classification_view(record)
-        self.assertTrue(view.is_persistent())
-        button = next(item for item in view.children if item.kind == "slides")
-        original_embed = discord.Embed(title="기존 자료")
-        self.bot.store.rename_document(
-            1, button.record_id, "Corrected Presentation Title", 101, False
-        )
-        self.bot.store.postpone(1, DAY)
+    async def test_legacy_classification_buttons_redirect_to_web_without_changing_data(self):
+        record = self.seed_legacy_document(kind="slides")
+        path = Path(self.temp.name) / record["file_path"]
+        original_file = path.read_bytes()
         await self.bot.close()
         self.bot = SeminarBot(Settings("test-token-not-used", Path(self.temp.name)))
-        interaction = SimpleNamespace(
-            client=self.bot,
-            guild_id=1,
-            user=SimpleNamespace(id=101),
-            response=SimpleNamespace(defer=AsyncMock()),
-            followup=SimpleNamespace(send=AsyncMock()),
-            message=SimpleNamespace(embeds=[original_embed], edit=AsyncMock()),
-        )
-        match = re.fullmatch(
-            r"seminar:kind:(?P<record_id>\d+):(?P<kind>slides|paper)", button.item.custom_id
-        )
-        restored = await DocumentKindButton.from_custom_id(interaction, button.item, match)
-        await restored.callback(interaction)
-        record = self.bot.store.document(1, restored.record_id)
-        self.assertEqual(record["kind"], "slides")
-        interaction.message.edit.assert_awaited_once()
-        refreshed = interaction.message.edit.await_args.kwargs["embed"]
-        self.assertEqual(refreshed.description, "Corrected Presentation Title")
-        self.assertEqual(
-            next(field.value for field in refreshed.fields if field.name == "발표 회차"),
-            "2026-10-22",
-        )
-        self.assertIn("발표 자료", interaction.followup.send.await_args.args[0])
-        self.assertIn("논문 3편", interaction.followup.send.await_args.args[0])
-
-    async def test_other_member_cannot_classify_with_button(self):
-        record = self.seed_legacy_document(kind="unknown")
-        button = classification_view(record).children[0]
-        interaction = SimpleNamespace(
-            client=self.bot,
-            guild_id=1,
-            user=SimpleNamespace(id=999),
-            response=SimpleNamespace(defer=AsyncMock(), is_done=Mock(return_value=True)),
-            followup=SimpleNamespace(send=AsyncMock()),
-            message=SimpleNamespace(embeds=[], edit=AsyncMock()),
-        )
-        await button.callback(interaction)
-        self.assertEqual(self.bot.store.document(1, button.record_id)["kind"], "unknown")
-        self.assertIn("자료를 올린 사람", interaction.followup.send.await_args.args[0])
-        interaction.message.edit.assert_not_awaited()
+        before = "\n".join(self.bot.store.db.iterdump())
+        for user_id, kind in ((101, "paper"), (999, "slides")):
+            item = discord.ui.Button(custom_id=f"seminar:kind:{record['id']}:{kind}")
+            match = re.fullmatch(
+                r"seminar:kind:(?P<record_id>\d+):(?P<kind>slides|paper)", item.custom_id
+            )
+            interaction = SimpleNamespace(
+                client=self.bot,
+                guild_id=1,
+                user=SimpleNamespace(id=user_id),
+                response=SimpleNamespace(send_message=AsyncMock()),
+                message=SimpleNamespace(edit=AsyncMock()),
+            )
+            restored = await DocumentKindButton.from_custom_id(interaction, item, match)
+            await restored.callback(interaction)
+            sent = interaction.response.send_message.await_args
+            self.assertTrue(sent.kwargs["ephemeral"])
+            self.assertIn("/제출", sent.args[0])
+            self.assertIn("웹페이지", sent.args[0])
+            interaction.message.edit.assert_not_awaited()
+        self.assertEqual("\n".join(self.bot.store.db.iterdump()), before)
+        self.assertEqual(path.read_bytes(), original_file)
 
     async def test_search_defaults_to_papers_and_can_include_slides(self):
         self.seed_legacy_document(kind="slides")

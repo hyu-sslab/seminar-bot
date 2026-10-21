@@ -11,6 +11,7 @@ from discord import app_commands
 from discord.ext import tasks
 
 from .archive import extract_saved
+from .command_sync import sync_commands
 from .documents import MAX_FILE_BYTES, DocumentInfo
 from .remote_parser import extract_remote
 from .rotation import apply_rotation, read_rotations
@@ -36,17 +37,12 @@ def weekly_schedule(config: dict) -> str:
     return f"매주 {WEEKDAYS[config['weekday']]}{when} ({config['timezone']})"
 
 
-def is_manager(interaction: discord.Interaction) -> bool:
-    return (
-        isinstance(interaction.user, discord.Member)
-        and interaction.user.guild_permissions.manage_guild
-    )
-
-
 class DocumentKindButton(
     discord.ui.DynamicItem[discord.ui.Button],
     template=r"seminar:kind:(?P<record_id>\d+):(?P<kind>slides|paper)",
 ):
+    """Handle old archive buttons by directing users to the web submission page."""
+
     def __init__(self, record_id: int, kind: str, selected: bool = False):
         self.record_id = record_id
         self.kind = kind
@@ -63,80 +59,12 @@ class DocumentKindButton(
         return cls(int(match["record_id"]), match["kind"])
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        bot = interaction.client
-        try:
-            if not await bot.tree.interaction_check(interaction):
-                return
-            if interaction.guild_id is None:
-                raise UserError("서버 채널에서 사용해주세요.")
-            await interaction.response.defer(ephemeral=True)
-            async with bot.schedule_lock:
-                record = await bot.classify_document_record(
-                    interaction.guild_id,
-                    self.record_id,
-                    self.kind,
-                    interaction.user.id,
-                    is_manager(interaction),
-                )
-                status = (
-                    bot.store.submission(interaction.guild_id, record["session_id"])
-                    if record["session_id"]
-                    else None
-                )
-            # Keep the public archive acknowledgment in sync with the selected type.
-            if interaction.message and interaction.message.embeds:
-                embed = interaction.message.embeds[0].copy()
-                add_submission_fields(embed, record, status)
-                try:
-                    await interaction.message.edit(embed=embed, view=classification_view(record))
-                except discord.HTTPException:
-                    log.warning(
-                        "Could not refresh classification message for record %s", self.record_id
-                    )
-            text = f"#{self.record_id} 자료를 **{KIND_LABELS[self.kind]}**로 구분했습니다."
-            text += classification_retention_notice(record)
-            if status:
-                text += "\n" + submission_summary(status)
-            await interaction.followup.send(text, ephemeral=True)
-        except Exception as exc:
-            await bot.on_command_error(interaction, exc)
-
-
-def classification_view(record: dict) -> discord.ui.View:
-    view = discord.ui.View(timeout=None)
-    for kind in ("slides", "paper"):
-        if kind == "paper" and Path(record["filename"]).suffix.casefold() != ".pdf":
-            continue
-        view.add_item(DocumentKindButton(record["id"], kind, selected=record["kind"] == kind))
-    return view
-
-
-def classification_retention_notice(record: dict) -> str:
-    if record["kind"] == "paper":
-        return (
-            "\n논문 제목·DOI 등 정보만 보관하고 이 기록의 PDF 원본과 본문은 제거했습니다. "
-            "발표 자료로 다시 바꿔도 원본은 복구되지 않습니다."
+        if not await interaction.client.tree.interaction_check(interaction):
+            return
+        await interaction.response.send_message(
+            "자료 수정은 `/제출`로 받은 본인 전용 웹페이지에서 진행해주세요.",
+            ephemeral=True,
         )
-    if record["kind"] == "slides" and not record["file_path"]:
-        return "\n이 기록에는 보관된 원본이 없습니다. 발표 자료 원본은 `/제출`로 받은 웹페이지에서 올려주세요."
-    return ""
-
-
-def add_submission_fields(embed: discord.Embed, record: dict, status: dict | None) -> None:
-    embed.description = safe(record["title"], 450)
-    fields = {
-        "발표 회차": record["seminar_date"] or "미연결 · /자료연결 로 지정",
-        "자료 구분": f"{KIND_LABELS[record['kind']]} · {safe(record['classification_reason'], 200)}",
-        "제출 현황": submission_summary(status)
-        if status
-        else "회차 미연결 · /자료연결 로 발표 날짜를 지정해주세요.",
-    }
-    for name, value in fields.items():
-        index = next((i for i, field in enumerate(embed.fields) if field.name == name), None)
-        if index is None:
-            embed.add_field(name=name, value=value, inline=False)
-        else:
-            embed.set_field_at(index, name=name, value=value, inline=False)
 
 
 def visible_channel_ids(interaction: discord.Interaction) -> list[int]:
@@ -203,35 +131,7 @@ class SeminarBot(discord.Client):
         self.reminders.start()
 
     async def sync_commands(self) -> None:
-        if self.settings.active_guild_id:
-            guild = discord.Object(id=self.settings.active_guild_id)
-            self.tree.copy_global_to(guild=guild)
-            synced = await self.tree.sync(guild=guild)
-            log.info("Registered %s guild commands for guild %s", len(synced), guild.id)
-            return
-
-        synced = await self.tree.sync()
-        log.info("Registered %s global commands", len(synced))
-        # Older guild registrations survive global sync; refresh existing ones
-        # only in servers already selected by configuration.
-        guild_ids = {config["guild_id"] for config in self.store.all_configs()}
-        if self.settings.api_guild_id:
-            guild_ids.add(self.settings.api_guild_id)
-        for guild_id in sorted(guild_ids):
-            guild = discord.Object(id=guild_id)
-            try:
-                existing = await self.tree.fetch_commands(guild=guild)
-                if not existing:
-                    log.info("No existing guild commands to update for guild %s", guild_id)
-                    continue
-                self.tree.copy_global_to(guild=guild)
-                synced = await self.tree.sync(guild=guild)
-            except discord.HTTPException as error:
-                log.warning(
-                    "Could not update existing guild commands for guild %s: %s", guild_id, error
-                )
-                continue
-            log.info("Registered %s guild commands for guild %s", len(synced), guild_id)
+        await sync_commands(self)
 
     def web_submission_enabled(self, guild_id: int) -> bool:
         return bool(self.settings.api_token) and guild_id == self.settings.api_guild_id
@@ -392,29 +292,6 @@ class SeminarBot(discord.Client):
         if record.get("source_type") in {"web", "manual"} and record.get("session_id"):
             return self.settings.submission_url(record["session_id"]) or record["message_url"]
         return record["message_url"]
-
-    async def classify_document_record(
-        self, guild_id: int, record_id: int, kind: str, user_id: int, manager: bool
-    ) -> dict:
-        """Called under schedule_lock; delete an explicitly reclassified paper first."""
-        record = self.store.document(guild_id, record_id)
-        self.store._can_edit(record, user_id, manager)
-        self.store._validate_kind(kind, record["filename"])
-        if kind == "paper" and record["file_path"]:
-            path = self.settings.data_dir / record["file_path"]
-            archive_root = (self.settings.data_dir / "files").resolve()
-            if not path.resolve().is_relative_to(archive_root):
-                raise UserError("보관 파일 경로를 확인할 수 없어 구분을 바꾸지 않았습니다.")
-            if not self.store.other_documents_use_file(record_id, record["file_path"]):
-                try:
-                    # Unlink the original directory entry, rather than the resolved
-                    # target, so a symlink cannot remove another archive's target.
-                    await asyncio.to_thread(path.unlink, missing_ok=True)
-                except OSError:
-                    raise UserError(
-                        "PDF 원본을 삭제하지 못해 구분을 바꾸지 않았습니다. 저장 공간 권한을 확인해주세요."
-                    ) from None
-        return self.store.classify(guild_id, record_id, kind, user_id, manager)
 
     async def reload_rotation_file(self) -> None:
         configs = self.store.all_configs()
@@ -789,69 +666,6 @@ class SeminarBot(discord.Client):
                 )
             embed.set_footer(text=f"{page}/{(count + 4) // 5} 페이지 · /검색 query:... page:2")
             await interaction.response.send_message(embed=embed, ephemeral=True)
-
-        @tree.command(
-            name="자료수정", description="등록된 자료의 제목을 수정합니다 (업로더 또는 관리자)"
-        )
-        @app_commands.guild_only()
-        async def rename(interaction: discord.Interaction, record_id: int, title: str) -> None:
-            self.store.rename_document(
-                interaction.guild_id, record_id, title, interaction.user.id, is_manager(interaction)
-            )
-            await interaction.response.send_message(
-                f"#{record_id} 제목을 수정했습니다.", ephemeral=True
-            )
-
-        @tree.command(
-            name="자료연결", description="자료를 발표 날짜에 연결합니다 (업로더 또는 관리자)"
-        )
-        @app_commands.guild_only()
-        async def link(interaction: discord.Interaction, record_id: int, seminar_date: str) -> None:
-            async with self.schedule_lock:
-                self.store.link_document(
-                    interaction.guild_id,
-                    record_id,
-                    parse_date(seminar_date),
-                    interaction.user.id,
-                    is_manager(interaction),
-                )
-                record = self.store.document(interaction.guild_id, record_id)
-                status = self.store.submission(interaction.guild_id, record["session_id"])
-            await interaction.response.send_message(
-                f"#{record_id} 자료를 {safe(seminar_date)} 발표에 연결했습니다.\n"
-                + submission_summary(status),
-                ephemeral=True,
-            )
-
-        @tree.command(
-            name="자료분류",
-            description="자료를 발표 자료 또는 논문 PDF로 구분합니다 (버튼으로도 가능)",
-        )
-        @app_commands.guild_only()
-        @app_commands.choices(
-            kind=[
-                app_commands.Choice(name=label, value=value) for value, label in KIND_LABELS.items()
-            ]
-        )
-        async def classify(interaction: discord.Interaction, record_id: int, kind: str) -> None:
-            async with self.schedule_lock:
-                record = await self.classify_document_record(
-                    interaction.guild_id,
-                    record_id,
-                    kind,
-                    interaction.user.id,
-                    is_manager(interaction),
-                )
-                status = (
-                    self.store.submission(interaction.guild_id, record["session_id"])
-                    if record["session_id"]
-                    else None
-                )
-            text = f"#{record_id} 자료를 **{KIND_LABELS[kind]}**로 구분했습니다."
-            text += classification_retention_notice(record)
-            if status:
-                text += "\n" + submission_summary(status)
-            await interaction.response.send_message(text, ephemeral=True)
 
         @tree.command(
             name="제출",
