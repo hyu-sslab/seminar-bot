@@ -29,6 +29,10 @@ class Settings:
     relay_url: str = ""
     connect_token: str = field(default="", repr=False)
 
+    @property
+    def active_guild_id(self) -> int | None:
+        return self.api_guild_id or self.guild_id
+
     def submission_url(self, session_id: int) -> str:
         return f"{self.seminar_page_url}?session={session_id}" if self.seminar_page_url else ""
 

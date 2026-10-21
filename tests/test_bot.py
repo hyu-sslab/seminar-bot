@@ -544,7 +544,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
     async def test_command_sync_respects_explicit_guild_without_global_or_other_guild_requests(
         self,
     ):
-        self.bot.settings = replace(self.bot.settings, guild_id=9, api_guild_id=1)
+        self.bot.settings = replace(self.bot.settings, guild_id=9)
         settings = self.bot.settings
 
         async def sync(*, guild=None):
@@ -565,13 +565,40 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         synced.assert_awaited_once()
         fetched.assert_not_awaited()
         self.assertIs(self.bot.settings, settings)
-        self.assertEqual((settings.guild_id, settings.api_guild_id), (9, 1))
+        self.assertEqual((settings.guild_id, settings.api_guild_id), (9, None))
         self.assertEqual(self.bot.tree.get_commands(guild=discord.Object(id=1)), [])
+
+    async def test_seminar_guild_overrides_old_command_target_and_stale_db_servers(self):
+        self.bot.settings = replace(self.bot.settings, guild_id=9, api_guild_id=2)
+        before = "\n".join(self.bot.store.db.iterdump())
+        with (
+            patch.object(self.bot.tree, "sync", AsyncMock(return_value=[])) as synced,
+            patch.object(self.bot.tree, "fetch_commands", AsyncMock()) as fetched,
+        ):
+            await self.bot.sync_commands()
+        self.assertEqual(synced.await_args.kwargs["guild"].id, 2)
+        fetched.assert_not_awaited()
+        self.assert_latest_guild_commands(2)
+        self.assertEqual(self.bot.tree.get_commands(guild=discord.Object(id=9)), [])
+        self.assertEqual("\n".join(self.bot.store.db.iterdump()), before)
+
+    async def test_commands_reject_inactive_servers_before_any_state_change(self):
+        self.bot.settings = replace(self.bot.settings, api_guild_id=1)
+        before = "\n".join(self.bot.store.db.iterdump())
+        for guild_id in (2, None):
+            interaction = SimpleNamespace(
+                guild_id=guild_id,
+                response=SimpleNamespace(send_message=AsyncMock()),
+            )
+            self.assertFalse(await self.bot.tree.interaction_check(interaction))
+            interaction.response.send_message.assert_awaited_once()
+            self.assertTrue(interaction.response.send_message.await_args.kwargs["ephemeral"])
+        self.assertTrue(await self.bot.tree.interaction_check(SimpleNamespace(guild_id=1)))
+        self.assertEqual("\n".join(self.bot.store.db.iterdump()), before)
 
     async def test_global_command_sync_refreshes_only_existing_guild_scopes_in_sorted_unique_targets(
         self,
     ):
-        self.bot.settings = replace(self.bot.settings, api_guild_id=2)
         events = []
 
         async def sync(*, guild=None):
@@ -590,6 +617,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
                 "all_configs",
                 return_value=[
                     {"guild_id": 3},
+                    {"guild_id": 2},
                     {"guild_id": 1},
                     {"guild_id": 3},
                 ],
@@ -615,7 +643,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fetched.await_count, 3)
         self.assertEqual([call.kwargs["guild"].id for call in copy.call_args_list], [2, 3])
         self.assertEqual(self.bot.tree.get_commands(guild=discord.Object(id=1)), [])
-        self.assertEqual(self.bot.settings.api_guild_id, 2)
+        self.assertIsNone(self.bot.settings.api_guild_id)
 
     async def test_command_sync_continues_after_individual_guild_fetch_and_sync_http_errors(self):
         for guild_id in (2, 3):
@@ -664,7 +692,6 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assert_latest_guild_commands(3)
 
     async def test_global_command_sync_failure_propagates_without_touching_guild_scopes(self):
-        self.bot.settings = replace(self.bot.settings, api_guild_id=3)
         failure = discord.HTTPException(SimpleNamespace(status=503, reason="Unavailable"), "retry")
         with (
             patch.object(
@@ -770,8 +797,12 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(1, self.bot.rotation_errors)
         self.assertEqual("\n".join(self.bot.store.db.iterdump()), postponed)
 
-    async def test_flat_rotation_uses_single_configured_guild_without_changing_env_targets(self):
-        self.bot.settings = replace(self.bot.settings, guild_id=2, api_guild_id=3)
+    async def test_flat_rotation_uses_seminar_guild_despite_stale_configs_and_dev_target(self):
+        self.bot.settings = replace(self.bot.settings, guild_id=9, api_guild_id=1)
+        self.bot.store.configure(2, 2001, 2002, 3, "09:00", "18:00", "Asia/Seoul", NOW)
+        self.bot.store.set_rotation(2, [201, 202], DAY, DAY)
+        stale_config = self.bot.store.require_config(2)
+        stale_sessions = self.bot.store.upcoming(2, DAY)
         self.bot.settings.rotation_file.write_text(
             json.dumps(
                 {
@@ -792,10 +823,19 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             await self.bot.reload_rotation_file()
         self.assertEqual(self.bot.store.session_on(1, DAY)["presenter_id"], 102)
         get_guild.assert_called_once_with(1)
-        self.assertEqual((self.bot.settings.guild_id, self.bot.settings.api_guild_id), (2, 3))
+        self.assertEqual((self.bot.settings.guild_id, self.bot.settings.api_guild_id), (9, 1))
         self.assertFalse(self.bot.rotation_errors)
+        self.assertEqual(self.bot.store.require_config(2), stale_config)
+        self.assertEqual(self.bot.store.upcoming(2, DAY), stale_sessions)
+        self.bot.store.postpone(1, DAY)
+        postponed = "\n".join(self.bot.store.db.iterdump())
+        with patch.object(
+            self.bot, "get_guild", side_effect=AssertionError("unchanged file must not reapply")
+        ):
+            await self.bot.reload_rotation_file()
+        self.assertEqual("\n".join(self.bot.store.db.iterdump()), postponed)
 
-    async def test_flat_rotation_waits_for_configuration_instead_of_using_env_guild_ids(self):
+    async def test_flat_rotation_waits_for_configuration_of_explicit_target(self):
         self.bot.settings.rotation_file.write_text('{"presenters":[{"user_id":"101"}]}')
         fresh = SeminarBot(
             replace(
@@ -815,10 +855,52 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
                 self.assertLogs("seminar_bot.bot", level="WARNING"),
             ):
                 await fresh.reload_rotation_file()
-            self.assertTrue(fresh.rotation_errors.get(None))
+            self.assertIn("/설정", fresh.rotation_errors[1])
             self.assertEqual(fresh.store.all_configs(), [])
         finally:
             await fresh.close()
+
+    async def test_explicit_rotation_target_never_falls_back_to_another_configured_server(self):
+        self.bot.settings = replace(self.bot.settings, api_guild_id=2)
+        self.bot.settings.rotation_file.write_text('{"presenters":[{"user_id":"101"}]}')
+        before = "\n".join(self.bot.store.db.iterdump())
+        with (
+            patch.object(self.bot, "get_guild") as get_guild,
+            self.assertLogs("seminar_bot.bot", level="WARNING"),
+        ):
+            await self.bot.reload_rotation_file()
+        get_guild.assert_not_called()
+        self.assertIn("/설정", self.bot.rotation_errors[2])
+        self.assertNotIn(None, self.bot.rotation_errors)
+        self.assertEqual("\n".join(self.bot.store.db.iterdump()), before)
+
+    async def test_explicit_rotation_target_ignores_other_legacy_guild_entries(self):
+        self.bot.settings = replace(self.bot.settings, api_guild_id=1)
+        self.bot.store.configure(2, 2001, 2002, 3, "09:00", "18:00", "Asia/Seoul", NOW)
+        self.bot.settings.rotation_file.write_text(
+            json.dumps(
+                {
+                    "guilds": {
+                        "1": {"presenters": [{"user_id": "102"}]},
+                        "2": {"presenters": [{"user_id": "201"}]},
+                    }
+                }
+            )
+        )
+        self.bot.rotation_errors[2] = "Old inactive server error"
+        guild = SimpleNamespace(get_member=Mock(return_value=SimpleNamespace(bot=False)))
+        stale = self.bot.store.require_config(2)
+        with (
+            patch.object(self.bot, "get_guild", return_value=guild) as get_guild,
+            patch("seminar_bot.bot.datetime") as clock,
+        ):
+            clock.now.return_value = NOW
+            await self.bot.reload_rotation_file()
+        get_guild.assert_called_once_with(1)
+        self.assertFalse(self.bot.rotation_errors)
+        self.assertEqual(self.bot.store.session_on(1, DAY)["presenter_id"], 102)
+        self.assertEqual(self.bot.store.require_config(2), stale)
+        self.assertEqual(self.bot.store.upcoming(2, DAY), [])
 
     async def test_flat_rotation_rejects_multiple_configs_but_legacy_mapping_still_applies(self):
         self.bot.store.configure(2, 2001, 2002, 3, "09:00", "18:00", "Asia/Seoul", NOW)
@@ -1117,6 +1199,45 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         remote.assert_not_called()
         self.assertEqual(result.extraction_method, "filename")
         self.assertEqual(result.text, "")
+
+    async def test_reminders_ignore_inactive_guild_even_when_it_is_connected_and_enabled(self):
+        self.bot.settings = replace(self.bot.settings, api_guild_id=1)
+        self.enable_notifications()
+        self.bot.store.configure(2, 2001, 2002, 3, "09:00", "18:00", "Asia/Seoul", NOW)
+        self.bot.store.set_rotation(2, [201], DAY, DAY)
+        self.bot.store.configure(
+            2,
+            2001,
+            2002,
+            3,
+            "09:00",
+            "18:00",
+            "Asia/Seoul",
+            NOW,
+            notifications_enabled=True,
+            reminder_start_date=DAY,
+        )
+        stale = self.bot.store.require_config(2)
+        channel = Mock(spec=discord.TextChannel)
+        channel.guild = SimpleNamespace(id=1)
+        channel.send = AsyncMock(return_value=SimpleNamespace(id=1000))
+        with (
+            patch.object(self.bot, "reload_rotation_file", AsyncMock()),
+            patch.object(self.bot, "get_guild", return_value=SimpleNamespace(id=1)) as guild,
+            patch.object(self.bot, "get_channel", return_value=channel) as get_channel,
+            patch("seminar_bot.bot.datetime") as clock,
+        ):
+            clock.now.return_value = NOW
+            await self.bot.reminders()
+        guild.assert_called_once_with(1)
+        get_channel.assert_called_once_with(1001)
+        channel.send.assert_awaited_once()
+        self.assertEqual(self.bot.store.require_config(2), stale)
+        self.assertIsNone(
+            self.bot.store.db.execute(
+                "SELECT 1 FROM deliveries d JOIN sessions s ON s.id=d.session_id WHERE s.guild_id=2"
+            ).fetchone()
+        )
 
     async def test_morning_and_evening_mention_only_presenter_and_persist(self):
         self.enable_web_submission()

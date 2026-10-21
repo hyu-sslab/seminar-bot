@@ -80,8 +80,8 @@ def read_rotations(path: Path, default_guild_id: int | None = None) -> list[Rota
         if default_guild_id is None:
             raise UserError(
                 "발표 순서를 적용할 서버를 자동으로 정할 수 없습니다. "
-                "서버 한 곳에서 먼저 /설정을 실행해주세요. "
-                "설정된 서버가 여러 곳이면 기존 guilds 형식을 사용해주세요."
+                ".env의 SEMINAR_GUILD_ID를 설정하거나 서버 한 곳에서 /설정을 실행해주세요. "
+                "여러 서버를 운영할 경우 기존 guilds 형식을 사용해주세요."
             )
         if type(default_guild_id) is not int or not 0 < default_guild_id <= 2**63 - 1:
             raise UserError("발표 순서를 적용할 서버 ID를 확인해주세요.")
@@ -159,10 +159,12 @@ def apply_rotation(store: Store, rotation: Rotation, now: datetime) -> date | No
     return start
 
 
-def export_rotations(store: Store, now: datetime) -> dict:
+def export_rotations(store: Store, now: datetime, guild_id: int | None = None) -> dict:
     """Adopt current DB state without rebuilding its individual occurrences."""
     guilds = {}
     configs = store.all_configs()
+    if guild_id is not None:
+        configs = [config for config in configs if config["guild_id"] == guild_id]
     for config in configs:
         ids = json.loads(config["rotation"])
         if not ids:
@@ -191,10 +193,14 @@ def main() -> None:
     load_dotenv()
     data_dir = Path(os.getenv("DATA_DIR", "./data")).resolve()
     try:
+        guild = (
+            os.getenv("SEMINAR_GUILD_ID", "").strip() or os.getenv("DISCORD_GUILD_ID", "").strip()
+        )
+        guild_id = snowflake(guild) if guild else None
         with instance_lock(data_dir):
             store = Store(data_dir / "seminar.sqlite3")
             try:
-                data = export_rotations(store, datetime.now(UTC))
+                data = export_rotations(store, datetime.now(UTC), guild_id=guild_id)
                 print(json.dumps(data, ensure_ascii=False, indent=2))
             finally:
                 store.close()

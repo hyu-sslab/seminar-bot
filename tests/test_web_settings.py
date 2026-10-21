@@ -47,6 +47,16 @@ class WebSettingsTests(unittest.TestCase):
         self.assertNotIn(settings.token, repr(settings))
         self.assertNotIn(settings.api_token, repr(settings))
 
+    def test_seminar_guild_is_active_even_without_web_api_and_overrides_dev_guild(self):
+        with patch.dict(os.environ, {"SEMINAR_GUILD_ID": "123", "DISCORD_GUILD_ID": "456"}):
+            settings = Settings.from_env()
+        self.assertEqual(settings.active_guild_id, 123)
+        self.assertEqual(settings.guild_id, 456)
+        self.assertFalse(settings.api_token)
+        with patch.dict(os.environ, {"DISCORD_GUILD_ID": "456"}):
+            self.assertEqual(Settings.from_env().active_guild_id, 456)
+        self.assertIsNone(Settings.from_env().active_guild_id)
+
     def test_private_vpc_configuration_needs_no_public_domain_or_access_application(self):
         env = {
             **self.web_environment(),

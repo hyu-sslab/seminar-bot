@@ -182,7 +182,7 @@ class WebAPITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 503)
         self.assertNotIn("private service diagnostic", await response.text())
 
-    async def test_rotation_display_names_resolve_flat_config_from_db_without_rebinding_api_guild(
+    async def test_rotation_display_names_use_fixed_api_guild_despite_stale_configured_servers(
         self,
     ):
         self.bot.settings.rotation_file.write_text(
@@ -197,18 +197,32 @@ class WebAPITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.api.guild_id, 1)
         self.bot.settings = replace(self.bot.settings, api_guild_id=2)
         other_api = SeminarAPI(self.bot)
-        self.assertEqual(await other_api.names(), {})
+        self.assertEqual(await other_api.names(), {101: "Synthetic Display"})
         self.assertEqual(other_api.guild_id, 2)
-        self.bot.store.configure(
-            2, 2001, 2002, self.day.weekday(), "09:00", "18:00", "UTC", datetime.now(UTC)
-        )
-        self.assertEqual(await self.api.names(), {})
+        for guild_id in (2, 3):
+            self.bot.store.configure(
+                guild_id,
+                2001,
+                2002,
+                self.day.weekday(),
+                "09:00",
+                "18:00",
+                "UTC",
+                datetime.now(UTC),
+            )
+        before = "\n".join(self.bot.store.db.iterdump())
+        self.assertEqual(await self.api.names(), {101: "Synthetic Display"})
+        self.assertEqual(await other_api.names(), {101: "Synthetic Display"})
+        self.assertEqual(self.api.guild_id, 1)
+        self.assertEqual(other_api.guild_id, 2)
         self.bot.settings.rotation_file.write_text(
             json.dumps(
                 {"guilds": {"1": {"presenters": [{"user_id": "101", "name": "Legacy Display"}]}}}
             )
         )
         self.assertEqual(await self.api.names(), {101: "Legacy Display"})
+        self.assertEqual(await other_api.names(), {})
+        self.assertEqual("\n".join(self.bot.store.db.iterdump()), before)
 
     async def test_disconnected_bot_fails_closed_but_authenticated_health_reports_readiness(self):
         self.bot.is_ready.return_value = False

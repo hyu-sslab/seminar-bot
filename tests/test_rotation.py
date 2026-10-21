@@ -162,7 +162,7 @@ class RotationTests(unittest.TestCase):
     def test_export_cli_outputs_json_and_refuses_a_running_instance(self):
         self.store.set_rotation(1, [101, 102], DAY, DAY)
         command = [sys.executable, "-m", "seminar_bot.rotation"]
-        env = dict(os.environ, DATA_DIR=str(self.root))
+        env = dict(os.environ, DATA_DIR=str(self.root), SEMINAR_GUILD_ID="", DISCORD_GUILD_ID="")
         result = subprocess.run(command, env=env, capture_output=True, text=True, check=True)
         exported = json.loads(result.stdout)
         self.assertEqual(set(exported), {"start_date", "presenters"})
@@ -328,6 +328,35 @@ class RotationTests(unittest.TestCase):
         self.assertIsNone(apply_rotation(self.store, rotations[0], NOW))
         self.assertEqual(self.store.upcoming(1, DAY), original)
         self.assertEqual(self.store.upcoming(2, DAY), [])
+
+    def test_export_cli_uses_seminar_guild_without_changing_stale_server_state(self):
+        self.store.set_rotation(1, [101, 102], DAY, DAY)
+        self.store.configure(2, 2001, 2002, 3, "09:00", "18:00", "Asia/Seoul", NOW)
+        self.store.set_rotation(2, [201, 202], DAY, DAY)
+        self.store.postpone(1, DAY)
+        active_sessions = self.store.upcoming(1, DAY)
+        stale = self.store.require_config(2)
+        stale_sessions = self.store.upcoming(2, DAY)
+        stale_fingerprint = self.store.rotation_fingerprint(2)
+        result = subprocess.run(
+            [sys.executable, "-m", "seminar_bot.rotation"],
+            env=dict(
+                os.environ, DATA_DIR=str(self.root), SEMINAR_GUILD_ID="1", DISCORD_GUILD_ID="2"
+            ),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        exported = json.loads(result.stdout)
+        self.assertEqual(set(exported), {"start_date", "presenters"})
+        self.assertEqual({p["user_id"] for p in exported["presenters"]}, {"101", "102"})
+        self.path.write_text(result.stdout)
+        rotation = read_rotations(self.path, default_guild_id=1)[0]
+        self.assertIsNone(apply_rotation(self.store, rotation, NOW))
+        self.assertEqual(self.store.upcoming(1, DAY), active_sessions)
+        self.assertEqual(self.store.require_config(2), stale)
+        self.assertEqual(self.store.upcoming(2, DAY), stale_sessions)
+        self.assertEqual(self.store.rotation_fingerprint(2), stale_fingerprint)
 
     def test_export_of_multiple_active_servers_preserves_each_schedule_and_fingerprint(self):
         self.store.set_rotation(1, [101, 102], DAY, DAY)

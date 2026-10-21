@@ -65,6 +65,8 @@ class DocumentKindButton(
     async def callback(self, interaction: discord.Interaction) -> None:
         bot = interaction.client
         try:
+            if not await bot.tree.interaction_check(interaction):
+                return
             if interaction.guild_id is None:
                 raise UserError("서버 채널에서 사용해주세요.")
             await interaction.response.defer(ephemeral=True)
@@ -146,6 +148,17 @@ def visible_channel_ids(interaction: discord.Interaction) -> list[int]:
     ]
 
 
+class SeminarCommandTree(app_commands.CommandTree):
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        target = self.client.settings.active_guild_id
+        if target is not None and interaction.guild_id != target:
+            await interaction.response.send_message(
+                "이 봇은 설정된 세미나 서버에서만 사용할 수 있습니다.", ephemeral=True
+            )
+            return False
+        return True
+
+
 class SeminarBot(discord.Client):
     def __init__(self, settings: Settings):
         intents = discord.Intents.default()
@@ -155,7 +168,7 @@ class SeminarBot(discord.Client):
         self.settings = settings
         settings.data_dir.mkdir(parents=True, exist_ok=True)
         self.store = Store(settings.data_dir / "seminar.sqlite3")
-        self.tree = app_commands.CommandTree(self)
+        self.tree = SeminarCommandTree(self)
         self.schedule_lock = asyncio.Lock()
         self.upload_slots = asyncio.Semaphore(2)
         self.rotation_errors: dict[int | None, str] = {}
@@ -190,8 +203,8 @@ class SeminarBot(discord.Client):
         self.reminders.start()
 
     async def sync_commands(self) -> None:
-        if self.settings.guild_id:
-            guild = discord.Object(id=self.settings.guild_id)
+        if self.settings.active_guild_id:
+            guild = discord.Object(id=self.settings.active_guild_id)
             self.tree.copy_global_to(guild=guild)
             synced = await self.tree.sync(guild=guild)
             log.info("Registered %s guild commands for guild %s", len(synced), guild.id)
@@ -247,6 +260,11 @@ class SeminarBot(discord.Client):
         except Exception:
             log.exception("Presenter JSON reload failed; keeping existing schedule and retrying")
         for config in self.store.all_configs():
+            if (
+                self.settings.active_guild_id is not None
+                and config["guild_id"] != self.settings.active_guild_id
+            ):
+                continue
             if self.get_guild(config["guild_id"]) is None:
                 continue
             try:
@@ -372,7 +390,10 @@ class SeminarBot(discord.Client):
 
     async def reload_rotation_file(self) -> None:
         configs = self.store.all_configs()
-        default_guild_id = configs[0]["guild_id"] if len(configs) == 1 else None
+        target = self.settings.active_guild_id
+        if target is not None:
+            configs = [config for config in configs if config["guild_id"] == target]
+        default_guild_id = target or (configs[0]["guild_id"] if len(configs) == 1 else None)
         try:
             rotations = await asyncio.to_thread(
                 read_rotations, self.settings.rotation_file, default_guild_id=default_guild_id
@@ -384,6 +405,19 @@ class SeminarBot(discord.Client):
                 self.rotation_errors[None] = message
             return
         self.rotation_errors.pop(None, None)
+        if target is not None:
+            rotations = [rotation for rotation in rotations if rotation.guild_id == target]
+            self.rotation_errors = {
+                guild_id: message
+                for guild_id, message in self.rotation_errors.items()
+                if guild_id == target
+            }
+            if not configs:
+                message = "설정된 세미나 서버에서 먼저 /설정을 실행해주세요."
+                if self.rotation_errors.get(target) != message:
+                    log.warning("Presenter JSON not applied for guild %s: %s", target, message)
+                    self.rotation_errors[target] = message
+                return
         file_guild_ids = {rotation.guild_id for rotation in rotations}
         for config in configs:
             guild_id = config["guild_id"]
