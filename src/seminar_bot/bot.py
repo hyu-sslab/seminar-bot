@@ -638,7 +638,9 @@ class SeminarBot(discord.Client):
                     else ""
                 )
             )
-            await interaction.followup.send(embed=embed)
+            await interaction.followup.send(
+                embed=embed, allowed_mentions=discord.AllowedMentions.none()
+            )
 
         @tree.command(name="스왑", description="두 날짜의 발표자를 교환합니다 (해당 회차만)")
         @app_commands.guild_only()
