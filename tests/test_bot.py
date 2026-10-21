@@ -385,7 +385,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             await self.bot.tree.get_command("일정").callback(interaction)
         embed = interaction.followup.send.await_args.kwargs["embed"]
         entries = embed.description.splitlines()
-        presentations = [line for line in entries if "<@" in line]
+        presentations = [line for line in entries if "휴강" not in line]
         self.assertTrue(presentations)
         self.assertTrue(all("14:00" in line for line in presentations))
         holiday = next(line for line in entries if "휴강" in line)
@@ -410,6 +410,107 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("시작 시간 미설정", embed.footer.text)
         self.assertIn("Asia/Seoul", embed.footer.text)
         self.assertNotIn("None", embed.description + embed.footer.text)
+
+    async def test_schedule_uses_nicknames_then_json_names_without_mentions_or_state_changes(self):
+        self.bot.settings.rotation_file.write_text(
+            json.dumps(
+                {
+                    "presenters": [
+                        {"user_id": "101", "name": "File Name A"},
+                        {"user_id": "102", "name": "File Name B"},
+                    ]
+                }
+            )
+        )
+        guild = SimpleNamespace(
+            get_member=lambda user_id: (
+                SimpleNamespace(display_name="Server Nickname") if user_id == 101 else None
+            ),
+            fetch_member=AsyncMock(),
+        )
+        interaction = SimpleNamespace(
+            guild_id=1,
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        before = "\n".join(self.bot.store.db.iterdump())
+        with (
+            patch.object(self.bot, "reload_rotation_file", AsyncMock()),
+            patch.object(self.bot, "get_guild", return_value=guild),
+            patch("seminar_bot.bot.local_now", return_value=NOW),
+        ):
+            await self.bot.tree.get_command("일정").callback(interaction, 4)
+        sent = interaction.followup.send.await_args.kwargs
+        description = sent["embed"].description
+        self.assertIn("Server Nickname", description)
+        self.assertIn("File Name B", description)
+        self.assertNotIn("File Name A", description)
+        self.assertNotIn("<@", description)
+        self.assertEqual(sent["allowed_mentions"].to_dict()["parse"], [])
+        guild.fetch_member.assert_not_awaited()
+        self.assertEqual("\n".join(self.bot.store.db.iterdump()), before)
+
+    async def test_schedule_fetches_each_missing_presenter_once_and_escapes_display_names(self):
+        self.bot.settings.rotation_file.write_text(
+            '{"presenters":[{"user_id":"101"},{"user_id":"102"}]}'
+        )
+        guild = SimpleNamespace(
+            get_member=Mock(return_value=None),
+            fetch_member=AsyncMock(
+                side_effect=lambda user_id: SimpleNamespace(
+                    display_name="**Name**\n@everyone <@123456789012345678>"
+                    if user_id == 101
+                    else "Fetched Name"
+                )
+            ),
+        )
+        interaction = SimpleNamespace(
+            guild_id=1,
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        with (
+            patch.object(self.bot, "reload_rotation_file", AsyncMock()),
+            patch.object(self.bot, "get_guild", return_value=guild),
+            patch("seminar_bot.bot.local_now", return_value=NOW),
+        ):
+            await self.bot.tree.get_command("일정").callback(interaction, 8)
+        description = interaction.followup.send.await_args.kwargs["embed"].description
+        self.assertEqual(len(description.splitlines()), 8)
+        self.assertIn(safe("**Name** @everyone <@123456789012345678>", 100), description)
+        self.assertIn("Fetched Name", description)
+        self.assertNotIn("<@123456789012345678>", description)
+        self.assertNotIn("@everyone", description)
+        self.assertEqual([c.args[0] for c in guild.fetch_member.await_args_list], [101, 102])
+
+    async def test_presenter_name_failure_keeps_schedule_available_and_json_name_edits_refresh(
+        self,
+    ):
+        guild = SimpleNamespace(
+            get_member=Mock(return_value=None),
+            fetch_member=AsyncMock(
+                side_effect=discord.NotFound(
+                    SimpleNamespace(status=404, reason="Not Found"), "missing member"
+                )
+            ),
+        )
+        before = "\n".join(self.bot.store.db.iterdump())
+        with patch.object(self.bot, "get_guild", return_value=guild):
+            self.bot.settings.rotation_file.write_text("{")
+            for error in (guild.fetch_member.side_effect, ConnectionResetError(), TimeoutError()):
+                with self.subTest(error=type(error).__name__):
+                    guild.fetch_member.side_effect = error
+                    self.assertIn("이름 확인 불가", (await self.bot.presenter_names(1, {101}))[101])
+            self.bot.settings.rotation_file.write_text(
+                '{"presenters":[{"user_id":"101","name":"Original Name"}]}'
+            )
+            self.assertEqual(await self.bot.presenter_names(1, {101}), {101: "Original Name"})
+            self.bot.settings.rotation_file.write_text(
+                '{"presenters":[{"user_id":"101","name":"Updated Name"}]}'
+            )
+            self.assertEqual(await self.bot.presenter_names(1, {101}), {101: "Updated Name"})
+        self.assertEqual(guild.fetch_member.await_count, 3)
+        self.assertEqual("\n".join(self.bot.store.db.iterdump()), before)
 
     async def test_seminar_time_in_reminders_keeps_trigger_times_and_duplicate_protection(self):
         self.enable_web_submission()

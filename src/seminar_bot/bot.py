@@ -236,6 +236,34 @@ class SeminarBot(discord.Client):
     def web_submission_enabled(self, guild_id: int) -> bool:
         return bool(self.settings.api_token) and guild_id == self.settings.api_guild_id
 
+    async def presenter_names(self, guild_id: int, presenter_ids: set[int]) -> dict[int, str]:
+        file_names = {}
+        try:
+            rotations = await asyncio.to_thread(
+                read_rotations, self.settings.rotation_file, default_guild_id=guild_id
+            )
+            for rotation in rotations:
+                if rotation.guild_id == guild_id:
+                    file_names = dict(zip(rotation.presenters, rotation.names, strict=True))
+                    break
+        except (UserError, OSError):
+            pass
+        guild = self.get_guild(guild_id)
+        names = {}
+        for user_id in sorted(presenter_ids):
+            member = guild.get_member(user_id) if guild else None
+            name = " ".join(member.display_name.split()) if member else ""
+            if not name:
+                name = " ".join(file_names.get(user_id, "").split())
+            if not name and guild:
+                try:
+                    member = await guild.fetch_member(user_id)
+                    name = " ".join(member.display_name.split())
+                except (discord.HTTPException, OSError):
+                    pass
+            names[user_id] = name or f"발표자 {user_id} (이름 확인 불가)"
+        return names
+
     async def on_ready(self) -> None:
         log.info("Connected as %s (%s)", self.user, self.user.id if self.user else "?")
 
@@ -615,10 +643,13 @@ class SeminarBot(discord.Client):
                     message += "아직 발표 순서가 없습니다. config/rotation.json의 presenters에 발표자를 등록해주세요."
                 raise UserError(message)
             start = config.get("seminar_time")
+            names = await self.presenter_names(
+                interaction.guild_id, {row["presenter_id"] for row in rows}
+            )
             items = [
                 (
                     row["seminar_date"],
-                    (f"{start} · " if start else "") + f"<@{row['presenter_id']}>",
+                    (f"{start} · " if start else "") + safe(names[row["presenter_id"]], 100),
                 )
                 for row in rows
             ]
