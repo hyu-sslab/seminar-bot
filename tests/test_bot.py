@@ -411,6 +411,50 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Asia/Seoul", embed.footer.text)
         self.assertNotIn("None", embed.description + embed.footer.text)
 
+    async def test_schedule_includes_only_recorded_recent_past_without_creating_history(self):
+        self.bot.store.ensure_horizon(1, DAY + timedelta(days=6))
+        interaction = SimpleNamespace(
+            guild_id=1,
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        before = "\n".join(self.bot.store.db.iterdump())
+        with (
+            patch.object(self.bot, "reload_rotation_file", AsyncMock()),
+            patch.object(
+                self.bot,
+                "presenter_names",
+                AsyncMock(return_value={101: "Presenter A", 102: "Presenter B"}),
+            ),
+            patch("seminar_bot.bot.local_now", return_value=NOW + timedelta(days=6)),
+        ):
+            await self.bot.tree.get_command("일정").callback(interaction, 2)
+        lines = interaction.followup.send.await_args.kwargs["embed"].description.splitlines()
+        self.assertEqual(len(lines), 3)
+        self.assertEqual(lines[0], f"**{DAY}** · Presenter A (지난 발표)")
+        self.assertEqual(lines[1], f"**{DAY + timedelta(weeks=1)}** · Presenter B")
+        self.assertNotIn("지난 발표", lines[1])
+        self.assertEqual("\n".join(self.bot.store.db.iterdump()), before)
+        with self.bot.store.db:
+            self.bot.store.db.execute(
+                "DELETE FROM sessions WHERE seminar_date < ?", (str(DAY + timedelta(days=6)),)
+            )
+        no_history = "\n".join(self.bot.store.db.iterdump())
+        with (
+            patch.object(self.bot, "reload_rotation_file", AsyncMock()),
+            patch.object(
+                self.bot,
+                "presenter_names",
+                AsyncMock(return_value={101: "Presenter A", 102: "Presenter B"}),
+            ),
+            patch("seminar_bot.bot.local_now", return_value=NOW + timedelta(days=6)),
+        ):
+            await self.bot.tree.get_command("일정").callback(interaction, 2)
+        description = interaction.followup.send.await_args.kwargs["embed"].description
+        self.assertNotIn("지난 발표", description)
+        self.assertNotIn(str(DAY), description)
+        self.assertEqual("\n".join(self.bot.store.db.iterdump()), no_history)
+
     async def test_schedule_uses_nicknames_then_json_names_without_mentions_or_state_changes(self):
         self.bot.settings.rotation_file.write_text(
             json.dumps(

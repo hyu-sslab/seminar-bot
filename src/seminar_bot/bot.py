@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import discord
@@ -619,7 +619,8 @@ class SeminarBot(discord.Client):
             await interaction.followup.send(text, ephemeral=True)
 
         @tree.command(
-            name="일정", description="다가오는 발표자·세미나 시작 시간과 휴강일을 확인합니다"
+            name="일정",
+            description="최근 지난 발표와 다가오는 발표자·시작 시간·휴강일을 확인합니다",
         )
         @app_commands.guild_only()
         async def schedule(
@@ -631,6 +632,11 @@ class SeminarBot(discord.Client):
             today = local_now(config).date()
             async with self.schedule_lock:
                 rows = self.store.upcoming(interaction.guild_id, today, weeks)
+                previous = self.store.recent_session(
+                    interaction.guild_id, today - timedelta(days=1)
+                )
+                if previous and previous["seminar_date"] >= (today - timedelta(days=7)).isoformat():
+                    rows.insert(0, previous)
                 holidays = self.store.holidays(interaction.guild_id, today)
             if not rows:
                 error = self.rotation_errors.get(None) or self.rotation_errors.get(
@@ -649,7 +655,9 @@ class SeminarBot(discord.Client):
             items = [
                 (
                     row["seminar_date"],
-                    (f"{start} · " if start else "") + safe(names[row["presenter_id"]], 100),
+                    (f"{start} · " if start else "")
+                    + safe(names[row["presenter_id"]], 100)
+                    + (" (지난 발표)" if row["seminar_date"] < today.isoformat() else ""),
                 )
                 for row in rows
             ]
