@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import io
 import json
+import sqlite3
 import tempfile
 import unittest
 import uuid
@@ -10,7 +12,7 @@ from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 from urllib.parse import quote
 
 from aiohttp.test_utils import TestClient, TestServer
@@ -21,6 +23,7 @@ from seminar_bot.access import AccessUnavailable
 from seminar_bot.bot import SeminarBot
 from seminar_bot.documents import DocumentInfo
 from seminar_bot.parser_service import create_parser_app
+from seminar_bot.remote_parser import ParserUnavailable
 from seminar_bot.settings import Settings
 from seminar_bot.web_api import SeminarAPI, session_version
 
@@ -454,6 +457,131 @@ class WebAPITests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Traceback", await response.text())
         self.assertEqual(self.count_documents(), 0)
         self.assertEqual(self.files(), [])
+
+    async def test_error_diagnostics_correlate_request_log_without_private_exception_text(self):
+        request_id = str(uuid.uuid4())
+        private = "private-exception-with-internal-path-and-credentials"
+        with (
+            patch.object(
+                self.bot, "extract_document", AsyncMock(side_effect=RuntimeError(private))
+            ),
+            self.assertLogs("seminar_bot.web_api", level="ERROR") as logs,
+        ):
+            response = await self.upload(headers={"X-Seminar-Request-ID": request_id})
+        payload = await response.json()
+        self.assertEqual(response.status, 503)
+        self.assertEqual(payload["code"], "internal_error")
+        self.assertEqual(payload["diagnostics"]["request_id"], request_id)
+        self.assertEqual(payload["diagnostics"]["stage"], "nas_parse")
+        self.assertGreater(payload["diagnostics"]["uploaded_bytes"], 0)
+        self.assertGreaterEqual(payload["diagnostics"]["elapsed_ms"], 0)
+        self.assertEqual(response.headers["X-Seminar-Request-ID"], request_id)
+        self.assertIn(request_id, "".join(logs.output))
+        self.assertIn('"exception_type": "RuntimeError"', "".join(logs.output))
+        self.assertNotIn("exception_type", payload["diagnostics"])
+        self.assertNotIn(private, json.dumps(payload) + "".join(logs.output))
+        self.assertNotIn(self.bot.settings.api_token, json.dumps(payload) + "".join(logs.output))
+        self.assertEqual(self.count_documents(), 0)
+        self.assertEqual(self.files(), [])
+
+    async def test_invalid_request_id_is_replaced_even_on_auth_failure(self):
+        response = await self.client.get(
+            "/v1/sessions", headers={"X-Seminar-Request-ID": "not-a-uuid-private-value"}
+        )
+        payload = await response.json()
+        self.assertEqual(response.status, 401)
+        self.assertEqual(payload["code"], "nas_auth_failed")
+        self.assertEqual(payload["diagnostics"]["stage"], "nas_auth")
+        self.assertEqual(
+            str(uuid.UUID(payload["diagnostics"]["request_id"])),
+            response.headers["X-Seminar-Request-ID"],
+        )
+        self.assertNotIn("not-a-uuid-private-value", await response.text())
+
+    async def test_parser_diagnostics_distinguish_timeout_rejection_and_invalid_response(self):
+        for code, upstream in (
+            ("parser_timeout", None),
+            ("parser_rejected", 503),
+            ("parser_invalid_response", None),
+            ("parser_config_invalid", None),
+            ("not-a-known-code", None),
+        ):
+            with (
+                self.subTest(code=code),
+                patch.object(
+                    self.bot,
+                    "extract_document",
+                    AsyncMock(side_effect=ParserUnavailable("private exception", code, upstream)),
+                ),
+                self.assertLogs("seminar_bot.web_api", level="ERROR"),
+            ):
+                response = await self.upload()
+            payload = await response.json()
+            self.assertEqual(response.status, 503)
+            self.assertEqual(
+                payload["code"], code if code != "not-a-known-code" else "parser_unavailable"
+            )
+            self.assertEqual(payload["diagnostics"]["stage"], "nas_parse")
+            self.assertEqual(payload["diagnostics"].get("upstream_status"), upstream)
+            self.assertNotIn("private exception", await response.text())
+            self.assertEqual(self.files(), [])
+
+    async def test_api_timeout_and_connection_loss_have_distinct_safe_diagnostics(self):
+        for failure, status, code in (
+            (TimeoutError("private timeout detail"), 408, "upload_timeout"),
+            (ConnectionError("private connection detail"), 503, "connection_interrupted"),
+        ):
+            with (
+                self.subTest(code=code),
+                patch.object(self.bot, "extract_document", AsyncMock(side_effect=failure)),
+                self.assertLogs("seminar_bot.web_api", level="WARNING"),
+            ):
+                response = await self.upload()
+            payload = await response.json()
+            self.assertEqual(response.status, status)
+            self.assertEqual(payload["code"], code)
+            self.assertEqual(payload["diagnostics"]["stage"], "nas_parse")
+            self.assertNotIn("private", await response.text())
+            self.assertEqual(self.files(), [])
+
+    async def test_storage_diagnostics_distinguish_permissions_capacity_and_io_failure(self):
+        for failure, code in (
+            (PermissionError("private NAS path"), "storage_permission_denied"),
+            (OSError(errno.ENOSPC, "private NAS path"), "storage_full"),
+            (OSError(errno.EDQUOT, "private NAS path"), "storage_full"),
+            (OSError(errno.EIO, "private NAS path"), "storage_unavailable"),
+        ):
+            with (
+                self.subTest(code=code),
+                patch("seminar_bot.web_api.shutil.disk_usage", side_effect=failure),
+                self.assertLogs("seminar_bot.web_api", level="ERROR"),
+            ):
+                response = await self.upload()
+            payload = await response.json()
+            self.assertEqual(response.status, 503)
+            self.assertEqual(payload["code"], code)
+            self.assertEqual(payload["diagnostics"]["stage"], "nas_storage")
+            self.assertNotIn("private NAS path", await response.text())
+
+    async def test_database_diagnostics_distinguish_locked_database(self):
+        for error_code, code in (
+            (sqlite3.SQLITE_BUSY, "database_busy"),
+            (sqlite3.SQLITE_ERROR, "database_error"),
+        ):
+            failure = sqlite3.OperationalError("private database detail")
+            failure.sqlite_errorcode = error_code
+            with (
+                self.subTest(code=code),
+                patch.object(self.bot.store, "add_document", side_effect=failure),
+                self.assertLogs("seminar_bot.web_api", level="ERROR"),
+            ):
+                response = await self.upload()
+            payload = await response.json()
+            self.assertEqual(response.status, 503)
+            self.assertEqual(payload["code"], code)
+            self.assertEqual(payload["diagnostics"]["stage"], "nas_store")
+            self.assertNotIn("private database detail", await response.text())
+            self.assertEqual(self.files(), [])
 
     async def test_canonical_uuid_retry_returns_existing_record_without_extra_files(self):
         key = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"

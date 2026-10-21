@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import hmac
 import json
 import logging
 import re
 import shutil
+import sqlite3
 import tempfile
+import time
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -19,6 +22,7 @@ from aiohttp import web
 
 from .access import AccessUnavailable, AccessVerifier
 from .documents import DocumentInfo, validate_paper_fields
+from .remote_parser import ParserUnavailable
 from .rotation import read_rotations
 from .store import UserError, local_now
 from .submission_access import SubmissionAccess, SubmissionAccessDenied, session_version
@@ -26,6 +30,38 @@ from .submission_access import SubmissionAccess, SubmissionAccessDenied, session
 log = logging.getLogger(__name__)
 WEB_MAX_BYTES = 20 * 1024 * 1024
 PRIVATE_HEADERS = {"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"}
+REQUEST_ID = re.compile(r"[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}")
+STATUS_CODES = {
+    400: "invalid_request",
+    401: "nas_auth_failed",
+    403: "request_not_allowed",
+    404: "not_found",
+    409: "conflict",
+    413: "file_too_large",
+    415: "unsupported_media_type",
+    429: "rate_limited",
+    503: "backend_unavailable",
+}
+PARSER_ERRORS = {
+    "parser_unavailable": "문서 분석 서버에 연결할 수 없습니다. 분석 컨테이너의 상태를 확인해주세요.",
+    "parser_timeout": "문서 분석 서버의 응답 시간이 초과되었습니다.",
+    "parser_invalid_response": "문서 분석 서버의 응답 형식이 올바르지 않습니다.",
+    "parser_rejected": "문서 분석 서버가 요청을 처리하지 못했습니다.",
+    "parser_config_invalid": "문서 분석 서버 연결 설정이 올바르지 않습니다.",
+}
+EXCEPTION_TYPES = {
+    RuntimeError: "RuntimeError",
+    ValueError: "ValueError",
+    TypeError: "TypeError",
+    KeyError: "KeyError",
+    AttributeError: "AttributeError",
+    AssertionError: "AssertionError",
+    MemoryError: "MemoryError",
+}
+
+
+def diagnostic_stage(request, stage: str) -> None:
+    request["seminar_diagnostics"]["stage"] = stage
 
 
 class APIError(Exception):
@@ -153,12 +189,44 @@ class SeminarAPI:
 
     @web.middleware
     async def guard(self, request, handler):
+        started = time.monotonic()
+        supplied_id = request.headers.get("X-Seminar-Request-ID", "")
+        request_id = supplied_id if REQUEST_ID.fullmatch(supplied_id) else str(uuid.uuid4())
+        request["seminar_diagnostics"] = {"request_id": request_id, "stage": "nas_auth"}
+
+        def error_response(
+            status: int, message: str, code: str, upstream_status=None, exception_type=None
+        ):
+            diagnostics = {
+                **request["seminar_diagnostics"],
+                "elapsed_ms": min(600_000, max(0, int((time.monotonic() - started) * 1000))),
+            }
+            if upstream_status is not None:
+                diagnostics["upstream_status"] = upstream_status
+            # Only fixed codes/stages and bounded counters are logged. No
+            # exception text, credentials, query strings, paths, or filenames.
+            log.log(
+                logging.ERROR if status >= 500 else logging.WARNING,
+                "Seminar API failure %s",
+                json.dumps(
+                    {
+                        "code": code,
+                        "status": status,
+                        **diagnostics,
+                        **({"exception_type": exception_type} if exception_type else {}),
+                    }
+                ),
+            )
+            return web.json_response(
+                {"error": message, "code": code, "diagnostics": diagnostics},
+                status=status,
+                headers={**PRIVATE_HEADERS, "X-Seminar-Request-ID": request_id},
+            )
+
         expected = f"Bearer {self.settings.api_token}".encode()
         provided = request.headers.get("Authorization", "").encode()
         if not hmac.compare_digest(expected, provided):
-            return web.json_response(
-                {"error": "인증이 필요합니다."}, status=401, headers=PRIVATE_HEADERS
-            )
+            return error_response(401, "인증이 필요합니다.", "nas_auth_failed")
         try:
             if self.access is not None:
                 assertion = request.headers.get("Cf-Access-Jwt-Assertion", "")
@@ -169,8 +237,14 @@ class SeminarAPI:
                 request.headers.get("X-Seminar-Relay-Token", "").encode(),
             ):
                 raise APIError(401, "비공개 중계 서버 인증을 확인할 수 없습니다.")
+            diagnostic_stage(request, "nas_ready")
             if request.path != "/v1/health" and not self.bot.is_ready():
-                raise APIError(503, "봇이 Discord에 연결 중입니다. 잠시 후 다시 시도해주세요.")
+                raise APIError(
+                    503,
+                    "봇이 Discord에 연결 중입니다. 잠시 후 다시 시도해주세요.",
+                    "bot_not_ready",
+                )
+            diagnostic_stage(request, "nas_auth")
             if "X-Seminar-Submission-Token" in request.headers:
                 await self.bot.reload_rotation_file()
                 async with self.bot.schedule_lock:
@@ -191,35 +265,73 @@ class SeminarAPI:
                         raise APIError(403, "이 링크로는 본인의 자료만 제출할 수 있습니다.")
                     if request.path != "/v1/submission/context":
                         self._session(request)
+            diagnostic_stage(request, "nas_request")
             response = await handler(request)
         except SubmissionAccessDenied as exc:
-            response = web.json_response({"error": str(exc)}, status=401)
+            response = error_response(401, str(exc), "submission_access_denied")
         except APIError as exc:
-            payload = {"error": str(exc)}
-            if exc.code:
-                payload["code"] = exc.code
-            response = web.json_response(payload, status=exc.status)
+            response = error_response(
+                exc.status, str(exc), exc.code or STATUS_CODES.get(exc.status, "invalid_request")
+            )
         except AccessUnavailable:
-            response = web.json_response(
-                {"error": "서버 인증 서비스를 확인할 수 없습니다. 잠시 후 다시 시도해주세요."},
-                status=503,
+            response = error_response(
+                503,
+                "서버 인증 서비스를 확인할 수 없습니다. 잠시 후 다시 시도해주세요.",
+                "access_unavailable",
             )
         except UserError as exc:
-            response = web.json_response({"error": str(exc)}, status=400)
+            response = error_response(400, str(exc), "invalid_request")
         except web.HTTPException as exc:
-            response = web.json_response({"error": "허용되지 않는 요청입니다."}, status=exc.status)
-        except (TimeoutError, ConnectionError):
-            response = web.json_response(
-                {"error": "전송 시간이 초과되었습니다. 다시 시도해주세요."}, status=408
+            response = error_response(
+                exc.status, "허용되지 않는 요청입니다.", "request_not_allowed"
             )
-        except Exception:
-            # No bearer headers, file contents, or original exceptions in HTTP responses.
-            log.exception("Seminar API request failed")
-            response = web.json_response(
-                {"error": "자료 서비스를 사용할 수 없습니다. 잠시 후 다시 시도해주세요."},
-                status=503,
+        except ParserUnavailable as exc:
+            code = exc.code if exc.code in PARSER_ERRORS else "parser_unavailable"
+            response = error_response(503, PARSER_ERRORS[code], code, exc.upstream_status)
+        except TimeoutError:
+            response = error_response(
+                408, "자료 처리 시간이 초과되었습니다. 다시 시도해주세요.", "upload_timeout"
+            )
+        except ConnectionError:
+            response = error_response(
+                503, "자료 전송 중 연결이 끊겼습니다. 다시 시도해주세요.", "connection_interrupted"
+            )
+        except PermissionError:
+            response = error_response(
+                503,
+                "NAS 저장소에 접근할 권한이 없습니다. 컨테이너 사용자와 폴더 ACL을 확인해주세요.",
+                "storage_permission_denied",
+            )
+        except OSError as exc:
+            full = exc.errno in {errno.ENOSPC, errno.EDQUOT}
+            response = error_response(
+                503,
+                "NAS 저장 공간 또는 할당량이 부족합니다."
+                if full
+                else "NAS 저장소에서 파일을 처리하지 못했습니다.",
+                "storage_full" if full else "storage_unavailable",
+            )
+        except sqlite3.Error as exc:
+            busy = getattr(exc, "sqlite_errorcode", 0) & 0xFF in {
+                sqlite3.SQLITE_BUSY,
+                sqlite3.SQLITE_LOCKED,
+            }
+            response = error_response(
+                503,
+                "자료 DB가 다른 작업에 사용 중입니다. 잠시 후 다시 시도해주세요."
+                if busy
+                else "자료 DB를 읽거나 저장하지 못했습니다.",
+                "database_busy" if busy else "database_error",
+            )
+        except Exception as exc:
+            response = error_response(
+                503,
+                "자료 서비스 내부 오류가 발생했습니다. 요청 ID로 서버 로그를 확인해주세요.",
+                "internal_error",
+                exception_type=EXCEPTION_TYPES.get(type(exc), "Exception"),
             )
         response.headers.update(PRIVATE_HEADERS)
+        response.headers["X-Seminar-Request-ID"] = request_id
         return response
 
     def config(self) -> dict:
@@ -474,6 +586,7 @@ class SeminarAPI:
         )
 
     async def upload(self, request):
+        diagnostic_stage(request, "nas_upload")
         kind = request.query.get("kind")
         if kind not in {"slides", "paper"}:
             raise APIError(400, "발표 자료 또는 논문 영역을 선택해주세요.")
@@ -485,7 +598,11 @@ class SeminarAPI:
         filename = filename_from_header(request.headers.get("X-Filename", ""))
         suffix = Path(filename).suffix.casefold()
         if suffix not in {".pdf", ".ppt", ".pptx"} or (kind == "paper" and suffix != ".pdf"):
-            raise APIError(400, "발표 자료는 PDF/PPT/PPTX, 논문은 PDF만 제출할 수 있습니다.")
+            raise APIError(
+                400,
+                "발표 자료는 PDF/PPT/PPTX, 논문은 PDF만 제출할 수 있습니다.",
+                "file_type_invalid",
+            )
         try:
             key = request.headers.get("Idempotency-Key", "")
             upload_id = uuid.UUID(key)
@@ -493,7 +610,9 @@ class SeminarAPI:
                 raise ValueError
             key = str(upload_id)
         except ValueError as exc:
-            raise APIError(400, "업로드 ID가 올바르지 않습니다. 파일을 다시 선택해주세요.") from exc
+            raise APIError(
+                400, "업로드 ID가 올바르지 않습니다. 파일을 다시 선택해주세요.", "upload_id_invalid"
+            ) from exc
         if request.content_length is not None and request.content_length > self.max_bytes:
             raise APIError(413, "파일 크기 제한을 초과했습니다.")
         async with self.bot.schedule_lock:
@@ -505,25 +624,35 @@ class SeminarAPI:
             if kind == "slides"
             else Path(tempfile.gettempdir()) / "seminar-paper-uploads"
         )
+        diagnostic_stage(request, "nas_storage")
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         if shutil.disk_usage(directory).free < self.max_bytes + 4 * 1024 * 1024:
-            raise APIError(503, "임시 처리 또는 보관 공간이 부족합니다. 관리자에게 문의해주세요.")
+            raise APIError(
+                503,
+                "임시 처리 또는 보관 공간이 부족합니다. 관리자에게 문의해주세요.",
+                "storage_low_space",
+            )
         path = directory / f"web-{uuid.uuid4()}{suffix}"
         saved = False
         try:
+            diagnostic_stage(request, "nas_upload")
             async with self.bot.upload_slots:
                 async with asyncio.timeout(65):
                     length = 0
                     digest = hashlib.sha256()
+                    diagnostic_stage(request, "nas_storage")
                     with path.open("xb") as stream:
+                        diagnostic_stage(request, "nas_receive")
                         async for chunk in request.content.iter_chunked(64 * 1024):
                             length += len(chunk)
+                            request["seminar_diagnostics"]["uploaded_bytes"] = length
                             if length > self.max_bytes:
                                 raise APIError(413, "파일 크기 제한을 초과했습니다.")
                             digest.update(chunk)
                             await asyncio.to_thread(stream.write, chunk)
                     if not length:
-                        raise APIError(400, "빈 파일은 제출할 수 없습니다.")
+                        raise APIError(400, "빈 파일은 제출할 수 없습니다.", "file_empty")
+                    diagnostic_stage(request, "nas_storage")
                     with path.open("rb") as prefix_file:
                         prefix = prefix_file.read(1024)
                     valid_header = (
@@ -535,7 +664,12 @@ class SeminarAPI:
                         or (suffix == ".pptx" and prefix.startswith(b"PK\x03\x04"))
                     )
                     if not valid_header:
-                        raise APIError(400, "파일 확장자와 실제 문서 형식이 일치하지 않습니다.")
+                        raise APIError(
+                            400,
+                            "파일 확장자와 실제 문서 형식이 일치하지 않습니다.",
+                            "file_type_invalid",
+                        )
+                    diagnostic_stage(request, "nas_store")
                     async with self.bot.schedule_lock:
                         self._check_upload_deleted(key)
                         existing = self.bot.store.web_upload(self.guild_id, key)
@@ -568,8 +702,11 @@ class SeminarAPI:
                                     "duplicate": True,
                                 }
                             )
+                    diagnostic_stage(request, "nas_storage")
                     data = await asyncio.to_thread(path.read_bytes)
+                    diagnostic_stage(request, "nas_parse")
                     info = await self.bot.extract_document(path, filename, data)
+                    diagnostic_stage(request, "nas_store")
                     async with self.bot.schedule_lock:
                         current = self._session(request)
                         check_version(request, current)

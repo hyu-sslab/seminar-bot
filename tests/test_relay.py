@@ -354,6 +354,15 @@ class RelayIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.calls), 1)
         await self.read_response(request)
 
+    async def test_existing_wire_uuid_is_forwarded_to_local_api_without_protocol_change(self):
+        request = self.request()
+        self.assertNotIn("x-seminar-request-id", request["headers"])
+        await self.begin(request)
+        response = await self.end_upload(request)
+        self.assertEqual(response["status"], 200)
+        await self.read_response(request)
+        self.assertEqual(self.calls[0][2]["X-Seminar-Request-ID"], request["id"])
+
     async def test_stalled_upload_timeout_closes_and_cleans_spool(self):
         request = self.request("PUT", "/v1/sessions/1/documents?kind=paper")
         with patch("seminar_bot.relay.REQUEST_TIMEOUT", 0.03):

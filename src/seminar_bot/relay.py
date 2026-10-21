@@ -403,7 +403,10 @@ class _Connection:
             async with self.local.request(
                 active.method,
                 f"http://127.0.0.1:{self.settings.api_port}{active.path}",
-                headers=active.headers,
+                # The protocol's existing UUID also correlates local API logs.
+                # Do not extend v1's strict wire-header allowlist: old NAS
+                # connectors must keep accepting requests from newer Workers.
+                headers={**active.headers, "X-Seminar-Request-ID": active.request_id},
                 data=self.body(active) if active.body else None,
                 allow_redirects=False,
             ) as response:

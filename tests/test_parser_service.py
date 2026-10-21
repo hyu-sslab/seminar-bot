@@ -278,10 +278,12 @@ class RemoteParserTests(unittest.IsolatedAsyncioTestCase):
             "http://name:password@localhost:8081",
             "http://localhost:bad",
         ]:
-            with self.subTest(url=url), self.assertRaises(ParserUnavailable):
+            with self.subTest(url=url), self.assertRaises(ParserUnavailable) as raised:
                 await self._extract(url=url)
-        with self.assertRaises(ParserUnavailable):
+            self.assertEqual(raised.exception.code, "parser_config_invalid")
+        with self.assertRaises(ParserUnavailable) as raised:
             await self._extract(url="http://127.0.0.1:1")
+        self.assertEqual(raised.exception.code, "parser_unavailable")
         self.assertEqual(self.requests, [])
 
     async def test_redirects_and_non_json_fail_without_exposing_response_contents(self):
@@ -297,6 +299,15 @@ class RemoteParserTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ParserUnavailable) as raised:
                 await self._extract()
             self.assertNotIn("private", str(raised.exception))
+            self.assertIn(raised.exception.code, {"parser_rejected", "parser_invalid_response"})
+
+    async def test_rejected_parser_reports_only_status_and_fixed_code(self):
+        self.handler = lambda request: web.Response(text="private parser credentials", status=503)
+        with self.assertRaises(ParserUnavailable) as raised:
+            await self._extract()
+        self.assertEqual(raised.exception.code, "parser_rejected")
+        self.assertEqual(raised.exception.upstream_status, 503)
+        self.assertNotIn("private", str(raised.exception))
 
     async def test_document_shapes_lengths_and_checksum_are_validated(self):
         changes = [
@@ -347,6 +358,7 @@ class RemoteParserTests(unittest.IsolatedAsyncioTestCase):
         self.handler = stalled
         with (
             patch.object(remote_parser, "PARSER_TIMEOUT_SECONDS", 0.02),
-            self.assertRaises(ParserUnavailable),
+            self.assertRaises(ParserUnavailable) as raised,
         ):
             await self._extract()
+        self.assertEqual(raised.exception.code, "parser_timeout")
