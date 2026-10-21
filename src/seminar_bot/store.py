@@ -25,10 +25,10 @@ def parse_date(value: str) -> date:
 
 
 def parse_time(value: str) -> time:
-    if not re.fullmatch(r"\d{2}:\d{2}", value):
+    if not re.fullmatch(r"[0-9]{2}:[0-9]{2}", value):
         raise UserError("시간은 HH:MM 형식으로 입력해주세요. 예: 09:00")
     try:
-        return time.fromisoformat(value)
+        return time(hour=int(value[:2]), minute=int(value[3:]))
     except ValueError as exc:
         raise UserError("시간은 00:00~23:59 사이여야 합니다.") from exc
 
@@ -50,7 +50,7 @@ class Store:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.execute("PRAGMA busy_timeout=5000")
-        if self.db.execute("PRAGMA user_version").fetchone()[0] > 6:
+        if self.db.execute("PRAGMA user_version").fetchone()[0] > 7:
             self.db.close()
             raise ValueError("데이터베이스 버전이 봇보다 새롭습니다. 봇을 업데이트해주세요.")
         self.db.executescript("""
@@ -62,6 +62,7 @@ class Store:
                 morning TEXT NOT NULL,
                 evening TEXT NOT NULL,
                 timezone TEXT NOT NULL,
+                seminar_time TEXT,
                 rotation TEXT NOT NULL DEFAULT '[]',
                 next_date TEXT,
                 next_index INTEGER NOT NULL DEFAULT 0
@@ -152,6 +153,10 @@ class Store:
         columns = {row["name"] for row in self.db.execute("PRAGMA table_info(documents)")}
         with self.db:
             self.db.execute("BEGIN")
+            if "seminar_time" not in {
+                row["name"] for row in self.db.execute("PRAGMA table_info(guilds)")
+            }:
+                self.db.execute("ALTER TABLE guilds ADD COLUMN seminar_time TEXT")
             if "kind" not in columns:
                 self.db.execute(
                     "ALTER TABLE documents ADD COLUMN kind TEXT NOT NULL DEFAULT 'unknown' CHECK(kind IN ('slides','paper','unknown'))"
@@ -199,7 +204,7 @@ class Store:
                 "CREATE UNIQUE INDEX IF NOT EXISTS web_upload_key ON documents(guild_id, upload_key) "
                 "WHERE upload_key IS NOT NULL"
             )
-            self.db.execute("PRAGMA user_version=6")
+            self.db.execute("PRAGMA user_version=7")
 
     def close(self) -> None:
         self.db.close()
@@ -227,9 +232,15 @@ class Store:
         evening: str,
         timezone: str,
         now: datetime | None = None,
+        *,
+        seminar_time: str | None = None,
     ) -> int:
         if weekday not in range(7):
             raise UserError("요일 값이 올바르지 않습니다.")
+        if seminar_time is not None:
+            if not isinstance(seminar_time, str):
+                raise UserError("세미나 시작 시간은 HH:MM 형식으로 입력해주세요.")
+            parse_time(seminar_time)
         if parse_time(morning) >= parse_time(evening):
             raise UserError("아침 알림 시간은 저녁 요청 시간보다 빨라야 합니다.")
         try:
@@ -256,13 +267,23 @@ class Store:
             self.db.execute(
                 """
                 INSERT INTO guilds(guild_id, channel_id, upload_channel_id, weekday,
-                    morning, evening, timezone) VALUES(?,?,?,?,?,?,?)
+                    morning, evening, timezone, seminar_time) VALUES(?,?,?,?,?,?,?,?)
                 ON CONFLICT(guild_id) DO UPDATE SET
                     channel_id=excluded.channel_id, upload_channel_id=excluded.upload_channel_id,
                     weekday=excluded.weekday, morning=excluded.morning,
-                    evening=excluded.evening, timezone=excluded.timezone
+                    evening=excluded.evening, timezone=excluded.timezone,
+                    seminar_time=COALESCE(excluded.seminar_time, guilds.seminar_time)
             """,
-                (guild_id, channel_id, upload_channel_id, weekday, morning, evening, timezone),
+                (
+                    guild_id,
+                    channel_id,
+                    upload_channel_id,
+                    weekday,
+                    morning,
+                    evening,
+                    timezone,
+                    seminar_time,
+                ),
             )
         return delta
 

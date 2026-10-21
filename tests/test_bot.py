@@ -7,7 +7,7 @@ import re
 import tempfile
 import unittest
 from dataclasses import replace
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -59,6 +59,149 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
                 {"guilds": {"1": {"presenters": [{"user_id": str(user_id)} for user_id in ids]}}}
             )
         )
+
+    def configuration_interaction(self):
+        target = SimpleNamespace(
+            id=1001,
+            guild=SimpleNamespace(id=1),
+            mention="<#1001>",
+            permissions_for=lambda _: SimpleNamespace(
+                view_channel=True, send_messages=True, embed_links=True, read_message_history=True
+            ),
+        )
+        interaction = SimpleNamespace(
+            guild_id=1,
+            guild=SimpleNamespace(me=object()),
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        return interaction, target
+
+    async def test_configure_seminar_time_has_korean_option_and_omission_preserves_saved_time(self):
+        command = self.bot.tree.get_command("설정")
+        options = command.to_dict(self.bot.tree)["options"]
+        option = next(item for item in options if item["name"] == "세미나시간")
+        self.assertFalse(option.get("required", False))
+        interaction, target = self.configuration_interaction()
+        sessions = [
+            dict(row) for row in self.bot.store.db.execute("SELECT * FROM sessions ORDER BY id")
+        ]
+        with patch.object(self.bot, "reload_rotation_file", AsyncMock()):
+            await command.callback(interaction, 3, target, target, seminar_time="14:00")
+            configured = self.bot.store.require_config(1)
+            self.assertEqual(
+                (configured["seminar_time"], configured["morning"], configured["evening"]),
+                ("14:00", "09:00", "18:00"),
+            )
+            response = interaction.followup.send.await_args.args[0]
+            self.assertIn("매주 목요일 14:00 (Asia/Seoul)", response)
+            self.assertIn("알림: 아침 09:00 / 저녁 18:00", response)
+            await command.callback(interaction, 3, target, target, morning="08:20", evening="19:10")
+        configured = self.bot.store.require_config(1)
+        self.assertEqual(
+            (configured["seminar_time"], configured["morning"], configured["evening"]),
+            ("14:00", "08:20", "19:10"),
+        )
+        response = interaction.followup.send.await_args.args[0]
+        self.assertIn("매주 목요일 14:00 (Asia/Seoul)", response)
+        self.assertIn("알림: 아침 08:20 / 저녁 19:10", response)
+        self.assertEqual(
+            [dict(row) for row in self.bot.store.db.execute("SELECT * FROM sessions ORDER BY id")],
+            sessions,
+        )
+        self.assertTrue(interaction.followup.send.await_args.kwargs["ephemeral"])
+
+    async def test_configure_without_seminar_time_labels_unset_and_reminder_times_separately(self):
+        interaction, target = self.configuration_interaction()
+        with patch.object(self.bot, "reload_rotation_file", AsyncMock()):
+            await self.bot.tree.get_command("설정").callback(interaction, 3, target, target)
+        self.assertIsNone(self.bot.store.require_config(1)["seminar_time"])
+        text = interaction.followup.send.await_args.args[0]
+        self.assertIn("매주 목요일 · 시작 시간 미설정 (Asia/Seoul)", text)
+        self.assertIn("알림: 아침 09:00 / 저녁 18:00", text)
+
+    async def test_schedule_displays_seminar_time_on_presentations_but_not_cancelled_week(self):
+        self.bot.store.configure(
+            1, 1001, 1002, 3, "09:00", "18:00", "Asia/Seoul", NOW, seminar_time="14:00"
+        )
+        self.bot.store.postpone(1, DAY)
+        interaction = SimpleNamespace(
+            guild_id=1,
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        with (
+            patch.object(self.bot, "reload_rotation_file", AsyncMock()),
+            patch("seminar_bot.bot.local_now", return_value=NOW),
+        ):
+            await self.bot.tree.get_command("일정").callback(interaction)
+        embed = interaction.followup.send.await_args.kwargs["embed"]
+        entries = embed.description.splitlines()
+        presentations = [line for line in entries if "<@" in line]
+        self.assertTrue(presentations)
+        self.assertTrue(all("14:00" in line for line in presentations))
+        holiday = next(line for line in entries if "휴강" in line)
+        self.assertIn(DAY.isoformat(), holiday)
+        self.assertNotIn("14:00", holiday)
+        self.assertIn((DAY + timedelta(days=7)).isoformat(), presentations[0])
+        for text in ("매주 목요일", "14:00", "Asia/Seoul", "아침 09:00", "저녁 18:00"):
+            self.assertIn(text, embed.footer.text)
+
+    async def test_schedule_without_seminar_time_has_explicit_unset_footer(self):
+        interaction = SimpleNamespace(
+            guild_id=1,
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        with (
+            patch.object(self.bot, "reload_rotation_file", AsyncMock()),
+            patch("seminar_bot.bot.local_now", return_value=NOW),
+        ):
+            await self.bot.tree.get_command("일정").callback(interaction)
+        embed = interaction.followup.send.await_args.kwargs["embed"]
+        self.assertIn("시작 시간 미설정", embed.footer.text)
+        self.assertIn("Asia/Seoul", embed.footer.text)
+        self.assertNotIn("None", embed.description + embed.footer.text)
+
+    async def test_seminar_time_in_reminders_keeps_trigger_times_and_duplicate_protection(self):
+        self.bot.store.configure(
+            1, 1001, 1002, 3, "08:20", "19:10", "Asia/Seoul", NOW, seminar_time="14:00"
+        )
+        channel = Mock(spec=discord.TextChannel)
+        channel.guild = SimpleNamespace(id=1)
+        channel.send = AsyncMock(return_value=SimpleNamespace(id=999))
+        with (
+            patch.object(self.bot, "reload_rotation_file", AsyncMock()),
+            patch.object(self.bot, "get_guild", return_value=SimpleNamespace(id=1)),
+            patch.object(self.bot, "get_channel", return_value=channel),
+            patch("seminar_bot.bot.datetime") as clock,
+        ):
+            for stamp, sent in (
+                (datetime(2026, 10, 14, 23, 19, tzinfo=UTC), 0),
+                (datetime(2026, 10, 14, 23, 20, tzinfo=UTC), 1),
+                (datetime(2026, 10, 14, 23, 20, tzinfo=UTC), 1),
+                (datetime(2026, 10, 15, 5, 0, tzinfo=UTC), 1),
+                (datetime(2026, 10, 15, 10, 9, tzinfo=UTC), 1),
+                (datetime(2026, 10, 15, 10, 10, tzinfo=UTC), 2),
+                (datetime(2026, 10, 15, 10, 10, tzinfo=UTC), 2),
+            ):
+                clock.now.return_value = stamp
+                await self.bot.reminders()
+                self.assertEqual(channel.send.await_count, sent, stamp)
+            self.bot.store.configure(
+                1, 1001, 1002, 3, "08:20", "19:10", "Asia/Seoul", NOW, seminar_time="15:00"
+            )
+            await self.bot.reminders()
+            self.assertEqual(channel.send.await_count, 2)
+        morning, evening = channel.send.await_args_list
+        self.assertIn("☀️", morning.args[0])
+        self.assertIn("🌙", evening.args[0])
+        for sent in (morning, evening):
+            self.assertIn("14:00 (Asia/Seoul)", sent.args[0])
+            self.assertIn("<@101>", sent.args[0])
+            mentions = sent.kwargs["allowed_mentions"].to_dict()
+            self.assertEqual(mentions["users"], [101])
+            self.assertEqual(mentions["parse"], [])
 
     async def test_rotation_command_is_replaced_by_file(self):
         self.assertIsNone(self.bot.tree.get_command("순서설정"))
@@ -534,10 +677,14 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             mention_config = channel.send.await_args.kwargs["allowed_mentions"].to_dict()
             self.assertEqual(mention_config["users"], [101])
             self.assertEqual(mention_config["parse"], [])
+            self.assertNotIn("None", channel.send.await_args.args[0])
+            self.assertNotIn("미설정", channel.send.await_args.args[0])
             clock.now.return_value = datetime(2026, 10, 15, 9, tzinfo=UTC)
             await self.bot.reminders()
             self.assertIn("<@101>", channel.send.await_args.args[0])
             self.assertIn("자료", channel.send.await_args.args[0])
+            self.assertNotIn("None", channel.send.await_args.args[0])
+            self.assertNotIn("미설정", channel.send.await_args.args[0])
             self.assertEqual(channel.send.await_count, 2)
 
     async def test_network_error_is_retried_without_marking_sent(self):

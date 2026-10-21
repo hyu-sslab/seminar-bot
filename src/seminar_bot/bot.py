@@ -33,6 +33,12 @@ def safe(value: str, limit: int = 300) -> str:
     return discord.utils.escape_mentions(discord.utils.escape_markdown(value))[:limit]
 
 
+def weekly_schedule(config: dict) -> str:
+    start = config.get("seminar_time")
+    when = f" {start}" if start else " · 시작 시간 미설정"
+    return f"매주 {WEEKDAYS[config['weekday']]}{when} ({config['timezone']})"
+
+
 def is_manager(interaction: discord.Interaction) -> bool:
     return (
         isinstance(interaction.user, discord.Member)
@@ -235,8 +241,10 @@ class SeminarBot(discord.Client):
                         ):
                             raise UserError("알림 채널을 확인해주세요.")
                         mention = f"<@{session['presenter_id']}>"
+                        start = config.get("seminar_time")
+                        when = f" {start} ({safe(config['timezone'])})" if start else ""
                         if kind == "morning":
-                            text = f"☀️ 오늘({session['seminar_date']}) 세미나 발표자는 {mention}입니다. 발표 준비 부탁드려요!"
+                            text = f"☀️ 오늘({session['seminar_date']}){when} 세미나 발표자는 {mention}입니다. 발표 준비 부탁드려요!"
                         else:
                             status = self.store.submission(config["guild_id"], session["id"])
                             destination = (
@@ -246,7 +254,7 @@ class SeminarBot(discord.Client):
                                 else ""
                             )
                             text = (
-                                f"🌙 {mention} 오늘 발표에 사용한 자료를 "
+                                f"🌙 {mention} 오늘{when} 발표에 사용한 자료를 "
                                 + (
                                     f"아래 제출 페이지에 올려주세요.\n{destination}\n"
                                     if destination
@@ -553,7 +561,8 @@ class SeminarBot(discord.Client):
         tree = self.tree
 
         @tree.command(
-            name="설정", description="세미나 요일, 알림 시간, 채널을 설정합니다 (서버 관리자)"
+            name="설정",
+            description="세미나 요일·시작 시간, 알림 시간, 채널을 설정합니다 (서버 관리자)",
         )
         @app_commands.guild_only()
         @app_commands.default_permissions(manage_guild=True)
@@ -561,6 +570,7 @@ class SeminarBot(discord.Client):
         @app_commands.choices(
             weekday=[app_commands.Choice(name=name, value=i) for i, name in enumerate(WEEKDAYS)]
         )
+        @app_commands.rename(seminar_time="세미나시간")
         @app_commands.describe(
             weekday="세미나 요일",
             channel="알림을 보낼 채널",
@@ -568,6 +578,7 @@ class SeminarBot(discord.Client):
             morning="아침 알림 HH:MM",
             evening="저녁 자료 요청 HH:MM",
             timezone="시간대 (기본 Asia/Seoul)",
+            seminar_time="매주 세미나 시작 시각 HH:MM (예: 14:00, 생략하면 기존 시간 유지)",
         )
         async def configure(
             interaction: discord.Interaction,
@@ -577,6 +588,7 @@ class SeminarBot(discord.Client):
             morning: str = "09:00",
             evening: str = "18:00",
             timezone: str = "Asia/Seoul",
+            seminar_time: str | None = None,
         ) -> None:
             for target in (channel, upload_channel):
                 member = interaction.guild.me
@@ -602,8 +614,14 @@ class SeminarBot(discord.Client):
                     morning,
                     evening,
                     timezone,
+                    seminar_time=seminar_time,
                 )
-            text = f"{WEEKDAYS[weekday]} · {morning}/{evening} ({safe(timezone)})\n알림: {channel.mention} · 자료: {upload_channel.mention}"
+                config = self.store.require_config(interaction.guild_id)
+            text = (
+                f"{safe(weekly_schedule(config))}\n"
+                f"알림: 아침 {config['morning']} / 저녁 {config['evening']}\n"
+                f"알림 채널: {channel.mention} · 자료: {upload_channel.mention}"
+            )
             if delta:
                 text += f"\n기존 미래 일정도 새 요일에 맞춰 {delta}일 뒤로 이동했습니다."
             await self.reload_rotation_file()
@@ -635,7 +653,14 @@ class SeminarBot(discord.Client):
                 else:
                     message += "아직 발표 순서가 없습니다. config/rotation.json의 presenters에 발표자를 등록해주세요."
                 raise UserError(message)
-            items = [(row["seminar_date"], f"<@{row['presenter_id']}>") for row in rows]
+            start = config.get("seminar_time")
+            items = [
+                (
+                    row["seminar_date"],
+                    (f"{start} · " if start else "") + f"<@{row['presenter_id']}>",
+                )
+                for row in rows
+            ]
             items.extend(
                 (row["seminar_date"], "💤 휴강")
                 for row in holidays
@@ -644,7 +669,7 @@ class SeminarBot(discord.Client):
             text = "\n".join(f"**{day}** · {speaker}" for day, speaker in sorted(items))
             embed = discord.Embed(title="🗓️ 세미나 일정", description=text, color=0x5B8DEF)
             embed.set_footer(
-                text=f"{config['timezone']} · 아침 {config['morning']} / 저녁 {config['evening']}"
+                text=f"{weekly_schedule(config)} · 알림: 아침 {config['morning']} / 저녁 {config['evening']}"
                 + (
                     " · 발표 순서 파일 적용 오류: NAS 로그 확인"
                     if self.rotation_errors.get(None)

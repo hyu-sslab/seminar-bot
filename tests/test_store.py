@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import sqlite3
 import tempfile
 import unittest
 from datetime import UTC, date, datetime, timedelta
@@ -8,6 +9,7 @@ from pathlib import Path
 
 from seminar_bot.documents import DocumentInfo
 from seminar_bot.store import Store, UserError, parse_date, parse_time
+from seminar_bot.submission_access import SubmissionAccess
 
 TODAY = date(2026, 10, 15)  # Thursday
 NOW = datetime(2026, 10, 15, 1, tzinfo=UTC)  # 10:00 KST
@@ -67,6 +69,163 @@ class StoreTests(unittest.TestCase):
         self.store.close()
         self.store = Store(self.path)
         self.assertEqual(self.store.upcoming(1, TODAY), initial)
+
+    def history(self):
+        return {
+            table: [
+                dict(row) for row in self.store.db.execute(f"SELECT * FROM {table} ORDER BY rowid")
+            ]
+            for table in (
+                "sessions",
+                "holidays",
+                "deliveries",
+                "documents",
+                "rotation_file_state",
+                "web_submission_receipts",
+                "web_upload_tombstones",
+                "submission_invitations",
+                "submission_grants",
+            )
+        }
+
+    def seed_history_and_submission_access(self):
+        record_id, _ = self.add_document()
+        self.store.postpone(1, TODAY, TODAY + timedelta(weeks=2))
+        session = self.store.session_on(1, TODAY)
+        self.store.mark_sent(session["id"], str(TODAY), "morning", 900)
+        self.store.mark_submission_receipt(session["id"], "receipt-fingerprint", 901)
+        with self.store.db:
+            self.store.remember_rotation_file(1, "ab" * 32)
+            self.store.db.execute(
+                "INSERT INTO web_upload_tombstones VALUES(?,?)", (1, "removed-upload")
+            )
+        access = SubmissionAccess(self.store)
+        invitation, _ = access.issue(1, session["id"], 101, now=1_700_000_000, scope="presenter")
+        token, _ = access.redeem(invitation, 1, now=1_700_000_001)
+        other = self.store.session_on(1, TODAY + timedelta(weeks=1))
+        access.issue(1, other["id"], 102, now=1_700_000_002, scope="presenter")
+        return record_id, token
+
+    def test_seminar_time_is_optional_and_omission_or_none_preserves_its_value(self):
+        self.assertIsNone(self.store.require_config(1)["seminar_time"])
+        self.assertEqual(
+            self.store.configure(
+                1,
+                1001,
+                1002,
+                3,
+                "09:00",
+                "18:00",
+                "Asia/Seoul",
+                NOW,
+                seminar_time="14:30",
+            ),
+            0,
+        )
+        self.configure(1)
+        self.assertEqual(self.store.require_config(1)["seminar_time"], "14:30")
+        self.store.configure(
+            1, 1001, 1002, 3, "09:00", "18:00", "Asia/Seoul", NOW, seminar_time=None
+        )
+        self.assertEqual(self.store.require_config(1)["seminar_time"], "14:30")
+        self.store.close()
+        self.store = Store(self.path)
+        self.assertEqual(self.store.require_config(1)["seminar_time"], "14:30")
+        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 7)
+
+    def test_seminar_time_accepts_midnight_and_last_minute_without_reminder_order_constraints(self):
+        for value in ("00:00", "23:59"):
+            with self.subTest(value=value):
+                self.store.configure(
+                    2, 2001, 2002, 3, "09:00", "18:00", "Asia/Seoul", NOW, seminar_time=value
+                )
+                self.assertEqual(self.store.require_config(2)["seminar_time"], value)
+
+    def test_time_only_update_preserves_dates_materials_deliveries_and_submission_access(self):
+        _, token = self.seed_history_and_submission_access()
+        before = self.history()
+        config = self.store.require_config(1)
+        self.assertEqual(
+            self.store.configure(
+                1,
+                1001,
+                1002,
+                3,
+                "09:00",
+                "18:00",
+                "Asia/Seoul",
+                NOW,
+                seminar_time="15:00",
+            ),
+            0,
+        )
+        self.assertEqual(self.store.require_config(1), {**config, "seminar_time": "15:00"})
+        self.assertEqual(self.history(), before)
+        self.assertEqual(
+            SubmissionAccess(self.store).validate(token, 1, now=1_700_000_003)["presenter_id"], 101
+        )
+
+    def test_invalid_seminar_time_cannot_partially_reconfigure_an_existing_or_new_guild(self):
+        self.seed_history_and_submission_access()
+        self.store.configure(
+            1, 1001, 1002, 3, "09:00", "18:00", "Asia/Seoul", NOW, seminar_time="14:30"
+        )
+        config = self.store.require_config(1)
+        before = self.history()
+        for value in ("", "9:00", "24:00", "12:60", "14:30:00", " 14:30 ", True, 1430):
+            for guild_id in (1, 2):
+                with self.subTest(value=value, guild_id=guild_id), self.assertRaises(UserError):
+                    self.store.configure(
+                        guild_id, 2001, 2002, 4, "08:00", "19:00", "UTC", NOW, seminar_time=value
+                    )
+                self.assertEqual(self.store.require_config(1), config)
+                self.assertIsNone(self.store.config(2))
+                self.assertEqual(self.history(), before)
+
+    def test_real_schema_six_upgrade_preserves_all_records_and_grants(self):
+        record_id, token = self.seed_history_and_submission_access()
+        config = self.store.require_config(1)
+        before = self.history()
+        # Remove the actual new column; changing only user_version would not
+        # exercise the schema-six migration against an old guilds table.
+        with self.store.db:
+            self.store.db.execute("ALTER TABLE guilds DROP COLUMN seminar_time")
+            self.store.db.execute("PRAGMA user_version=6")
+        self.assertNotIn(
+            "seminar_time",
+            {row["name"] for row in self.store.db.execute("PRAGMA table_info(guilds)")},
+        )
+        self.store.close()
+        self.store = Store(self.path)
+        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 7)
+        column = next(
+            row
+            for row in self.store.db.execute("PRAGMA table_info(guilds)")
+            if row["name"] == "seminar_time"
+        )
+        self.assertEqual((column["type"], column["notnull"]), ("TEXT", 0))
+        self.assertEqual(self.store.require_config(1), config)
+        self.assertEqual(self.history(), before)
+        self.assertEqual(self.store.document(1, record_id)["file_path"], "files/a.pdf")
+        self.assertEqual(
+            SubmissionAccess(self.store).validate(token, 1, now=1_700_000_003)["presenter_id"], 101
+        )
+
+    def test_future_schema_version_is_rejected_before_creating_or_rewriting_tables(self):
+        future = Path(self.temp.name) / "future.sqlite3"
+        with sqlite3.connect(future) as db:
+            db.execute("CREATE TABLE sentinel(value TEXT)")
+            db.execute("INSERT INTO sentinel VALUES('keep')")
+            db.execute("PRAGMA user_version=8")
+        with self.assertRaisesRegex(ValueError, "버전"):
+            Store(future)
+        with sqlite3.connect(future) as db:
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 8)
+            self.assertEqual(db.execute("SELECT * FROM sentinel").fetchall(), [("keep",)])
+            self.assertEqual(
+                db.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall(),
+                [("sentinel",)],
+            )
 
     def test_postpone_moves_entire_schedule_and_generation_cursor(self):
         before = self.store.upcoming(1, TODAY, 20)
