@@ -50,7 +50,7 @@ class Store:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.execute("PRAGMA busy_timeout=5000")
-        if self.db.execute("PRAGMA user_version").fetchone()[0] > 4:
+        if self.db.execute("PRAGMA user_version").fetchone()[0] > 5:
             self.db.close()
             raise ValueError("데이터베이스 버전이 봇보다 새롭습니다. 봇을 업데이트해주세요.")
         self.db.executescript("""
@@ -121,6 +121,28 @@ class Store:
                 fingerprint TEXT NOT NULL,
                 message_id INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS submission_invitations (
+                token_hash TEXT PRIMARY KEY,
+                guild_id INTEGER NOT NULL REFERENCES guilds(guild_id) ON DELETE CASCADE,
+                session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                presenter_id INTEGER NOT NULL,
+                upload_channel_id INTEGER NOT NULL,
+                session_version TEXT NOT NULL,
+                expires_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS submission_invitation_expiry
+                ON submission_invitations(expires_at);
+            CREATE TABLE IF NOT EXISTS submission_grants (
+                token_hash TEXT PRIMARY KEY,
+                guild_id INTEGER NOT NULL REFERENCES guilds(guild_id) ON DELETE CASCADE,
+                session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                presenter_id INTEGER NOT NULL,
+                upload_channel_id INTEGER NOT NULL,
+                session_version TEXT NOT NULL,
+                expires_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS submission_grant_expiry
+                ON submission_grants(expires_at);
         """)
         columns = {row["name"] for row in self.db.execute("PRAGMA table_info(documents)")}
         with self.db:
@@ -157,7 +179,7 @@ class Store:
                 "CREATE UNIQUE INDEX IF NOT EXISTS web_upload_key ON documents(guild_id, upload_key) "
                 "WHERE upload_key IS NOT NULL"
             )
-            self.db.execute("PRAGMA user_version=4")
+            self.db.execute("PRAGMA user_version=5")
 
     def close(self) -> None:
         self.db.close()
@@ -198,6 +220,9 @@ class Store:
         old = self.config(guild_id)
         delta = (weekday - old["weekday"]) % 7 if old else 0
         with self.db:
+            if old and old["upload_channel_id"] != upload_channel_id:
+                for table in ("submission_invitations", "submission_grants"):
+                    self.db.execute(f"DELETE FROM {table} WHERE guild_id=?", (guild_id,))
             if delta:
                 self._shift_dates(guild_id, today, delta)
                 # A long-stopped bot may have an ungenerated cursor in the past.
@@ -229,6 +254,7 @@ class Store:
             (guild_id, from_date.isoformat()),
         ).fetchall()
         for row in rows:
+            self._revoke_submission_sessions([row["id"]])
             shifted = date.fromisoformat(row["seminar_date"]) + timedelta(days=days)
             self.db.execute(
                 "UPDATE sessions SET seminar_date=? WHERE id=?", (shifted.isoformat(), row["id"])
@@ -420,6 +446,7 @@ class Store:
                 "두 날짜 모두 예정된 발표가 있어야 합니다. /일정 에서 날짜를 확인해주세요."
             )
         with self.db:
+            self._revoke_submission_sessions([one["id"], two["id"]])
             self.db.execute(
                 "UPDATE sessions SET presenter_id=? WHERE id=?", (two["presenter_id"], one["id"])
             )
@@ -438,6 +465,13 @@ class Store:
             self.db.execute(
                 "DELETE FROM deliveries WHERE session_id IN (?,?) AND on_date>=?",
                 (one["id"], two["id"], today.isoformat()),
+            )
+
+    def _revoke_submission_sessions(self, session_ids: list[int]) -> None:
+        """Caller owns the schedule transaction; old links never revive after a swap back."""
+        for table in ("submission_invitations", "submission_grants"):
+            self.db.executemany(
+                f"DELETE FROM {table} WHERE session_id=?", ((value,) for value in session_ids)
             )
 
     def was_sent(self, session_id: int, on_date: str, kind: str) -> bool:

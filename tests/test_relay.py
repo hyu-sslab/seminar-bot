@@ -35,6 +35,23 @@ class _Peer:
 
 
 class RelayValidationTests(unittest.TestCase):
+    def test_submission_routes_are_small_and_do_not_accept_destinations(self):
+        token = "A" * 43
+        headers, maximum = validated_request(
+            "GET", "/v1/submission/context", {"x-seminar-submission-token": token}
+        )
+        self.assertEqual(headers["x-seminar-submission-token"], token)
+        self.assertEqual(maximum, 0)
+        self.assertEqual(validated_request("POST", "/v1/submission/redeem", {})[1], 4096)
+        for method, path in (
+            ("GET", "/v1/submission/redeem"),
+            ("POST", "/v1/submission/context"),
+            ("GET", "/v1/submission/context?session=2"),
+            ("POST", "/v1/submission/redeem?target=http://other-host"),
+        ):
+            with self.subTest(method=method, path=path), self.assertRaises(RelayProtocolError):
+                validated_request(method, path, {})
+
     def test_requests_cannot_select_hosts_other_paths_methods_or_duplicate_query_keys(self):
         for method, path in (
             ("GET", "http://other-host/v1/health"),

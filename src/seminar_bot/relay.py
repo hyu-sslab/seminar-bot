@@ -39,6 +39,7 @@ _REQUEST_HEADERS = {
     "x-filename",
     "idempotency-key",
     "x-seminar-version",
+    "x-seminar-submission-token",
 }
 _RESPONSE_HEADERS = {
     "content-type",
@@ -58,13 +59,15 @@ def validated_request(method: object, path: object, headers: object) -> tuple[di
         raise RelayProtocolError("Invalid request") from exc
     if parsed.scheme or parsed.netloc or parsed.fragment or "%" in parsed.path:
         raise RelayProtocolError("Invalid request")
-    if parsed.path in {"/v1/health", "/v1/sessions"} or re.fullmatch(
+    if parsed.path in {"/v1/health", "/v1/sessions", "/v1/submission/context"} or re.fullmatch(
         rf"/v1/sessions/{_ID}|/v1/documents/{_ID}/file", parsed.path
     ):
         allowed_method, query_keys, maximum = "GET", set(), 0
     elif re.fullmatch(rf"/v1/sessions/{_ID}/documents", parsed.path):
         allowed_method, query_keys, maximum = "PUT", {"kind"}, MAX_BODY_BYTES
     elif re.fullmatch(rf"/v1/sessions/{_ID}/submit", parsed.path):
+        allowed_method, query_keys, maximum = "POST", set(), 4096
+    elif parsed.path == "/v1/submission/redeem":
         allowed_method, query_keys, maximum = "POST", set(), 4096
     elif parsed.path == "/v1/search":
         allowed_method, query_keys, maximum = "GET", {"q", "kind", "page"}, 0

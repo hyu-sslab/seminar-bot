@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import json
 import logging
 import re
 import shutil
@@ -19,6 +20,7 @@ from aiohttp import web
 from .access import AccessUnavailable, AccessVerifier
 from .rotation import read_rotations
 from .store import UserError, local_now
+from .submission_access import SubmissionAccess, SubmissionAccessDenied, session_version
 
 log = logging.getLogger(__name__)
 WEB_MAX_BYTES = 20 * 1024 * 1024
@@ -30,12 +32,6 @@ class APIError(Exception):
         super().__init__(message)
         self.status = status
         self.code = code
-
-
-def session_version(row: dict) -> str:
-    return hashlib.sha256(
-        f"{row['id']}:{row['seminar_date']}:{row['presenter_id']}".encode()
-    ).hexdigest()
 
 
 def check_version(request, row: dict) -> None:
@@ -74,6 +70,7 @@ def filename_from_header(value: str) -> str:
 class SeminarAPI:
     def __init__(self, bot):
         self.bot = bot
+        self.submission_access = SubmissionAccess(bot.store)
         self.settings = bot.settings
         self.guild_id = self.settings.api_guild_id
         if not self.settings.api_token or not self.guild_id:
@@ -98,6 +95,8 @@ class SeminarAPI:
         self.app.add_routes(
             [
                 web.get("/v1/health", self.health),
+                web.post("/v1/submission/redeem", self.redeem_submission),
+                web.get("/v1/submission/context", self.submission_context),
                 web.get("/v1/sessions", self.sessions),
                 web.get("/v1/sessions/{session_id:[1-9][0-9]{0,18}}", self.session),
                 web.put("/v1/sessions/{session_id:[1-9][0-9]{0,18}}/documents", self.upload),
@@ -127,7 +126,26 @@ class SeminarAPI:
                 raise APIError(401, "비공개 중계 서버 인증을 확인할 수 없습니다.")
             if request.path != "/v1/health" and not self.bot.is_ready():
                 raise APIError(503, "봇이 Discord에 연결 중입니다. 잠시 후 다시 시도해주세요.")
+            if "X-Seminar-Submission-Token" in request.headers:
+                await self.bot.reload_rotation_file()
+                async with self.bot.schedule_lock:
+                    grant = self._submission_scope(request)
+                    allowed = (
+                        request.method == "GET" and request.path == "/v1/submission/context"
+                    ) or any(
+                        request.method == method
+                        and request.path == f"/v1/sessions/{grant['session_id']}{suffix}"
+                        for method, suffix in (
+                            ("GET", ""),
+                            ("PUT", "/documents"),
+                            ("POST", "/submit"),
+                        )
+                    )
+                    if not allowed:
+                        raise APIError(403, "이 링크로는 본인의 자료만 제출할 수 있습니다.")
             response = await handler(request)
+        except SubmissionAccessDenied as exc:
+            response = web.json_response({"error": str(exc)}, status=401)
         except APIError as exc:
             payload = {"error": str(exc)}
             if exc.code:
@@ -159,11 +177,21 @@ class SeminarAPI:
     def config(self) -> dict:
         return self.bot.store.require_config(self.guild_id)
 
+    def _submission_scope(self, request) -> dict | None:
+        if "X-Seminar-Submission-Token" not in request.headers:
+            return None
+        return self.submission_access.validate(
+            request.headers["X-Seminar-Submission-Token"], self.guild_id
+        )
+
     def _session(self, request) -> dict:
+        grant = self._submission_scope(request)
         try:
             value = int(request.match_info["session_id"])
             if value > 2**63 - 1:
                 raise ValueError
+            if grant is not None and grant["session_id"] != value:
+                raise APIError(403, "이 링크로는 본인의 자료만 제출할 수 있습니다.")
             return self.bot.store.session(self.guild_id, value)
         except (UserError, ValueError) as exc:
             raise APIError(404, "해당 발표 회차를 찾을 수 없습니다.") from exc
@@ -221,6 +249,41 @@ class SeminarAPI:
 
     async def health(self, request):
         return web.json_response({"ok": True, "ready": self.bot.is_ready()})
+
+    async def redeem_submission(self, request):
+        if request.content_type != "application/json":
+            raise APIError(415, "JSON 형식으로 요청해주세요.")
+        if request.content_length is not None and request.content_length > 1024:
+            raise APIError(413, "요청이 너무 큽니다.")
+        body = bytearray()
+        async with asyncio.timeout(10):
+            async for chunk in request.content.iter_chunked(1024):
+                body.extend(chunk)
+                if len(body) > 1024:
+                    raise APIError(413, "요청이 너무 큽니다.")
+        try:
+            payload = json.loads(body)
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise SubmissionAccessDenied() from exc
+        if not isinstance(payload, dict) or set(payload) != {"token"}:
+            raise SubmissionAccessDenied()
+        await self.bot.reload_rotation_file()
+        async with self.bot.schedule_lock:
+            token, expires_at = self.submission_access.redeem(payload["token"], self.guild_id)
+        return web.json_response({"access_token": token, "expires_at": expires_at})
+
+    async def submission_context(self, request):
+        async with self.bot.schedule_lock:
+            grant = self._submission_scope(request)
+            if grant is None:
+                raise SubmissionAccessDenied()
+        return web.json_response(
+            {
+                "session_id": grant["session_id"],
+                "version": grant["session_version"],
+                "expires_at": grant["expires_at"],
+            }
+        )
 
     async def sessions(self, request):
         await self.bot.reload_rotation_file()

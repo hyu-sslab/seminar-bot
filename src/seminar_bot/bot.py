@@ -20,6 +20,7 @@ from .rotation import apply_rotation, read_rotations
 from .scheduling import due_reminders
 from .settings import Settings
 from .store import Store, UserError, local_now, parse_date
+from .submission_access import SubmissionAccess, submission_link
 from .submissions import classify_document, submission_summary
 from .web_api import SeminarAPI
 
@@ -793,6 +794,56 @@ class SeminarBot(discord.Client):
             await interaction.response.send_message(text, ephemeral=True)
 
         @tree.command(
+            name="제출", description="내 발표 자료를 바로 올릴 수 있는 임시 링크를 받습니다"
+        )
+        @app_commands.guild_only()
+        @app_commands.checks.cooldown(
+            1, 10, key=lambda interaction: (interaction.guild_id, interaction.user.id)
+        )
+        @app_commands.describe(
+            seminar_date="본인 발표 날짜 YYYY-MM-DD (생략: 최근 미완료 또는 다음 발표)"
+        )
+        async def submit_link(
+            interaction: discord.Interaction, seminar_date: str | None = None
+        ) -> None:
+            if (
+                not self.settings.api_token
+                or interaction.guild_id != self.settings.api_guild_id
+                or not self.settings.seminar_page_url
+            ):
+                raise UserError(
+                    "이 서버의 웹 자료 제출이 설정되지 않았습니다. 서버 관리자에게 문의해주세요."
+                )
+            submission_link(self.settings.seminar_page_url, "x" * 43)
+            await interaction.response.defer(ephemeral=True)
+            await self.reload_rotation_file()
+            async with self.schedule_lock:
+                config = self.store.require_config(interaction.guild_id)
+                access = SubmissionAccess(self.store)
+                session = access.select_session(
+                    interaction.guild_id,
+                    interaction.user.id,
+                    local_now(config).date(),
+                    parse_date(seminar_date) if seminar_date else None,
+                )
+                token, _ = access.issue(interaction.guild_id, session["id"], interaction.user.id)
+            view = discord.ui.View()
+            view.add_item(
+                discord.ui.Button(
+                    label="내 발표 자료 제출하기",
+                    url=submission_link(self.settings.seminar_page_url, token),
+                )
+            )
+            await interaction.followup.send(
+                f"**{session['seminar_date']} 발표 자료 제출**\n"
+                "아래 버튼으로 본인 제출 페이지를 바로 열 수 있습니다.\n"
+                "링크는 15분 안에 한 번만 열 수 있고, 열린 페이지는 1시간 동안 사용할 수 있습니다.\n"
+                "새 링크를 발급하면 같은 회차의 이전 링크와 제출 페이지는 만료됩니다. 링크를 다른 사람에게 공유하지 마세요.",
+                view=view,
+                ephemeral=True,
+            )
+
+        @tree.command(
             name="제출현황", description="발표 자료 1개와 논문 PDF 3개 이상이 제출됐는지 확인합니다"
         )
         @app_commands.guild_only()
@@ -847,6 +898,7 @@ class SeminarBot(discord.Client):
                 "`/연기` 해당 주 휴강 + 이후 전체 1주 연기\n\n"
                 "**모든 멤버**\n"
                 "`/일정` 발표자와 휴강일 확인\n"
+                "`/제출` 본인 회차의 임시 웹 제출 링크 받기 (로그인 없이 파일 업로드)\n"
                 "자료 채널에 **발표 자료 PDF/PPT/PPTX + 논문 PDF 3개 이상** 업로드 → 회차별 누적 기록\n"
                 "구분이 애매한 PDF는 업로드 아래 버튼으로 **발표 자료 / 논문 PDF** 선택\n"
                 "`/제출현황` 부족한 자료 확인 · `/자료분류` 구분 수정\n"

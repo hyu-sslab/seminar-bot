@@ -61,7 +61,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_rotation_command_is_replaced_by_file(self):
         self.assertIsNone(self.bot.tree.get_command("순서설정"))
-        self.assertEqual(len(self.bot.tree.get_commands()), 10)
+        self.assertEqual(len(self.bot.tree.get_commands()), 11)
 
     async def test_schedule_acknowledges_before_json_member_validation(self):
         interaction = SimpleNamespace(
