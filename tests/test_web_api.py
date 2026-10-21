@@ -409,6 +409,18 @@ class WebAPITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.count_documents(), 1)
         self.assertEqual(len(self.files()), 1)
 
+    async def test_idempotent_replay_cannot_reveal_documents_from_previous_upload_channel(self):
+        key = str(uuid.uuid4())
+        data = pdf_bytes("Hidden Previous Channel Paper")
+        response = await self.upload("paper", data, "private.pdf", key=key)
+        self.assertEqual(response.status, 201)
+        self.bot.store.db.execute("UPDATE guilds SET upload_channel_id=9999 WHERE guild_id=1")
+        self.bot.store.db.commit()
+        response = await self.upload("paper", data, "private.pdf", key=key)
+        self.assertEqual(response.status, 409)
+        self.assertNotIn("Hidden Previous Channel Paper", await response.text())
+        self.assertEqual(self.count_documents(), 1)
+
     async def test_complete_submission_notifies_once_and_repeated_submit_is_idempotent(self):
         await self.complete_uploads()
         for _ in range(2):

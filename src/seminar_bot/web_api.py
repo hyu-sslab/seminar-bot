@@ -328,6 +328,8 @@ class SeminarAPI:
                             check_version(request, self._session(request))
                             if (
                                 existing["session_id"] != original["id"]
+                                or existing["source_channel_id"]
+                                != self.config()["upload_channel_id"]
                                 or existing["kind"] != kind
                                 or existing["filename"] != filename
                                 or existing["sha256"] != digest.hexdigest()
@@ -363,6 +365,8 @@ class SeminarAPI:
                         if existing:
                             if (
                                 existing["sha256"] != info.sha256
+                                or existing["source_channel_id"]
+                                != self.config()["upload_channel_id"]
                                 or existing["session_id"] != current["id"]
                                 or existing["kind"] != kind
                                 or existing["filename"] != filename
