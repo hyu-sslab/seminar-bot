@@ -3,9 +3,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-import shutil
-import tempfile
-from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -21,7 +18,7 @@ from .scheduling import due_reminders
 from .settings import Settings
 from .store import Store, UserError, local_now, parse_date
 from .submission_access import SubmissionAccess, submission_link
-from .submissions import classify_document, submission_summary
+from .submissions import submission_summary
 from .web_api import SeminarAPI
 
 log = logging.getLogger(__name__)
@@ -119,9 +116,7 @@ def classification_retention_notice(record: dict) -> str:
             "발표 자료로 다시 바꿔도 원본은 복구되지 않습니다."
         )
     if record["kind"] == "slides" and not record["file_path"]:
-        return (
-            "\n이 기록에는 보관된 원본이 없습니다. 발표 자료 원본을 보관하려면 다시 업로드해주세요."
-        )
+        return "\n이 기록에는 보관된 원본이 없습니다. 발표 자료 원본은 `/제출`로 받은 웹페이지에서 올려주세요."
     return ""
 
 
@@ -154,7 +149,7 @@ def visible_channel_ids(interaction: discord.Interaction) -> list[int]:
 class SeminarBot(discord.Client):
     def __init__(self, settings: Settings):
         intents = discord.Intents.default()
-        intents.message_content = True
+        intents.message_content = False
         intents.typing = False
         super().__init__(intents=intents, allowed_mentions=discord.AllowedMentions.none())
         self.settings = settings
@@ -225,6 +220,9 @@ class SeminarBot(discord.Client):
                 continue
             log.info("Registered %s guild commands for guild %s", len(synced), guild_id)
 
+    def web_submission_enabled(self, guild_id: int) -> bool:
+        return bool(self.settings.api_token) and guild_id == self.settings.api_guild_id
+
     async def on_ready(self) -> None:
         log.info("Connected as %s (%s)", self.user, self.user.id if self.user else "?")
 
@@ -272,23 +270,22 @@ class SeminarBot(discord.Client):
                             text = f"☀️ 오늘({session['seminar_date']}){when} 세미나 발표자는 {mention}입니다. 발표 준비 부탁드려요!"
                         else:
                             status = self.store.submission(config["guild_id"], session["id"])
-                            destination = (
-                                self.settings.submission_url(session["id"])
-                                if self.settings.api_token
-                                and config["guild_id"] == self.settings.api_guild_id
-                                else ""
-                            )
-                            text = (
-                                f"🌙 {mention} 오늘{when} 발표에 사용한 자료를 "
-                                + (
-                                    f"아래 제출 페이지에 올려주세요.\n{destination}\n"
-                                    if destination
-                                    else f"<#{config['upload_channel_id']}>에 공유해주세요.\n"
+                            if self.web_submission_enabled(config["guild_id"]):
+                                text = (
+                                    f"🌙 {mention} 오늘{when} 발표에 사용한 자료를 제출해주세요.\n"
+                                    "`/제출` 명령을 실행해 본인 전용 임시 링크를 받은 뒤 웹페이지에서 등록해주세요.\n"
+                                    "발표 자료 **PDF/PPT/PPTX 1개 이상** + 참고한 **서로 다른 논문 3편 이상**이 필요합니다.\n"
+                                    "논문은 제출 페이지에 PDF를 올려 정보를 추출하거나 직접 입력할 수 있습니다.\n"
+                                    "한 번에 올리거나 나누어 올려도 회차별로 누적합니다.\n"
+                                    + submission_summary(status)
                                 )
-                                + "발표 자료 **PDF/PPT/PPTX 1개 이상** + 참고한 **서로 다른 논문 3편 이상**이 필요합니다. 논문은 PDF 업로드 또는 웹에서 직접 입력할 수 있습니다.\n"
-                                "한 번에 올리거나 나누어 올려도 회차별로 누적합니다.\n"
-                                + submission_summary(status)
-                            )
+                            else:
+                                text = (
+                                    f"🌙 {mention} 오늘{when} 발표 자료 제출을 위한 웹 연동이 설정되지 않았습니다.\n"
+                                    "서버 관리자에게 웹 제출 연동 설정을 요청해주세요.\n"
+                                    "발표 자료는 웹 제출 페이지에서 등록합니다.\n"
+                                    + submission_summary(status)
+                                )
                         sent = await channel.send(
                             text,
                             allowed_mentions=discord.AllowedMentions(
@@ -307,9 +304,9 @@ class SeminarBot(discord.Client):
 
     async def notify_web_submission(self, session: dict, status: dict) -> int:
         config = self.store.require_config(session["guild_id"])
-        channel = self.get_channel(config["upload_channel_id"])
+        channel = self.get_channel(config["channel_id"])
         if channel is None:
-            channel = await self.fetch_channel(config["upload_channel_id"])
+            channel = await self.fetch_channel(config["channel_id"])
         if not isinstance(channel, discord.TextChannel) or channel.guild.id != session["guild_id"]:
             raise UserError("자료 알림 채널을 확인해주세요.")
         message = await channel.send(
@@ -340,28 +337,6 @@ class SeminarBot(discord.Client):
         if record.get("source_type") in {"web", "manual"} and record.get("session_id"):
             return self.settings.submission_url(record["session_id"]) or record["message_url"]
         return record["message_url"]
-
-    async def prepare_discord_document(self, message, attachment, data: bytes):
-        # Unclassified PDFs and papers never enter the permanent archive. In
-        # Compose this directory is memory-backed tmpfs, separate from NAS data.
-        suffix = Path(attachment.filename).suffix.casefold()
-        with tempfile.TemporaryDirectory(prefix="seminar-discord-") as temporary:
-            path = Path(temporary) / f"document{suffix}"
-            await asyncio.to_thread(path.write_bytes, data)
-            info = await self.extract_document(path, attachment.filename, data)
-            classification = classify_document(
-                attachment.filename, info, getattr(message, "content", "")
-            )
-            relative_path = ""
-            if classification.kind == "slides":
-                directory = self.settings.data_dir / "files" / str(message.guild.id)
-                directory.mkdir(parents=True, exist_ok=True)
-                target = directory / f"{attachment.id}{suffix}"
-                await asyncio.to_thread(shutil.copyfile, path, target)
-                relative_path = str(target.relative_to(self.settings.data_dir))
-            else:
-                info = replace(info, text="")
-            return info, classification, relative_path
 
     async def classify_document_record(
         self, guild_id: int, record_id: int, kind: str, user_id: int, manager: bool
@@ -459,109 +434,6 @@ class SeminarBot(discord.Client):
     async def before_reminders(self) -> None:
         await self.wait_until_ready()
 
-    async def on_message(self, message: discord.Message) -> None:
-        if not message.guild or message.author.bot or not message.attachments:
-            return
-        config = self.store.config(message.guild.id)
-        if not config or message.channel.id != config["upload_channel_id"]:
-            return
-        for attachment in message.attachments:
-            if Path(attachment.filename).suffix.casefold() not in {".pdf", ".ppt", ".pptx"}:
-                continue
-            try:
-                async with self.upload_slots:
-                    await self.archive_attachment(message, attachment)
-            except Exception:
-                log.exception("Could not archive attachment %s", attachment.id)
-                try:
-                    await message.reply(
-                        f"`{safe(attachment.filename, 100)}` 저장에 실패했습니다. 잠시 후 파일을 다시 올려주세요.",
-                        mention_author=False,
-                    )
-                except discord.HTTPException:
-                    pass
-
-    async def archive_attachment(
-        self, message: discord.Message, attachment: discord.Attachment
-    ) -> None:
-        guild_id = message.guild.id
-        if self.store.has_attachment(guild_id, attachment.id):
-            return
-        limit = self.settings.max_file_mb * 1024 * 1024
-        if attachment.size > limit:
-            await message.reply(
-                f"파일당 {self.settings.max_file_mb}MB까지 기록할 수 있습니다.",
-                mention_author=False,
-            )
-            return
-        # Attachment.read uses Discord's CDN URL; never fetch URLs from message text.
-        data = await attachment.read()
-        if len(data) > limit:
-            raise UserError("파일 크기 제한을 초과했습니다.")
-        info, classification, file_path = await self.prepare_discord_document(
-            message, attachment, data
-        )
-        # Replayed events can run concurrently while the worker is parsing.
-        if self.store.has_attachment(guild_id, attachment.id):
-            return
-        async with self.schedule_lock:
-            if self.store.has_attachment(guild_id, attachment.id):
-                return
-            record_id, duplicates = self.store.add_document(
-                guild_id,
-                attachment.id,
-                message.author.id,
-                info,
-                attachment.filename,
-                file_path,
-                message.jump_url,
-                message.created_at,
-                source_channel_id=message.channel.id,
-                kind=classification.kind,
-                classification_reason=classification.reason,
-            )
-            record = self.store.document(guild_id, record_id)
-            status = (
-                self.store.submission(guild_id, record["session_id"])
-                if record["session_id"]
-                else None
-            )
-        embed = discord.Embed(
-            title="📚 자료를 기록했어요", description=safe(info.title, 450), color=0x5B8DEF
-        )
-        embed.add_field(name="자료 번호", value=f"#{record_id}")
-        embed.add_field(
-            name="발표 회차",
-            value=record["seminar_date"] or "미연결 · /자료연결 로 지정",
-            inline=True,
-        )
-        if info.doi:
-            embed.add_field(name="DOI", value=safe(info.doi, 255), inline=False)
-        if info.arxiv_id:
-            embed.add_field(name="arXiv", value=safe(info.arxiv_id), inline=True)
-        if info.warning:
-            embed.add_field(name="추출 결과", value=safe(info.warning, 500), inline=False)
-        if duplicates:
-            previous = []
-            for old in duplicates:
-                when = old["seminar_date"] or "발표 회차 미연결"
-                current_record = self.store.document(guild_id, old["id"])
-                previous.append(
-                    f"#{old['id']} · {when} · [기존 업로드]({self.source_url(current_record)})"
-                )
-            embed.add_field(
-                name="같은 논문 또는 파일로 보이는 기존 기록",
-                value="\n".join(previous),
-                inline=False,
-            )
-        add_submission_fields(embed, record, status)
-        embed.set_footer(text="아래 버튼으로 자료 구분 확인/수정 · /제출현황 으로 최신 현황 확인")
-        try:
-            await message.reply(embed=embed, view=classification_view(record), mention_author=False)
-        except discord.HTTPException:
-            # The archive already committed; a failed acknowledgment is not a failed save.
-            log.warning("Archived record %s but could not send acknowledgment", record_id)
-
     async def on_command_error(
         self, interaction: discord.Interaction, error: app_commands.AppCommandError
     ) -> None:
@@ -587,7 +459,7 @@ class SeminarBot(discord.Client):
 
         @tree.command(
             name="설정",
-            description="세미나 요일·시작 시간, 알림 시간, 채널을 설정합니다 (서버 관리자)",
+            description="세미나 요일·필수 시작 시간, 알림 시간과 알림 채널을 설정합니다 (서버 관리자)",
         )
         @app_commands.guild_only()
         @app_commands.default_permissions(manage_guild=True)
@@ -599,42 +471,40 @@ class SeminarBot(discord.Client):
         @app_commands.describe(
             weekday="세미나 요일",
             channel="알림을 보낼 채널",
-            upload_channel="자료 파일을 올릴 채널",
             morning="아침 알림 HH:MM",
             evening="저녁 자료 요청 HH:MM",
             timezone="시간대 (기본 Asia/Seoul)",
-            seminar_time="매주 세미나 시작 시각 HH:MM (예: 14:00, 생략하면 기존 시간 유지)",
+            seminar_time="매주 세미나 시작 시각 HH:MM (필수, 예: 14:00)",
         )
         async def configure(
             interaction: discord.Interaction,
             weekday: int,
             channel: discord.TextChannel,
-            upload_channel: discord.TextChannel,
+            seminar_time: str,
             morning: str = "09:00",
             evening: str = "18:00",
             timezone: str = "Asia/Seoul",
-            seminar_time: str | None = None,
         ) -> None:
-            for target in (channel, upload_channel):
-                member = interaction.guild.me
-                permissions = target.permissions_for(member)
-                if not (
-                    permissions.view_channel
-                    and permissions.send_messages
-                    and permissions.embed_links
-                    and permissions.read_message_history
-                ):
-                    raise UserError(
-                        f"{target.mention}에서 봇에게 채널 보기·메시지 보내기·링크 임베드·기록 보기 권한을 주세요."
-                    )
-                if target.guild.id != interaction.guild_id:
-                    raise UserError("현재 서버의 채널을 선택해주세요.")
+            if channel.guild.id != interaction.guild_id:
+                raise UserError("현재 서버의 채널을 선택해주세요.")
+            permissions = channel.permissions_for(interaction.guild.me)
+            if not (
+                permissions.view_channel
+                and permissions.send_messages
+                and permissions.embed_links
+                and permissions.read_message_history
+            ):
+                raise UserError(
+                    f"{channel.mention}에서 봇에게 채널 보기·메시지 보내기·링크 임베드·기록 보기 권한을 주세요."
+                )
             await interaction.response.defer(ephemeral=True)
             async with self.schedule_lock:
+                previous = self.store.config(interaction.guild_id)
+                upload_channel_id = previous["upload_channel_id"] if previous else channel.id
                 delta = self.store.configure(
                     interaction.guild_id,
                     channel.id,
-                    upload_channel.id,
+                    upload_channel_id,
                     weekday,
                     morning,
                     evening,
@@ -645,7 +515,7 @@ class SeminarBot(discord.Client):
             text = (
                 f"{safe(weekly_schedule(config))}\n"
                 f"알림: 아침 {config['morning']} / 저녁 {config['evening']}\n"
-                f"알림 채널: {channel.mention} · 자료: {upload_channel.mention}"
+                f"알림 채널: {channel.mention}"
             )
             if delta:
                 text += f"\n기존 미래 일정도 새 요일에 맞춰 {delta}일 뒤로 이동했습니다."
@@ -994,13 +864,12 @@ class SeminarBot(discord.Client):
                 "연구실 사이트 **Internal → 세미나 자료 조회**에서 최신순 열람·논문 검색·발표 자료 다운로드\n"
                 "`/검색`으로도 논문 검색 가능하며 종류 옵션에서 발표 자료나 전체를 선택할 수 있습니다.\n\n"
                 "**서버 관리자**\n"
-                "`/설정` 요일·**세미나시간**(매주 고정 시작 시각)·알림/자료 채널 지정\n"
+                "`/설정` 요일·**세미나시간**(매주 고정 시작 시각, 필수)·알림 채널 지정\n"
                 "아침 알림·저녁 자료 요청 시각은 세미나 시작 시각과 별도로 지정합니다.\n"
                 "발표 순서는 NAS의 `config/rotation.json`의 `presenters`에서 편집 (서버 한 곳이면 서버 ID 불필요)\n"
                 "파일 저장 후 30초 안에 적용하며 `/일정`을 열 때도 확인합니다.\n"
-                "`/스왑` 두 날짜의 발표자 교환 · `/연기` 해당 주 휴강 + 이후 전체 1주 연기\n\n"
-                "**Discord에 직접 올린 자료 관리**\n"
-                "자료 채널에 파일을 올려도 자동 등록합니다. 구분이 애매한 PDF는 아래 버튼으로 선택하세요.\n"
-                "`/자료분류` 구분 수정 · `/자료수정` 제목 수정 · `/자료연결` 발표 회차 지정"
+                "`/스왑` 두 날짜의 발표자 교환 · `/연기` 해당 주 휴강 + 이후 전체 1주 연기"
             )
+            if not self.web_submission_enabled(interaction.guild_id):
+                text += "\n\n웹 제출이 설정되지 않았습니다. 서버 관리자에게 웹 연동 설정을 요청해주세요."
             await interaction.response.send_message(text, ephemeral=True)

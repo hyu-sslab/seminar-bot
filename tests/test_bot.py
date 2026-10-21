@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import json
 import re
@@ -17,10 +18,11 @@ from pypdf import PdfWriter
 
 from seminar_bot.__main__ import instance_lock
 from seminar_bot.archive import extract_saved
-from seminar_bot.bot import DocumentKindButton, SeminarBot, safe
+from seminar_bot.bot import DocumentKindButton, SeminarBot, classification_view, safe
 from seminar_bot.documents import DocumentInfo
 from seminar_bot.settings import Settings
 from seminar_bot.store import UserError
+from seminar_bot.submission_access import SubmissionAccess
 from seminar_bot.web_api import APIError, SeminarAPI
 
 DAY = date(2026, 10, 15)
@@ -60,34 +62,43 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-    def configuration_interaction(self):
+    def configuration_interaction(self, guild_id=1, channel_id=1001):
         target = SimpleNamespace(
-            id=1001,
-            guild=SimpleNamespace(id=1),
-            mention="<#1001>",
+            id=channel_id,
+            guild=SimpleNamespace(id=guild_id),
+            mention=f"<#{channel_id}>",
             permissions_for=lambda _: SimpleNamespace(
                 view_channel=True, send_messages=True, embed_links=True, read_message_history=True
             ),
         )
         interaction = SimpleNamespace(
-            guild_id=1,
+            guild_id=guild_id,
             guild=SimpleNamespace(me=object()),
             response=SimpleNamespace(defer=AsyncMock()),
             followup=SimpleNamespace(send=AsyncMock()),
         )
         return interaction, target
 
-    async def test_configure_seminar_time_has_korean_option_and_omission_preserves_saved_time(self):
+    def enable_web_submission(self):
+        self.bot.settings = replace(
+            self.bot.settings,
+            api_token="synthetic-api-token-" * 3,
+            api_guild_id=1,
+            seminar_page_url="https://example.test/internal/seminars/",
+        )
+
+    async def test_configure_requires_korean_seminar_time_and_exposes_only_one_channel(self):
         command = self.bot.tree.get_command("설정")
         options = command.to_dict(self.bot.tree)["options"]
         option = next(item for item in options if item["name"] == "세미나시간")
-        self.assertFalse(option.get("required", False))
+        self.assertTrue(option["required"])
+        self.assertNotIn("upload_channel", {item["name"] for item in options})
         interaction, target = self.configuration_interaction()
         sessions = [
             dict(row) for row in self.bot.store.db.execute("SELECT * FROM sessions ORDER BY id")
         ]
         with patch.object(self.bot, "reload_rotation_file", AsyncMock()):
-            await command.callback(interaction, 3, target, target, seminar_time="14:00")
+            await command.callback(interaction, 3, target, "14:00")
             configured = self.bot.store.require_config(1)
             self.assertEqual(
                 (configured["seminar_time"], configured["morning"], configured["evening"]),
@@ -96,14 +107,16 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             response = interaction.followup.send.await_args.args[0]
             self.assertIn("매주 목요일 14:00 (Asia/Seoul)", response)
             self.assertIn("알림: 아침 09:00 / 저녁 18:00", response)
-            await command.callback(interaction, 3, target, target, morning="08:20", evening="19:10")
+            await command.callback(
+                interaction, 3, target, "15:30", morning="08:20", evening="19:10"
+            )
         configured = self.bot.store.require_config(1)
         self.assertEqual(
             (configured["seminar_time"], configured["morning"], configured["evening"]),
-            ("14:00", "08:20", "19:10"),
+            ("15:30", "08:20", "19:10"),
         )
         response = interaction.followup.send.await_args.args[0]
-        self.assertIn("매주 목요일 14:00 (Asia/Seoul)", response)
+        self.assertIn("매주 목요일 15:30 (Asia/Seoul)", response)
         self.assertIn("알림: 아침 08:20 / 저녁 19:10", response)
         self.assertEqual(
             [dict(row) for row in self.bot.store.db.execute("SELECT * FROM sessions ORDER BY id")],
@@ -111,14 +124,93 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(interaction.followup.send.await_args.kwargs["ephemeral"])
 
-    async def test_configure_without_seminar_time_labels_unset_and_reminder_times_separately(self):
-        interaction, target = self.configuration_interaction()
+    async def test_first_configuration_initializes_internal_scope_to_the_single_notification_channel(
+        self,
+    ):
+        interaction, target = self.configuration_interaction(guild_id=2, channel_id=2001)
         with patch.object(self.bot, "reload_rotation_file", AsyncMock()):
-            await self.bot.tree.get_command("설정").callback(interaction, 3, target, target)
-        self.assertIsNone(self.bot.store.require_config(1)["seminar_time"])
+            await self.bot.tree.get_command("설정").callback(interaction, 3, target, "14:00")
+        config = self.bot.store.require_config(2)
+        self.assertEqual(
+            (config["channel_id"], config["upload_channel_id"], config["seminar_time"]),
+            (2001, 2001, "14:00"),
+        )
         text = interaction.followup.send.await_args.args[0]
-        self.assertIn("매주 목요일 · 시작 시간 미설정 (Asia/Seoul)", text)
+        self.assertIn("매주 목요일 14:00 (Asia/Seoul)", text)
         self.assertIn("알림: 아침 09:00 / 저녁 18:00", text)
+        self.assertNotIn("자료:", text)
+
+    async def test_notification_channel_change_preserves_archive_scope_progress_and_submission_grants(
+        self,
+    ):
+        record, path = await self.retained_slides_fixture()
+        self.bot.store.postpone(1, DAY, DAY + timedelta(weeks=2))
+        session = self.bot.store.session_on(1, DAY)
+        self.bot.store.mark_sent(session["id"], str(DAY), "morning", 901)
+        with self.bot.store.db:
+            self.bot.store.remember_rotation_file(1, "ab" * 32)
+        access = SubmissionAccess(self.bot.store)
+        invite, _ = access.issue(1, session["id"], 101, now=1_700_000_000, scope="presenter")
+        token, _ = access.redeem(invite, 1, now=1_700_000_001)
+        self.enable_web_submission()
+        settings = self.bot.settings
+        tables = (
+            "sessions",
+            "holidays",
+            "documents",
+            "deliveries",
+            "rotation_file_state",
+            "submission_invitations",
+            "submission_grants",
+        )
+
+        def history():
+            return {
+                table: [
+                    dict(row)
+                    for row in self.bot.store.db.execute(f"SELECT * FROM {table} ORDER BY rowid")
+                ]
+                for table in tables
+            }
+
+        original = history()
+        before = self.bot.store.require_config(1)
+        progress = self.bot.store.submission(1, session["id"])
+        content = path.read_bytes()
+        interaction, target = self.configuration_interaction(channel_id=1009)
+        with patch.object(self.bot, "reload_rotation_file", AsyncMock()):
+            await self.bot.tree.get_command("설정").callback(interaction, 3, target, "14:00")
+        self.assertEqual(
+            self.bot.store.require_config(1),
+            {**before, "channel_id": 1009, "seminar_time": "14:00"},
+        )
+        self.assertEqual(history(), original)
+        self.assertEqual(self.bot.store.submission(1, session["id"]), progress)
+        self.assertEqual(self.bot.store.document(1, record["id"])["source_channel_id"], 1002)
+        self.assertEqual(path.read_bytes(), content)
+        self.assertEqual(access.validate(token, 1, now=1_700_000_002)["upload_channel_id"], 1002)
+        self.assertIs(self.bot.settings, settings)
+
+    async def test_web_submission_notification_uses_main_channel_and_keeps_archive_scope(self):
+        main = Mock(spec=discord.TextChannel)
+        main.guild = SimpleNamespace(id=1)
+        main.send = AsyncMock(return_value=SimpleNamespace(id=902))
+        archive = Mock(spec=discord.TextChannel)
+        archive.send = AsyncMock()
+        session = self.bot.store.session_on(1, DAY)
+        with patch.object(
+            self.bot,
+            "get_channel",
+            side_effect=lambda channel_id: main if channel_id == 1001 else archive,
+        ) as get:
+            result = await self.bot.notify_web_submission(
+                session, self.bot.store.submission(1, session["id"])
+            )
+        self.assertEqual(result, 902)
+        get.assert_called_once_with(1001)
+        main.send.assert_awaited_once()
+        archive.send.assert_not_awaited()
+        self.assertEqual(self.bot.store.require_config(1)["upload_channel_id"], 1002)
 
     async def test_schedule_displays_seminar_time_on_presentations_but_not_cancelled_week(self):
         self.bot.store.configure(
@@ -164,6 +256,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("None", embed.description + embed.footer.text)
 
     async def test_seminar_time_in_reminders_keeps_trigger_times_and_duplicate_protection(self):
+        self.enable_web_submission()
         self.bot.store.configure(
             1, 1001, 1002, 3, "08:20", "19:10", "Asia/Seoul", NOW, seminar_time="14:00"
         )
@@ -224,6 +317,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(len(text), 2000)
 
     async def test_help_explains_current_seminar_submission_and_archive_workflows(self):
+        self.enable_web_submission()
         response = await self.help_response()
         text = response.args[0].replace("*", "").replace("`", "")
         for feature in (
@@ -262,6 +356,19 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             text, r"논문[^\n]*(?:PDF|원본)[^\n]*(?:미보관|보관하지|저장하지|보관\s*안)"
         )
         self.assertNotIn("kind:전체", text)
+        configure = next(line for line in text.splitlines() if line.startswith("/설정"))
+        self.assertIn("필수", configure)
+        self.assertNotIn("자료 채널", configure)
+        self.assertNotIn("자동 등록", text)
+        self.assertNotIn("upload_channel", text)
+
+    async def test_help_without_web_configuration_never_advertises_discord_attachment_submission(
+        self,
+    ):
+        text = (await self.help_response()).args[0]
+        self.assertNotIn("자동 등록", text)
+        self.assertNotIn("파일 첨부", text)
+        self.assertNotRegex(text, r"(?:자료\s*채널|채널)에[^\n]*(?:올리|업로드|공유)")
 
     def assert_latest_guild_commands(self, guild_id):
         commands = self.bot.tree.get_commands(guild=discord.Object(id=guild_id))
@@ -603,7 +710,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             self.bot.rotation_errors[1] = error
 
         with patch.object(self.bot, "reload_rotation_file", side_effect=fail_reload):
-            await self.bot.tree.get_command("설정").callback(interaction, 3, target, target)
+            await self.bot.tree.get_command("설정").callback(interaction, 3, target, "14:00")
         sent = interaction.followup.send.await_args
         self.assertTrue(sent.kwargs["ephemeral"])
         self.assertIn("현재 서버 ID: `1`", sent.args[0])
@@ -612,7 +719,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(
             self.bot, "reload_rotation_file", side_effect=self.bot.rotation_errors.clear
         ):
-            await self.bot.tree.get_command("설정").callback(interaction, 3, target, target)
+            await self.bot.tree.get_command("설정").callback(interaction, 3, target, "14:00")
         self.assertNotIn("현재 서버 ID:", interaction.followup.send.await_args.args[0])
         self.assertNotIn("⚠️", interaction.followup.send.await_args.args[0])
 
@@ -688,30 +795,72 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         )
         return message, attachment
 
-    async def test_real_pdf_worker_keeps_metadata_and_search_without_original(self):
-        message, attachment = self.message()
-        await self.bot.on_message(message)
-        attachment.read.assert_awaited_once()
-        rows, count = self.bot.store.search(1, "한글연구논문")
-        self.assertEqual(count, 1)
-        record = rows[0]
-        self.assertEqual(record["seminar_date"], DAY.isoformat())
-        self.assertEqual(record["file_path"], "")
-        self.assertEqual(record["extracted_text"], "")
-        self.assertFalse(list(Path(self.temp.name).glob("files/**/*.*")))
-        self.assertEqual(record["source_channel_id"], 1002)
-        self.assertEqual(message.reply.await_args.kwargs["embed"].title, "📚 자료를 기록했어요")
+    def seed_legacy_document(
+        self, kind="paper", title="한글 연구 논문 Attention Study", attachment_id=500, info=None
+    ):
+        info = info or DocumentInfo(
+            title,
+            "",
+            None,
+            None,
+            hashlib.sha256(str(attachment_id).encode()).hexdigest(),
+            "pdf_metadata",
+        )
+        filename = f"{kind}-{attachment_id}.pdf"
+        relative_path = ""
+        if kind == "slides":
+            path = Path(self.temp.name) / "files" / filename
+            path.parent.mkdir(exist_ok=True)
+            path.write_bytes(pdf_bytes(title))
+            relative_path = str(path.relative_to(Path(self.temp.name)))
+        record_id, _ = self.bot.store.add_document(
+            1,
+            attachment_id,
+            101,
+            info,
+            filename,
+            relative_path,
+            f"https://discord.com/channels/1/1002/{attachment_id}",
+            NOW,
+            source_channel_id=1002,
+            kind=kind,
+        )
+        return self.bot.store.document(1, record_id)
 
-    async def test_explicit_presentation_pdf_keeps_original(self):
-        message, _ = self.message(filename="seminar_slides.pdf")
-        await self.bot.on_message(message)
-        record = self.bot.store.search(1, "한글연구논문")[0][0]
-        self.assertEqual(record["kind"], "slides")
-        self.assertTrue(record["file_path"])
-        self.assertEqual((Path(self.temp.name) / record["file_path"]).read_bytes(), pdf_bytes())
+    async def test_discord_attachments_are_never_collected_in_any_guild(self):
+        self.assertFalse(self.bot.intents.message_content)
+        await self.bot._async_setup_hook()
+        self.bot.store.configure(2, 2001, 2002, 3, "09:00", "18:00", "Asia/Seoul", NOW)
+        for enabled in (False, True):
+            if enabled:
+                self.enable_web_submission()
+            for guild_id in (1, 2):
+                with self.subTest(web_enabled=enabled, guild_id=guild_id):
+                    message, attachment = self.message(filename="slides.pdf")
+                    message.guild.id = guild_id
+                    message.channel.id = 1002 if guild_id == 1 else 2002
+                    oversized = SimpleNamespace(
+                        filename="oversized.pdf", size=30 * 1024 * 1024, read=AsyncMock()
+                    )
+                    message.attachments.append(oversized)
+                    before = "\n".join(self.bot.store.db.iterdump())
+                    with (
+                        patch.object(self.bot, "extract_document", AsyncMock()) as parser,
+                        patch.object(
+                            self.bot.store, "add_document", wraps=self.bot.store.add_document
+                        ) as save,
+                    ):
+                        self.bot.dispatch("message", message)
+                        await asyncio.sleep(0)
+                    attachment.read.assert_not_awaited()
+                    oversized.read.assert_not_awaited()
+                    parser.assert_not_awaited()
+                    save.assert_not_called()
+                    message.reply.assert_not_awaited()
+                    self.assertEqual("\n".join(self.bot.store.db.iterdump()), before)
+                    self.assertFalse(list(Path(self.temp.name).glob("files/**/*")))
 
     async def retained_slides_fixture(self):
-        message, _ = self.message(filename="seminar_slides.pdf")
         info = DocumentInfo(
             "Research Slides Reclassified As A Paper",
             "Sensitive extracted paper body",
@@ -720,9 +869,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             "classification-fixture-sha",
             "pdf_text",
         )
-        with patch.object(self.bot, "extract_document", AsyncMock(return_value=info)):
-            await self.bot.on_message(message)
-        record = self.bot.store.search(1, "Research Slides")[0][0]
+        record = self.seed_legacy_document(kind="slides", info=info)
         return record, Path(self.temp.name) / record["file_path"]
 
     async def test_reclassification_command_deletes_paper_original_and_body_and_blocks_download(
@@ -755,7 +902,8 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await command.callback(interaction, record["id"], "slides")
         restored = self.bot.store.document(1, record["id"])
         self.assertEqual((restored["file_path"], restored["extracted_text"]), ("", ""))
-        self.assertIn("다시 업로드", interaction.response.send_message.await_args.args[0])
+        self.assertIn("/제출", interaction.response.send_message.await_args.args[0])
+        self.assertIn("웹페이지", interaction.response.send_message.await_args.args[0])
 
     async def test_reclassification_keeps_an_original_referenced_by_another_document(self):
         record, path = await self.retained_slides_fixture()
@@ -811,64 +959,8 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.extraction_method, "filename")
         self.assertEqual(result.text, "")
 
-    async def test_corrupt_upload_is_still_indexed_by_filename(self):
-        message, _ = self.message(b"not a real PDF", "broken_research.pdf")
-        await self.bot.on_message(message)
-        rows, count = self.bot.store.search(1, "broken research")
-        self.assertEqual(count, 1)
-        self.assertEqual(rows[0]["extraction_method"], "filename")
-        self.assertTrue(rows[0]["warning"])
-
-    async def test_repeat_upload_event_does_not_duplicate(self):
-        message, attachment = self.message()
-        await self.bot.on_message(message)
-        await self.bot.on_message(message)
-        attachment.read.assert_awaited_once()
-        message.reply.assert_awaited_once()
-
-    async def test_concurrent_replayed_upload_under_schedule_lock(self):
-        message, attachment = self.message()
-        calls = 0
-        both_parsed = asyncio.Event()
-
-        async def extract(*args):
-            nonlocal calls
-            calls += 1
-            if calls == 2:
-                both_parsed.set()
-            return DocumentInfo("Concurrent Study", "", None, None, "hash", "filename")
-
-        await self.bot.schedule_lock.acquire()
-        try:
-            with patch("seminar_bot.bot.extract_saved", side_effect=extract):
-                one = asyncio.create_task(self.bot.archive_attachment(message, attachment))
-                two = asyncio.create_task(self.bot.archive_attachment(message, attachment))
-                await asyncio.wait_for(both_parsed.wait(), timeout=3)
-                self.bot.schedule_lock.release()
-                await asyncio.gather(one, two)
-        finally:
-            if self.bot.schedule_lock.locked():
-                self.bot.schedule_lock.release()
-        message.reply.assert_awaited_once()
-        self.assertEqual(self.bot.store.search(1, "concurrent")[1], 1)
-
-    async def test_upload_channel_and_file_type_are_respected(self):
-        message, attachment = self.message(filename="notes.txt")
-        await self.bot.on_message(message)
-        attachment.read.assert_not_awaited()
-        message, attachment = self.message()
-        message.channel.id = 999
-        await self.bot.on_message(message)
-        attachment.read.assert_not_awaited()
-
-    async def test_oversized_file_is_rejected_before_download(self):
-        message, attachment = self.message()
-        attachment.size = 21 * 1024 * 1024
-        await self.bot.on_message(message)
-        attachment.read.assert_not_awaited()
-        self.assertIn("20MB", message.reply.await_args.args[0])
-
     async def test_morning_and_evening_mention_only_presenter_and_persist(self):
+        self.enable_web_submission()
         channel = Mock(spec=discord.TextChannel)
         channel.guild = SimpleNamespace(id=1)
         channel.send = AsyncMock(return_value=SimpleNamespace(id=999))
@@ -917,8 +1009,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(channel.send.await_count, 2)
 
     async def test_private_source_channel_is_not_searchable_without_permission(self):
-        message, _ = self.message()
-        await self.bot.on_message(message)
+        self.seed_legacy_document()
         channel = SimpleNamespace(
             id=1002,
             permissions_for=Mock(
@@ -960,27 +1051,16 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         process.kill.assert_called_once()
         process.wait.assert_awaited_once()
 
-    async def test_presentation_and_three_papers_in_one_message_complete_submission(self):
-        message, _ = self.message()
-        files = [("seminar.ppt", b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1old-presentation")]
-        files.extend(
-            (f"paper{i}.pdf", pdf_bytes(f"Distinct Source Research Paper {i}")) for i in range(1, 4)
-        )
-        message.attachments = [
-            SimpleNamespace(
-                id=index, filename=name, size=len(data), read=AsyncMock(return_value=data)
+    async def test_submission_status_still_reports_preexisting_legacy_materials(self):
+        self.seed_legacy_document(kind="slides")
+        for index in range(1, 4):
+            self.seed_legacy_document(
+                attachment_id=500 + index, title=f"Distinct Source Research Paper {index}"
             )
-            for index, (name, data) in enumerate(files, start=501)
-        ]
-        await self.bot.on_message(message)
         session = self.bot.store.session_on(1, DAY)
         status = self.bot.store.submission(1, session["id"])
         self.assertEqual((status["slides"], status["papers"]), (1, 3))
         self.assertTrue(status["complete"])
-        latest = message.reply.await_args.kwargs["embed"]
-        summary = next(field.value for field in latest.fields if field.name == "제출 현황")
-        self.assertIn("제출 완료", summary)
-        self.assertEqual(message.reply.await_count, 4)
         self.assertEqual(self.bot.store.search(1, "distinct", kind="paper")[1], 3)
         channel = SimpleNamespace(
             id=1002,
@@ -1000,13 +1080,11 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(status_response.kwargs["ephemeral"])
 
     async def test_classification_button_survives_restart_and_recalculates_progress(self):
-        message, _ = self.message(filename="ambiguous.pdf")
-        await self.bot.on_message(message)
-        reply = message.reply.await_args.kwargs
-        view = reply["view"]
+        record = self.seed_legacy_document(kind="unknown")
+        view = classification_view(record)
         self.assertTrue(view.is_persistent())
         button = next(item for item in view.children if item.kind == "slides")
-        original_embed = reply["embed"]
+        original_embed = discord.Embed(title="기존 자료")
         self.bot.store.rename_document(
             1, button.record_id, "Corrected Presentation Title", 101, False
         )
@@ -1039,9 +1117,8 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("논문 3편", interaction.followup.send.await_args.args[0])
 
     async def test_other_member_cannot_classify_with_button(self):
-        message, _ = self.message(filename="ambiguous.pdf")
-        await self.bot.on_message(message)
-        button = message.reply.await_args.kwargs["view"].children[0]
+        record = self.seed_legacy_document(kind="unknown")
+        button = classification_view(record).children[0]
         interaction = SimpleNamespace(
             client=self.bot,
             guild_id=1,
@@ -1056,8 +1133,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         interaction.message.edit.assert_not_awaited()
 
     async def test_search_defaults_to_papers_and_can_include_slides(self):
-        message, _ = self.message(filename="slides.pdf")
-        await self.bot.on_message(message)
+        self.seed_legacy_document(kind="slides")
         channel = SimpleNamespace(
             id=1002,
             permissions_for=Mock(
@@ -1077,7 +1153,10 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             len(interaction.response.send_message.await_args.kwargs["embed"].fields), 1
         )
 
-    async def test_evening_reminder_mentions_both_upload_requirements_and_progress(self):
+    async def test_evening_reminder_requests_personal_submission_link_without_shared_url_or_channel_upload(
+        self,
+    ):
+        self.enable_web_submission()
         channel = Mock(spec=discord.TextChannel)
         channel.guild = SimpleNamespace(id=1)
         channel.send = AsyncMock(return_value=SimpleNamespace(id=1000))
@@ -1093,6 +1172,31 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("논문 3편 이상", text)
         self.assertIn("현재: 발표 자료 0개", text)
         self.assertIn("<@101>", text)
+        self.assertIn("/제출", text)
+        self.assertIn("링크", text)
+        self.assertNotIn(self.bot.settings.seminar_page_url, text)
+        self.assertNotIn("https://", text)
+        self.assertNotRegex(text, r"<#\d+>|채널에[^\n]*(?:공유|올려|첨부)")
+
+    async def test_evening_without_web_configuration_requests_admin_setup_and_never_channel_upload(
+        self,
+    ):
+        channel = Mock(spec=discord.TextChannel)
+        channel.guild = SimpleNamespace(id=1)
+        channel.send = AsyncMock(return_value=SimpleNamespace(id=1000))
+        with (
+            patch.object(self.bot, "reload_rotation_file", AsyncMock()),
+            patch.object(self.bot, "get_guild", return_value=SimpleNamespace(id=1)),
+            patch.object(self.bot, "get_channel", return_value=channel),
+            patch("seminar_bot.bot.datetime") as clock,
+        ):
+            clock.now.return_value = datetime(2026, 10, 15, 9, tzinfo=UTC)
+            await self.bot.reminders()
+        text = channel.send.await_args.args[0]
+        for word in ("관리자", "웹", "설정"):
+            self.assertIn(word, text)
+        self.assertNotIn("https://", text)
+        self.assertNotRegex(text, r"<#\d+>|채널에[^\n]*(?:공유|올려|첨부)")
 
 
 class RuntimeTests(unittest.TestCase):

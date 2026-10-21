@@ -473,6 +473,106 @@ class WebAPITests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Hidden Previous Channel Paper", await response.text())
         self.assertEqual(self.count_documents(), 1)
 
+    async def test_notification_channel_change_keeps_web_archive_scope_grant_and_replay(self):
+        invitation, _ = self.api.submission_access.issue(1, self.row["id"], 101, scope="presenter")
+        grant, _ = self.api.submission_access.redeem(invitation, 1)
+        scoped = {"X-Seminar-Submission-Token": grant}
+        key = str(uuid.uuid4())
+        data = pdf_bytes("Existing Seminar Presentation")
+        uploaded = await self.upload(data=data, key=key, headers=scoped)
+        self.assertEqual(uploaded.status, 201)
+        document = (await uploaded.json())["document"]
+        hidden_path = self.data_dir / "files" / "other-channel.pdf"
+        hidden_path.write_bytes(pdf_bytes("Hidden Channel Presentation"))
+        hidden_id, _ = self.bot.store.add_document(
+            1,
+            999,
+            101,
+            DocumentInfo(
+                "Hidden Channel Presentation",
+                "private body",
+                None,
+                None,
+                "hidden-sha",
+                "pdf_metadata",
+            ),
+            "other-channel.pdf",
+            "files/other-channel.pdf",
+            "https://site.test/internal/seminars/",
+            datetime.now(UTC),
+            source_channel_id=999,
+            kind="slides",
+            session_id=self.row["id"],
+            source_type="web",
+            upload_key=str(uuid.uuid4()),
+        )
+        target = SimpleNamespace(
+            id=2001,
+            guild=SimpleNamespace(id=1),
+            mention="<#2001>",
+            permissions_for=lambda _: SimpleNamespace(
+                view_channel=True, send_messages=True, embed_links=True, read_message_history=True
+            ),
+        )
+        interaction = SimpleNamespace(
+            guild_id=1,
+            guild=SimpleNamespace(me=object()),
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        await self.bot.tree.get_command("설정").callback(
+            interaction,
+            self.day.weekday(),
+            target,
+            "14:00",
+            timezone="UTC",
+        )
+        config = self.bot.store.require_config(1)
+        self.assertEqual((config["channel_id"], config["upload_channel_id"]), (2001, 1002))
+        context = await self.client.get("/v1/submission/context", headers=self.headers(**scoped))
+        self.assertEqual(context.status, 200)
+        self.assertEqual((await context.json())["session_id"], self.row["id"])
+        detail = await self.client.get(
+            f"/v1/sessions/{self.row['id']}", headers=self.headers(**scoped)
+        )
+        self.assertEqual(detail.status, 200)
+        self.assertEqual(
+            [row["id"] for row in (await detail.json())["documents"]], [document["id"]]
+        )
+        archive = await self.client.get("/v1/archive", headers=self.headers())
+        self.assertEqual(archive.status, 200)
+        self.assertEqual(
+            [row["id"] for row in (await archive.json())["documents"]], [document["id"]]
+        )
+        search = await self.client.get("/v1/search?q=Presentation&kind=all", headers=self.headers())
+        self.assertEqual(
+            [row["id"] for row in (await search.json())["documents"]], [document["id"]]
+        )
+        download = await self.client.get(
+            f"/v1/documents/{document['id']}/file", headers=self.headers()
+        )
+        self.assertEqual(download.status, 200)
+        self.assertEqual(await download.read(), data)
+        self.assertEqual(
+            (
+                await self.client.get(f"/v1/documents/{hidden_id}/file", headers=self.headers())
+            ).status,
+            404,
+        )
+        for method in ("patch", "delete"):
+            hidden = await getattr(self.client, method)(
+                f"/v1/sessions/{self.row['id']}/documents/{hidden_id}",
+                json={"title": "Not allowed"} if method == "patch" else {},
+                headers=self.headers(**scoped),
+            )
+            self.assertEqual(hidden.status, 404)
+        replay = await self.upload(data=data, key=key, headers=scoped)
+        self.assertEqual(replay.status, 200)
+        self.assertTrue((await replay.json())["duplicate"])
+        self.assertEqual(self.count_documents(), 2)
+        self.assertEqual(self.bot.store.document(1, document["id"])["source_channel_id"], 1002)
+        self.assertTrue(hidden_path.exists())
+
     async def test_complete_submission_notifies_once_and_repeated_submit_is_idempotent(self):
         await self.complete_uploads()
         for _ in range(2):
