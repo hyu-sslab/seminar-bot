@@ -81,6 +81,8 @@ def validated_request(method: object, path: object, headers: object) -> tuple[di
         allowed_method, query_keys, maximum = "GET", {"q", "kind", "page"}, 0
     elif parsed.path == "/v1/archive":
         allowed_method, query_keys, maximum = "GET", {"q", "kind", "page"}, 0
+    elif parsed.path == "/v1/presentations":
+        allowed_method, query_keys, maximum = "GET", {"q", "page"}, 0
     else:
         raise RelayProtocolError("Invalid request")
     if method != allowed_method or re.search(r"%(?![a-fA-F0-9]{2})", parsed.query):
@@ -111,7 +113,7 @@ def validated_request(method: object, path: object, headers: object) -> tuple[di
             or not re.fullmatch(r"[1-9][0-9]{0,5}", query.get("page", "1"))
         ):
             raise RelayProtocolError("Invalid request")
-    if parsed.path == "/v1/archive":
+    if parsed.path in {"/v1/archive", "/v1/presentations"}:
         search = query.get("q", "")
         page = query.get("page", "1")
         if (

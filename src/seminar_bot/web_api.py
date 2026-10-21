@@ -21,10 +21,10 @@ from urllib.parse import quote, unquote
 from aiohttp import web
 
 from .access import AccessUnavailable, AccessVerifier
-from .documents import DocumentInfo, validate_paper_fields
+from .documents import DocumentInfo, normalize_search, validate_paper_fields
 from .remote_parser import ParserUnavailable
 from .rotation import read_rotations
-from .store import UserError, local_now
+from .store import UserError, archive_search_term, local_now
 from .submission_access import SubmissionAccess, SubmissionAccessDenied, session_version
 
 log = logging.getLogger(__name__)
@@ -183,6 +183,7 @@ class SeminarAPI:
                 ),
                 web.get("/v1/search", self.search),
                 web.get("/v1/archive", self.archive),
+                web.get("/v1/presentations", self.presentations),
                 web.get("/v1/documents/{document_id:[1-9][0-9]{0,18}}/file", self.download),
             ]
         )
@@ -1024,6 +1025,60 @@ class SeminarAPI:
                 "total": total,
                 "page": page,
                 "page_size": 20,
+            }
+        )
+
+    async def presentations(self, request):
+        for key in request.query:
+            if key not in {"q", "page"} or len(request.query.getall(key)) != 1:
+                raise APIError(400, "요청 매개변수를 확인해주세요.")
+        raw_page = request.query.get("page", "1")
+        if not re.fullmatch(r"[1-9][0-9]{0,5}", raw_page) or int(raw_page) > 100000:
+            raise APIError(400, "조회 페이지를 확인해주세요.")
+        query = request.query.get("q", "")
+        term = archive_search_term(query)
+        names = await self.names()
+        display_names = dict(names)
+        guild = self.bot.get_guild(self.guild_id)
+        if guild is not None:
+            for member in getattr(guild, "members", ()):
+                display_names.setdefault(member.id, member.display_name)
+        matching_presenters = (
+            [user_id for user_id, name in display_names.items() if term in normalize_search(name)]
+            if term
+            else []
+        )
+        async with self.bot.schedule_lock:
+            config = self.config()
+            rows, total = self.bot.store.presentations(
+                self.guild_id,
+                through=local_now(config).date(),
+                q=query,
+                page=int(raw_page),
+                page_size=10,
+                visible_channel_ids=[config["upload_channel_id"]],
+                presenter_ids=matching_presenters,
+            )
+        return web.json_response(
+            {
+                "presentations": [
+                    {
+                        "session": self.session_data(row["session"], names),
+                        "documents": [
+                            self.document_data(document, names) for document in row["documents"]
+                        ],
+                        "slides_count": sum(
+                            document["kind"] == "slides" for document in row["documents"]
+                        ),
+                        "paper_count": sum(
+                            document["kind"] == "paper" for document in row["documents"]
+                        ),
+                    }
+                    for row in rows
+                ],
+                "total": total,
+                "page": int(raw_page),
+                "page_size": 10,
             }
         )
 

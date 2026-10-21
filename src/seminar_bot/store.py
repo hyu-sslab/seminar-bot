@@ -41,6 +41,25 @@ def local_now(config: dict, now: datetime | None = None) -> datetime:
     return (now or datetime.now(UTC)).astimezone(ZoneInfo(config["timezone"]))
 
 
+def archive_search_term(query: str) -> str:
+    """Validate optional archive search and normalize titles and paper identifiers."""
+    try:
+        valid = isinstance(query, str) and len(query) <= 200 and len(query.encode("utf-8")) <= 400
+    except UnicodeError:
+        valid = False
+    if not valid or any(ord(char) < 32 or ord(char) == 127 for char in query):
+        raise UserError("검색어는 200자, 400바이트 이내로 입력해주세요.")
+    raw = query.strip()
+    raw = re.sub(r"^(?:https?://(?:dx\.)?doi\.org/|doi\s*:\s*)", "", raw, flags=re.I)
+    raw = re.sub(r"^(?:https?://arxiv\.org/(?:abs|pdf)/|arxiv\s*:\s*)", "", raw, flags=re.I)
+    if re.fullmatch(r"(?:\d{4}\.\d{4,5}|[a-z][a-z.\-]+/\d{7})(?:v\d+)?(?:\.pdf)?", raw, re.I):
+        raw = re.sub(r"(?:v\d+)?(?:\.pdf)?$", "", raw, flags=re.I)
+    term = normalize_search(raw)
+    if query.strip() and (not term or len(term) > 200):
+        raise UserError("검색할 제목 또는 식별자를 입력해주세요.")
+    return term
+
+
 class Store:
     """Small, synchronous SQLite transactions; no network or parsing inside transactions."""
 
@@ -857,20 +876,7 @@ class Store:
             raise UserError("자료 표시 개수를 확인해주세요.")
         if kind is not None and kind not in {"slides", "paper"}:
             raise UserError("발표 자료 또는 논문을 선택해주세요.")
-        try:
-            valid_query = isinstance(q, str) and len(q) <= 200 and len(q.encode("utf-8")) <= 400
-        except UnicodeError:
-            valid_query = False
-        if not valid_query or any(ord(char) < 32 or ord(char) == 127 for char in q):
-            raise UserError("검색어는 200자, 400바이트 이내로 입력해주세요.")
-        raw = q.strip()
-        raw = re.sub(r"^(?:https?://(?:dx\.)?doi\.org/|doi\s*:\s*)", "", raw, flags=re.I)
-        raw = re.sub(r"^(?:https?://arxiv\.org/(?:abs|pdf)/|arxiv\s*:\s*)", "", raw, flags=re.I)
-        if re.fullmatch(r"(?:\d{4}\.\d{4,5}|[a-z][a-z.\-]+/\d{7})(?:v\d+)?(?:\.pdf)?", raw, re.I):
-            raw = re.sub(r"(?:v\d+)?(?:\.pdf)?$", "", raw, flags=re.I)
-        term = normalize_search(raw)
-        if q.strip() and (not term or len(term) > 200):
-            raise UserError("검색할 제목 또는 식별자를 입력해주세요.")
+        term = archive_search_term(q)
         conditions = ["d.guild_id=?"]
         parameters: list = [guild_id]
         if visible_channel_ids is not None:
@@ -899,6 +905,76 @@ class Store:
             (*parameters, page_size, (page - 1) * page_size),
         ).fetchall()
         return [dict(row) for row in rows], count
+
+    def presentations(
+        self,
+        guild_id: int,
+        through: date,
+        q: str = "",
+        page: int = 1,
+        page_size: int = 10,
+        visible_channel_ids: list[int] | None = None,
+        presenter_ids: list[int] | None = None,
+    ) -> tuple[list[dict], int]:
+        """Page existing past presentations, keeping each session's materials together."""
+        if type(page) is not int or not 1 <= page <= 100000:
+            raise UserError("페이지는 1~100000 사이로 입력해주세요.")
+        if type(page_size) is not int or not 1 <= page_size <= 100:
+            raise UserError("발표 표시 개수를 확인해주세요.")
+        if type(through) is not date:
+            raise UserError("조회 날짜를 확인해주세요.")
+        term = archive_search_term(q)
+        document_conditions = ["d.guild_id=s.guild_id", "d.session_id=s.id"]
+        document_parameters: list = []
+        if visible_channel_ids is not None:
+            if not visible_channel_ids:
+                return [], 0
+            document_conditions.append(
+                "d.source_channel_id IN (" + ",".join("?" for _ in visible_channel_ids) + ")"
+            )
+            document_parameters.extend(visible_channel_ids)
+        document_where = " AND ".join(document_conditions)
+        matching_where = document_where
+        matching_parameters = list(document_parameters)
+        if term:
+            match_conditions = ["instr(d.search_text, ?)>0"]
+            matching_parameters.append(term)
+            if presenter_ids:
+                match_conditions.append(
+                    "s.presenter_id IN (" + ",".join("?" for _ in presenter_ids) + ")"
+                )
+                matching_parameters.extend(presenter_ids)
+            matching_where += " AND (" + " OR ".join(match_conditions) + ")"
+        where = (
+            "s.guild_id=? AND s.seminar_date<=? AND EXISTS ("
+            "SELECT 1 FROM documents d WHERE " + matching_where + ")"
+        )
+        parameters = [guild_id, through.isoformat(), *matching_parameters]
+        total = self.db.execute(
+            "SELECT COUNT(*) FROM sessions s WHERE " + where, parameters
+        ).fetchone()[0]
+        rows = self.db.execute(
+            "SELECT s.* FROM sessions s WHERE "
+            + where
+            + " ORDER BY s.seminar_date DESC,s.id DESC LIMIT ? OFFSET ?",
+            (*parameters, page_size, (page - 1) * page_size),
+        ).fetchall()
+        if not rows:
+            return [], total
+        session_ids = [row["id"] for row in rows]
+        documents = self.db.execute(
+            "SELECT d.*,s.seminar_date,s.presenter_id FROM documents d "
+            "JOIN sessions s ON s.id=d.session_id WHERE "
+            + document_where
+            + " AND s.guild_id=? AND s.id IN ("
+            + ",".join("?" for _ in session_ids)
+            + ") ORDER BY d.uploaded_at DESC,d.id DESC",
+            (*document_parameters, guild_id, *session_ids),
+        ).fetchall()
+        by_session: dict[int, list[dict]] = {session_id: [] for session_id in session_ids}
+        for document in documents:
+            by_session[document["session_id"]].append(dict(document))
+        return [{"session": dict(row), "documents": by_session[row["id"]]} for row in rows], total
 
     def rename_document(
         self, guild_id: int, record_id: int, title: str, user_id: int, manager: bool
