@@ -9,6 +9,8 @@ description = "Discord lab seminar rotation, reminders, and automatic paper arch
 requires-python = ">=3.12"
 dependencies = [
   "discord.py>=2.6,<3",
+  "aiohttp>=3.12,<4",
+  "PyJWT[crypto]>=2.10,<3",
   "pypdf>=6,<7",
   "python-dotenv>=1,<2",
   "tzdata>=2025.1",

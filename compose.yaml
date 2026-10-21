@@ -1,6 +1,8 @@
 services:
   seminar-bot:
-    build: .
+    build:
+      context: .
+      target: bot
     restart: unless-stopped
     init: true
     env_file:
@@ -8,10 +10,54 @@ services:
     environment:
       DATA_DIR: /app/data
       ROTATION_FILE: /app/config/rotation.json
+      SEMINAR_API_HOST: 0.0.0.0
+      DOCUMENT_PARSER_URL: http://document-parser:8081
     volumes:
       - seminar-data:/app/data
       - ./config:/app/config:ro
     stop_grace_period: 20s
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=67108864,mode=1777
+    depends_on:
+      - document-parser
+    networks:
+      - default
+      - parser
+
+  document-parser:
+    build:
+      context: .
+      target: parser
+    restart: unless-stopped
+    init: true
+    command: [python, -m, seminar_bot.parser_service]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=100663296,mode=1777
+    mem_limit: 768m
+    pids_limit: 64
+    cpus: 1.0
+    networks:
+      - parser
+
+  cloudflared:
+    image: cloudflare/cloudflared:2026.10.2
+    profiles: [web]
+    restart: unless-stopped
+    command: [tunnel, --no-autoupdate, run]
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    depends_on:
+      - seminar-bot
 
 volumes:
   seminar-data:
+
+networks:
+  parser:
+    internal: true

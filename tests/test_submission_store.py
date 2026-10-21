@@ -88,6 +88,22 @@ class SubmissionStoreTests(unittest.TestCase):
         with self.assertRaises(UserError):
             self.add(3, "paper", "not-a-paper.ppt")
 
+    def test_explicit_paper_classification_clears_body_and_archive_reference(self):
+        record_id = self.add(1, "slides", "slides.pdf", doi="10.1000/paper")
+        before = self.store.document(1, record_id)
+        self.assertTrue(before["file_path"])
+        self.assertEqual(before["extracted_text"], "text")
+        paper = self.store.classify(1, record_id, "paper", 101, False)
+        self.assertEqual(
+            (paper["kind"], paper["file_path"], paper["extracted_text"]), ("paper", "", "")
+        )
+        self.assertEqual(
+            (paper["title"], paper["doi"], paper["sha256"]),
+            (before["title"], before["doi"], before["sha256"]),
+        )
+        restored = self.store.classify(1, record_id, "slides", 101, False)
+        self.assertEqual((restored["file_path"], restored["extracted_text"]), ("", ""))
+
     def test_duplicate_slide_bytes_cannot_fill_a_paper_slot(self):
         self.add(1, "slides", "slides.pdf", sha="same")
         self.add(2, "paper", "paper.pdf", sha="same")
@@ -141,7 +157,7 @@ class SubmissionStoreTests(unittest.TestCase):
         self.assertEqual(self.store.document(1, paper_id)["file_path"], old_file)
         self.assertEqual(self.store.document(1, paper_id)["session_id"], self.session["id"])
         self.assertTrue(self.store.was_sent(self.session["id"], DAY.isoformat(), "morning"))
-        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 3)
+        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 4)
         # Opening the migrated database again must preserve manual corrections.
         self.store.classify(1, paper_id, "slides", 101, False)
         self.store.close()

@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
+import shutil
+import tempfile
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -10,11 +14,14 @@ from discord import app_commands
 from discord.ext import tasks
 
 from .archive import extract_saved
+from .documents import MAX_FILE_BYTES, DocumentInfo
+from .remote_parser import extract_remote
 from .rotation import apply_rotation, read_rotations
 from .scheduling import due_reminders
 from .settings import Settings
 from .store import Store, UserError, local_now, parse_date
 from .submissions import classify_document, submission_summary
+from .web_api import SeminarAPI
 
 log = logging.getLogger(__name__)
 WEEKDAYS = ["월요일", "화요일", "수요일", "목요일", "금요일", "토요일", "일요일"]
@@ -58,7 +65,7 @@ class DocumentKindButton(
                 raise UserError("서버 채널에서 사용해주세요.")
             await interaction.response.defer(ephemeral=True)
             async with bot.schedule_lock:
-                record = bot.store.classify(
+                record = await bot.classify_document_record(
                     interaction.guild_id,
                     self.record_id,
                     self.kind,
@@ -81,6 +88,7 @@ class DocumentKindButton(
                         "Could not refresh classification message for record %s", self.record_id
                     )
             text = f"#{self.record_id} 자료를 **{KIND_LABELS[self.kind]}**로 구분했습니다."
+            text += classification_retention_notice(record)
             if status:
                 text += "\n" + submission_summary(status)
             await interaction.followup.send(text, ephemeral=True)
@@ -95,6 +103,19 @@ def classification_view(record: dict) -> discord.ui.View:
             continue
         view.add_item(DocumentKindButton(record["id"], kind, selected=record["kind"] == kind))
     return view
+
+
+def classification_retention_notice(record: dict) -> str:
+    if record["kind"] == "paper":
+        return (
+            "\n논문 제목·DOI 등 정보만 보관하고 이 기록의 PDF 원본과 본문은 제거했습니다. "
+            "발표 자료로 다시 바꿔도 원본은 복구되지 않습니다."
+        )
+    if record["kind"] == "slides" and not record["file_path"]:
+        return (
+            "\n이 기록에는 보관된 원본이 없습니다. 발표 자료 원본을 보관하려면 다시 업로드해주세요."
+        )
+    return ""
 
 
 def add_submission_fields(embed: discord.Embed, record: dict, status: dict | None) -> None:
@@ -136,6 +157,7 @@ class SeminarBot(discord.Client):
         self.schedule_lock = asyncio.Lock()
         self.upload_slots = asyncio.Semaphore(2)
         self.rotation_errors: dict[int | None, str] = {}
+        self.api_runner = None
         self._register_commands()
         self.tree.error(self.on_command_error)
         self.add_dynamic_items(DocumentKindButton)
@@ -148,6 +170,21 @@ class SeminarBot(discord.Client):
         else:
             synced = await self.tree.sync()
         log.info("Registered %s commands", len(synced))
+        if self.settings.api_token:
+            from aiohttp import web
+
+            self.api_runner = web.AppRunner(
+                SeminarAPI(self).app, access_log=None, shutdown_timeout=20
+            )
+            await self.api_runner.setup()
+            try:
+                site = web.TCPSite(self.api_runner, self.settings.api_host, self.settings.api_port)
+                await site.start()
+            except Exception:
+                await self.api_runner.cleanup()
+                self.api_runner = None
+                raise
+            log.info("Seminar web API listening on port %s", self.settings.api_port)
         self.reminders.start()
 
     async def on_ready(self) -> None:
@@ -158,6 +195,9 @@ class SeminarBot(discord.Client):
         reminder_task = self.reminders.get_task()
         if reminder_task:
             await asyncio.gather(reminder_task, return_exceptions=True)
+        if self.api_runner:
+            await self.api_runner.cleanup()
+            self.api_runner = None
         await super().close()
         self.store.close()
 
@@ -189,9 +229,20 @@ class SeminarBot(discord.Client):
                             text = f"☀️ 오늘({session['seminar_date']}) 세미나 발표자는 {mention}입니다. 발표 준비 부탁드려요!"
                         else:
                             status = self.store.submission(config["guild_id"], session["id"])
+                            destination = (
+                                self.settings.submission_url(session["id"])
+                                if self.settings.api_token
+                                and config["guild_id"] == self.settings.api_guild_id
+                                else ""
+                            )
                             text = (
-                                f"🌙 {mention} 오늘 발표에 사용한 자료를 <#{config['upload_channel_id']}>에 공유해주세요.\n"
-                                "발표 자료 **PDF/PPT/PPTX 1개 이상** + 참고한 **서로 다른 논문 PDF 3개 이상**이 필요합니다.\n"
+                                f"🌙 {mention} 오늘 발표에 사용한 자료를 "
+                                + (
+                                    f"아래 제출 페이지에 올려주세요.\n{destination}\n"
+                                    if destination
+                                    else f"<#{config['upload_channel_id']}>에 공유해주세요.\n"
+                                )
+                                + "발표 자료 **PDF/PPT/PPTX 1개 이상** + 참고한 **서로 다른 논문 PDF 3개 이상**이 필요합니다.\n"
                                 "한 번에 올리거나 나누어 올려도 회차별로 누적합니다.\n"
                                 + submission_summary(status)
                             )
@@ -210,6 +261,87 @@ class SeminarBot(discord.Client):
                 log.exception(
                     "Reminder failed for guild %s; will retry next tick", config["guild_id"]
                 )
+
+    async def notify_web_submission(self, session: dict, status: dict) -> int:
+        config = self.store.require_config(session["guild_id"])
+        channel = self.get_channel(config["upload_channel_id"])
+        if channel is None:
+            channel = await self.fetch_channel(config["upload_channel_id"])
+        if not isinstance(channel, discord.TextChannel) or channel.guild.id != session["guild_id"]:
+            raise UserError("자료 알림 채널을 확인해주세요.")
+        message = await channel.send(
+            f"📚 {session['seminar_date']} · <@{session['presenter_id']}> 발표 자료가 웹으로 제출되었습니다.\n"
+            + submission_summary(status)
+            + "\n"
+            + self.settings.submission_url(session["id"]),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return message.id
+
+    async def extract_document(self, path: Path, filename: str, data: bytes):
+        if len(data) > MAX_FILE_BYTES:
+            return DocumentInfo(
+                Path(filename.replace("\\", "/")).stem[:500] or "이름 없는 문서",
+                "",
+                None,
+                None,
+                hashlib.sha256(data).hexdigest(),
+                "filename",
+                "문서 분석 용량 제한을 넘어 파일명으로 기록했습니다.",
+            )
+        if self.settings.parser_url:
+            return await extract_remote(path, filename, data, self.settings.parser_url)
+        return await extract_saved(path, filename, data)
+
+    def source_url(self, record: dict) -> str:
+        if record.get("source_type") == "web" and record.get("session_id"):
+            return self.settings.submission_url(record["session_id"]) or record["message_url"]
+        return record["message_url"]
+
+    async def prepare_discord_document(self, message, attachment, data: bytes):
+        # Unclassified PDFs and papers never enter the permanent archive. In
+        # Compose this directory is memory-backed tmpfs, separate from NAS data.
+        suffix = Path(attachment.filename).suffix.casefold()
+        with tempfile.TemporaryDirectory(prefix="seminar-discord-") as temporary:
+            path = Path(temporary) / f"document{suffix}"
+            await asyncio.to_thread(path.write_bytes, data)
+            info = await self.extract_document(path, attachment.filename, data)
+            classification = classify_document(
+                attachment.filename, info, getattr(message, "content", "")
+            )
+            relative_path = ""
+            if classification.kind == "slides":
+                directory = self.settings.data_dir / "files" / str(message.guild.id)
+                directory.mkdir(parents=True, exist_ok=True)
+                target = directory / f"{attachment.id}{suffix}"
+                await asyncio.to_thread(shutil.copyfile, path, target)
+                relative_path = str(target.relative_to(self.settings.data_dir))
+            else:
+                info = replace(info, text="")
+            return info, classification, relative_path
+
+    async def classify_document_record(
+        self, guild_id: int, record_id: int, kind: str, user_id: int, manager: bool
+    ) -> dict:
+        """Called under schedule_lock; delete an explicitly reclassified paper first."""
+        record = self.store.document(guild_id, record_id)
+        self.store._can_edit(record, user_id, manager)
+        self.store._validate_kind(kind, record["filename"])
+        if kind == "paper" and record["file_path"]:
+            path = self.settings.data_dir / record["file_path"]
+            archive_root = (self.settings.data_dir / "files").resolve()
+            if not path.resolve().is_relative_to(archive_root):
+                raise UserError("보관 파일 경로를 확인할 수 없어 구분을 바꾸지 않았습니다.")
+            if not self.store.other_documents_use_file(record_id, record["file_path"]):
+                try:
+                    # Unlink the original directory entry, rather than the resolved
+                    # target, so a symlink cannot remove another archive's target.
+                    await asyncio.to_thread(path.unlink, missing_ok=True)
+                except OSError:
+                    raise UserError(
+                        "PDF 원본을 삭제하지 못해 구분을 바꾸지 않았습니다. 저장 공간 권한을 확인해주세요."
+                    ) from None
+        return self.store.classify(guild_id, record_id, kind, user_id, manager)
 
     async def reload_rotation_file(self) -> None:
         try:
@@ -305,13 +437,8 @@ class SeminarBot(discord.Client):
         data = await attachment.read()
         if len(data) > limit:
             raise UserError("파일 크기 제한을 초과했습니다.")
-        directory = self.settings.data_dir / "files" / str(guild_id)
-        directory.mkdir(parents=True, exist_ok=True)
-        path = directory / f"{attachment.id}{Path(attachment.filename).suffix.casefold()}"
-        await asyncio.to_thread(path.write_bytes, data)
-        info = await extract_saved(path, attachment.filename, data)
-        classification = classify_document(
-            attachment.filename, info, getattr(message, "content", "")
+        info, classification, file_path = await self.prepare_discord_document(
+            message, attachment, data
         )
         # Replayed events can run concurrently while the worker is parsing.
         if self.store.has_attachment(guild_id, attachment.id):
@@ -325,7 +452,7 @@ class SeminarBot(discord.Client):
                 message.author.id,
                 info,
                 attachment.filename,
-                str(path.relative_to(self.settings.data_dir)),
+                file_path,
                 message.jump_url,
                 message.created_at,
                 source_channel_id=message.channel.id,
@@ -357,7 +484,10 @@ class SeminarBot(discord.Client):
             previous = []
             for old in duplicates:
                 when = old["seminar_date"] or "발표 회차 미연결"
-                previous.append(f"#{old['id']} · {when} · [기존 업로드]({old['message_url']})")
+                current_record = self.store.document(guild_id, old["id"])
+                previous.append(
+                    f"#{old['id']} · {when} · [기존 업로드]({self.source_url(current_record)})"
+                )
             embed.add_field(
                 name="같은 논문 또는 파일로 보이는 기존 기록",
                 value="\n".join(previous),
@@ -578,7 +708,8 @@ class SeminarBot(discord.Client):
                     linked = f"{status}: {row['seminar_date']} · <@{row['presenter_id']}>"
                 else:
                     linked = "발표 회차 미연결"
-                value = f"구분: {KIND_LABELS[row['kind']]}\n{linked}\n파일: {safe(row['filename'], 160)}\n[원본 업로드]({row['message_url']}) · 업로더 <@{row['uploader_id']}>"
+                author = "회차 발표자" if row.get("source_type") == "web" else "업로더"
+                value = f"구분: {KIND_LABELS[row['kind']]}\n{linked}\n파일: {safe(row['filename'], 160)}\n[원본 업로드]({self.source_url(row)}) · {author} <@{row['uploader_id']}>"
                 if row["doi"]:
                     value += f"\nDOI: {safe(row['doi'], 255)}"
                 if row["arxiv_id"]:
@@ -634,7 +765,7 @@ class SeminarBot(discord.Client):
         )
         async def classify(interaction: discord.Interaction, record_id: int, kind: str) -> None:
             async with self.schedule_lock:
-                record = self.store.classify(
+                record = await self.classify_document_record(
                     interaction.guild_id,
                     record_id,
                     kind,
@@ -647,6 +778,7 @@ class SeminarBot(discord.Client):
                     else None
                 )
             text = f"#{record_id} 자료를 **{KIND_LABELS[kind]}**로 구분했습니다."
+            text += classification_retention_notice(record)
             if status:
                 text += "\n" + submission_summary(status)
             await interaction.response.send_message(text, ephemeral=True)
@@ -687,7 +819,7 @@ class SeminarBot(discord.Client):
             for record in rows[:15]:
                 embed.add_field(
                     name=f"#{record['id']} · {KIND_LABELS[record['kind']]}",
-                    value=f"{safe(record['title'], 160)} · [업로드]({record['message_url']})",
+                    value=f"{safe(record['title'], 160)} · [업로드]({self.source_url(record)})",
                     inline=False,
                 )
             embed.set_footer(

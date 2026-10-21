@@ -55,6 +55,14 @@ def check_index() -> list[str]:
                 b"DATA_DIR": b"./data",
                 b"MAX_FILE_MB": b"20",
                 b"LOG_LEVEL": b"INFO",
+                b"SEMINAR_API_TOKEN": b"",
+                b"SEMINAR_GUILD_ID": b"",
+                b"SEMINAR_PAGE_URL": b"",
+                b"SEMINAR_API_TRANSPORT": b"access",
+                b"SEMINAR_RELAY_TOKEN": b"",
+                b"CLOUDFLARE_ACCESS_TEAM_DOMAIN": b"",
+                b"CLOUDFLARE_ACCESS_AUD": b"",
+                b"CLOUDFLARE_TUNNEL_TOKEN": b"",
             }
             settings = [
                 line.strip()

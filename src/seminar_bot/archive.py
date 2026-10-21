@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -24,6 +25,11 @@ async def extract_saved(
         filename,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
+        env={
+            key: value
+            for key, value in os.environ.items()
+            if key in {"PATH", "LANG", "LC_ALL", "SYSTEMROOT"}
+        },
     )
     try:
         stdout, _ = await asyncio.wait_for(process.communicate(), timeout=timeout)

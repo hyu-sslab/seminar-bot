@@ -1,4 +1,4 @@
-FROM python:3.13-slim-bookworm
+FROM python:3.13-slim-bookworm AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -17,6 +17,11 @@ RUN python -m pip install --no-cache-dir . \
     && chown bot:bot /app/data
 
 USER bot
+
+FROM runtime AS parser
+CMD ["python", "-m", "seminar_bot.parser_service"]
+
+FROM runtime AS bot
 VOLUME ["/app/data"]
 
 CMD ["python", "-m", "seminar_bot"]

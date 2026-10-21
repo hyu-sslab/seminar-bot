@@ -23,6 +23,7 @@ class Rotation:
     guild_id: int
     presenters: tuple[int, ...]
     start_date: date | None
+    names: tuple[str, ...] = ()
 
     @property
     def fingerprint(self) -> str:
@@ -104,7 +105,9 @@ def read_rotations(path: Path) -> list[Rotation]:
             ids.append(snowflake(member["user_id"]))
         if len(set(ids)) != len(ids):
             raise UserError("같은 발표자가 중복되었습니다.")
-        rotations.append(Rotation(guild_id, tuple(ids), start))
+        rotations.append(
+            Rotation(guild_id, tuple(ids), start, tuple(m.get("name", "") for m in members))
+        )
     return rotations
 
 

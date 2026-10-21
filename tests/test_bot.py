@@ -19,6 +19,8 @@ from seminar_bot.archive import extract_saved
 from seminar_bot.bot import DocumentKindButton, SeminarBot, safe
 from seminar_bot.documents import DocumentInfo
 from seminar_bot.settings import Settings
+from seminar_bot.store import UserError
+from seminar_bot.web_api import APIError, SeminarAPI
 
 DAY = date(2026, 10, 15)
 NOW = datetime(2026, 10, 15, 0, tzinfo=UTC)
@@ -144,7 +146,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         )
         return message, attachment
 
-    async def test_real_upload_worker_archive_and_search(self):
+    async def test_real_pdf_worker_keeps_metadata_and_search_without_original(self):
         message, attachment = self.message()
         await self.bot.on_message(message)
         attachment.read.assert_awaited_once()
@@ -152,9 +154,120 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(count, 1)
         record = rows[0]
         self.assertEqual(record["seminar_date"], DAY.isoformat())
-        self.assertEqual((Path(self.temp.name) / record["file_path"]).read_bytes(), pdf_bytes())
+        self.assertEqual(record["file_path"], "")
+        self.assertEqual(record["extracted_text"], "")
+        self.assertFalse(list(Path(self.temp.name).glob("files/**/*.*")))
         self.assertEqual(record["source_channel_id"], 1002)
         self.assertEqual(message.reply.await_args.kwargs["embed"].title, "📚 자료를 기록했어요")
+
+    async def test_explicit_presentation_pdf_keeps_original(self):
+        message, _ = self.message(filename="seminar_slides.pdf")
+        await self.bot.on_message(message)
+        record = self.bot.store.search(1, "한글연구논문")[0][0]
+        self.assertEqual(record["kind"], "slides")
+        self.assertTrue(record["file_path"])
+        self.assertEqual((Path(self.temp.name) / record["file_path"]).read_bytes(), pdf_bytes())
+
+    async def retained_slides_fixture(self):
+        message, _ = self.message(filename="seminar_slides.pdf")
+        info = DocumentInfo(
+            "Research Slides Reclassified As A Paper",
+            "Sensitive extracted paper body",
+            "10.1000/reference",
+            None,
+            "classification-fixture-sha",
+            "pdf_text",
+        )
+        with patch.object(self.bot, "extract_document", AsyncMock(return_value=info)):
+            await self.bot.on_message(message)
+        record = self.bot.store.search(1, "Research Slides")[0][0]
+        return record, Path(self.temp.name) / record["file_path"]
+
+    async def test_reclassification_command_deletes_paper_original_and_body_and_blocks_download(
+        self,
+    ):
+        record, path = await self.retained_slides_fixture()
+        self.assertTrue(path.is_file())
+        interaction = SimpleNamespace(
+            guild_id=1,
+            user=SimpleNamespace(id=101),
+            response=SimpleNamespace(send_message=AsyncMock()),
+        )
+        command = self.bot.tree.get_command("자료분류")
+        await command.callback(interaction, record["id"], "paper")
+        paper = self.bot.store.document(1, record["id"])
+        self.assertEqual(
+            (paper["kind"], paper["file_path"], paper["extracted_text"]), ("paper", "", "")
+        )
+        self.assertEqual(paper["doi"], "10.1000/reference")
+        self.assertFalse(path.exists())
+        self.assertIn(
+            "원본은 복구되지 않습니다", interaction.response.send_message.await_args.args[0]
+        )
+        api = object.__new__(SeminarAPI)
+        api.bot, api.guild_id, api.settings = self.bot, 1, self.bot.settings
+        self.assertFalse(api.document_data(paper, {})["file_available"])
+        with self.assertRaises(APIError) as denied:
+            await api.download(SimpleNamespace(match_info={"document_id": str(record["id"])}))
+        self.assertEqual(denied.exception.status, 404)
+        await command.callback(interaction, record["id"], "slides")
+        restored = self.bot.store.document(1, record["id"])
+        self.assertEqual((restored["file_path"], restored["extracted_text"]), ("", ""))
+        self.assertIn("다시 업로드", interaction.response.send_message.await_args.args[0])
+
+    async def test_reclassification_keeps_an_original_referenced_by_another_document(self):
+        record, path = await self.retained_slides_fixture()
+        other_id, _ = self.bot.store.add_document(
+            1,
+            501,
+            101,
+            DocumentInfo(
+                "Shared Slides", "Other slides body", None, None, "shared-sha", "pdf_text"
+            ),
+            "shared-slides.pdf",
+            record["file_path"],
+            "https://discord.com/channels/1/1002/501",
+            NOW,
+            kind="slides",
+        )
+        async with self.bot.schedule_lock:
+            paper = await self.bot.classify_document_record(1, record["id"], "paper", 101, False)
+        self.assertEqual((paper["file_path"], paper["extracted_text"]), ("", ""))
+        self.assertTrue(path.is_file())
+        other = self.bot.store.document(1, other_id)
+        self.assertEqual(
+            (other["kind"], other["file_path"], other["extracted_text"]),
+            ("slides", record["file_path"], "Other slides body"),
+        )
+
+    async def test_failed_or_unauthorized_original_deletion_preserves_the_existing_record(self):
+        record, path = await self.retained_slides_fixture()
+        async with self.bot.schedule_lock:
+            with self.assertRaises(UserError):
+                await self.bot.classify_document_record(1, record["id"], "paper", 999, False)
+            self.assertTrue(path.is_file())
+            with patch.object(Path, "unlink", side_effect=PermissionError("fixture denial")):
+                with self.assertRaises(UserError):
+                    await self.bot.classify_document_record(1, record["id"], "paper", 101, False)
+        current = self.bot.store.document(1, record["id"])
+        self.assertEqual(
+            (current["kind"], current["file_path"], current["extracted_text"]),
+            (record["kind"], record["file_path"], record["extracted_text"]),
+        )
+        self.assertTrue(path.is_file())
+
+    async def test_document_over_parser_limit_uses_metadata_without_network(self):
+        self.bot.settings = Settings(
+            "test-token-not-used", Path(self.temp.name), parser_url="http://document-parser:8081"
+        )
+        with (
+            patch("seminar_bot.bot.MAX_FILE_BYTES", 3),
+            patch("seminar_bot.bot.extract_remote") as remote,
+        ):
+            result = await self.bot.extract_document(Path("unused"), "large.pdf", b"%PDF-long")
+        remote.assert_not_called()
+        self.assertEqual(result.extraction_method, "filename")
+        self.assertEqual(result.text, "")
 
     async def test_corrupt_upload_is_still_indexed_by_filename(self):
         message, _ = self.message(b"not a real PDF", "broken_research.pdf")

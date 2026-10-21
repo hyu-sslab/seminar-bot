@@ -50,7 +50,7 @@ class Store:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.execute("PRAGMA busy_timeout=5000")
-        if self.db.execute("PRAGMA user_version").fetchone()[0] > 3:
+        if self.db.execute("PRAGMA user_version").fetchone()[0] > 4:
             self.db.close()
             raise ValueError("데이터베이스 버전이 봇보다 새롭습니다. 봇을 업데이트해주세요.")
         self.db.executescript("""
@@ -116,6 +116,11 @@ class Store:
                 guild_id INTEGER PRIMARY KEY REFERENCES guilds(guild_id),
                 fingerprint TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS web_submission_receipts (
+                session_id INTEGER PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+                fingerprint TEXT NOT NULL,
+                message_id INTEGER NOT NULL
+            );
         """)
         columns = {row["name"] for row in self.db.execute("PRAGMA table_info(documents)")}
         with self.db:
@@ -143,7 +148,16 @@ class Store:
                         "UPDATE documents SET kind=?, classification_reason=? WHERE id=?",
                         (classification.kind, classification.reason, record["id"]),
                     )
-            self.db.execute("PRAGMA user_version=3")
+            if "source_type" not in columns:
+                self.db.execute(
+                    "ALTER TABLE documents ADD COLUMN source_type TEXT NOT NULL DEFAULT 'discord'"
+                )
+                self.db.execute("ALTER TABLE documents ADD COLUMN upload_key TEXT")
+            self.db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS web_upload_key ON documents(guild_id, upload_key) "
+                "WHERE upload_key IS NOT NULL"
+            )
+            self.db.execute("PRAGMA user_version=4")
 
     def close(self) -> None:
         self.db.close()
@@ -495,13 +509,26 @@ class Store:
         source_channel_id: int | None = None,
         kind: str = "unknown",
         classification_reason: str = "",
+        *,
+        session_id: int | None = None,
+        source_type: str = "discord",
+        upload_key: str | None = None,
     ) -> tuple[int, list[dict]]:
         config = self.require_config(guild_id)
         self._validate_kind(kind, filename)
         source_channel_id = source_channel_id or config["upload_channel_id"]
         uploaded_date = local_now(config, uploaded_at).date()
-        self.ensure_horizon(guild_id, uploaded_date)
-        session_id = self.guess_session(guild_id, uploader_id, uploaded_date)
+        if source_type not in {"discord", "web"}:
+            raise UserError("자료 출처를 확인해주세요.")
+        if source_type == "web":
+            if session_id is None or not upload_key:
+                raise UserError("웹 제출에는 발표 회차와 업로드 ID가 필요합니다.")
+            session = self.session(guild_id, session_id)
+            if session["presenter_id"] != uploader_id:
+                raise UserError("발표자가 바뀌었습니다. 발표 회차를 다시 선택해주세요.")
+        else:
+            self.ensure_horizon(guild_id, uploaded_date)
+            session_id = self.guess_session(guild_id, uploader_id, uploaded_date)
         title = info.title[:500]
         normalized = normalize_search(title)
         duplicates = [
@@ -533,8 +560,9 @@ class Store:
                 """
                 INSERT INTO documents(guild_id, attachment_id, uploader_id, source_channel_id, session_id,
                     title, filename, doi, arxiv_id, sha256, search_text, extracted_text,
-                    extraction_method, warning, file_path, message_url, uploaded_at, kind, classification_reason)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    extraction_method, warning, file_path, message_url, uploaded_at, kind, classification_reason,
+                    source_type, upload_key)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
                 (
                     guild_id,
@@ -548,7 +576,10 @@ class Store:
                     info.arxiv_id,
                     info.sha256,
                     self._search_text(title, filename, info.doi, info.arxiv_id),
-                    info.text,
+                    ""
+                    if kind == "paper"
+                    or (kind == "unknown" and filename.casefold().endswith(".pdf"))
+                    else info.text,
                     info.extraction_method,
                     info.warning,
                     file_path,
@@ -556,9 +587,31 @@ class Store:
                     uploaded_at.isoformat(),
                     kind,
                     classification_reason,
+                    source_type,
+                    upload_key,
                 ),
             )
         return cursor.lastrowid, duplicates
+
+    def web_upload(self, guild_id: int, upload_key: str) -> dict | None:
+        row = self.db.execute(
+            "SELECT id FROM documents WHERE guild_id=? AND upload_key=?", (guild_id, upload_key)
+        ).fetchone()
+        return self.document(guild_id, row["id"]) if row else None
+
+    def submission_receipt(self, session_id: int) -> str | None:
+        row = self.db.execute(
+            "SELECT fingerprint FROM web_submission_receipts WHERE session_id=?", (session_id,)
+        ).fetchone()
+        return row["fingerprint"] if row else None
+
+    def mark_submission_receipt(self, session_id: int, fingerprint: str, message_id: int) -> None:
+        with self.db:
+            self.db.execute(
+                "INSERT INTO web_submission_receipts VALUES(?,?,?) ON CONFLICT(session_id) DO UPDATE SET "
+                "fingerprint=excluded.fingerprint, message_id=excluded.message_id",
+                (session_id, fingerprint, message_id),
+            )
 
     def document(self, guild_id: int, record_id: int) -> dict:
         row = self.db.execute(
@@ -686,10 +739,22 @@ class Store:
         self._validate_kind(kind, record["filename"])
         with self.db:
             self.db.execute(
-                "UPDATE documents SET kind=?, classification_reason='사용자가 확인한 구분' WHERE guild_id=? AND id=?",
-                (kind, guild_id, record_id),
+                "UPDATE documents SET kind=?, classification_reason='사용자가 확인한 구분', "
+                "file_path=CASE WHEN ?='paper' THEN '' ELSE file_path END, "
+                "extracted_text=CASE WHEN ?='paper' THEN '' ELSE extracted_text END "
+                "WHERE guild_id=? AND id=?",
+                (kind, kind, kind, guild_id, record_id),
             )
         return self.document(guild_id, record_id)
+
+    def other_documents_use_file(self, record_id: int, file_path: str) -> bool:
+        return (
+            self.db.execute(
+                "SELECT 1 FROM documents WHERE file_path=? AND id<>? LIMIT 1",
+                (file_path, record_id),
+            ).fetchone()
+            is not None
+        )
 
     def submission(
         self, guild_id: int, session_id: int, visible_channel_ids: list[int] | None = None
