@@ -54,6 +54,7 @@ def check_index() -> list[str]:
                 b"DISCORD_GUILD_ID": b"",
                 b"DATA_DIR": b"./data",
                 b"MAX_FILE_MB": b"20",
+                b"DOCUMENT_PARSER_CPUS": b"1.0",
                 b"LOG_LEVEL": b"INFO",
                 b"SEMINAR_API_TOKEN": b"",
                 b"SEMINAR_GUILD_ID": b"",

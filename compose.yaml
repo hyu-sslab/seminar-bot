@@ -41,7 +41,7 @@ services:
       - /tmp:rw,noexec,nosuid,nodev,size=100663296,mode=1777
     mem_limit: 768m
     pids_limit: 64
-    cpus: 1.0
+    cpus: ${DOCUMENT_PARSER_CPUS:-1.0}
     networks:
       - parser
 
