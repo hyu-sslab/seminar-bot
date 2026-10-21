@@ -774,6 +774,65 @@ class Store:
         ).fetchall()
         return [dict(row) for row in rows], count
 
+    def archive(
+        self,
+        guild_id: int,
+        q: str = "",
+        kind: str | None = None,
+        page: int = 1,
+        page_size: int = 20,
+        visible_channel_ids: list[int] | None = None,
+    ) -> tuple[list[dict], int]:
+        """Read existing materials in seminar order without creating schedule rows."""
+        if type(page) is not int or not 1 <= page <= 100000:
+            raise UserError("페이지는 1~100000 사이로 입력해주세요.")
+        if type(page_size) is not int or not 1 <= page_size <= 100:
+            raise UserError("자료 표시 개수를 확인해주세요.")
+        if kind is not None and kind not in {"slides", "paper"}:
+            raise UserError("발표 자료 또는 논문을 선택해주세요.")
+        try:
+            valid_query = isinstance(q, str) and len(q) <= 200 and len(q.encode("utf-8")) <= 400
+        except UnicodeError:
+            valid_query = False
+        if not valid_query or any(ord(char) < 32 or ord(char) == 127 for char in q):
+            raise UserError("검색어는 200자, 400바이트 이내로 입력해주세요.")
+        raw = q.strip()
+        raw = re.sub(r"^(?:https?://(?:dx\.)?doi\.org/|doi\s*:\s*)", "", raw, flags=re.I)
+        raw = re.sub(r"^(?:https?://arxiv\.org/(?:abs|pdf)/|arxiv\s*:\s*)", "", raw, flags=re.I)
+        if re.fullmatch(r"(?:\d{4}\.\d{4,5}|[a-z][a-z.\-]+/\d{7})(?:v\d+)?(?:\.pdf)?", raw, re.I):
+            raw = re.sub(r"(?:v\d+)?(?:\.pdf)?$", "", raw, flags=re.I)
+        term = normalize_search(raw)
+        if q.strip() and (not term or len(term) > 200):
+            raise UserError("검색할 제목 또는 식별자를 입력해주세요.")
+        conditions = ["d.guild_id=?"]
+        parameters: list = [guild_id]
+        if visible_channel_ids is not None:
+            if not visible_channel_ids:
+                return [], 0
+            conditions.append(
+                "d.source_channel_id IN (" + ",".join("?" for _ in visible_channel_ids) + ")"
+            )
+            parameters.extend(visible_channel_ids)
+        if kind is not None:
+            conditions.append("d.kind=?")
+            parameters.append(kind)
+        if term:
+            conditions.append("instr(d.search_text, ?)>0")
+            parameters.append(term)
+        where = " AND ".join(conditions)
+        count = self.db.execute(
+            "SELECT COUNT(*) FROM documents d WHERE " + where, parameters
+        ).fetchone()[0]
+        rows = self.db.execute(
+            "SELECT d.*,s.seminar_date,s.presenter_id FROM documents d "
+            "LEFT JOIN sessions s ON s.id=d.session_id WHERE "
+            + where
+            + " ORDER BY COALESCE(s.seminar_date,substr(d.uploaded_at,1,10)) DESC,"
+            "d.uploaded_at DESC,d.id DESC LIMIT ? OFFSET ?",
+            (*parameters, page_size, (page - 1) * page_size),
+        ).fetchall()
+        return [dict(row) for row in rows], count
+
     def rename_document(
         self, guild_id: int, record_id: int, title: str, user_id: int, manager: bool
     ) -> None:

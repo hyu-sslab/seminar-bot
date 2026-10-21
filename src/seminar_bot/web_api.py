@@ -146,6 +146,7 @@ class SeminarAPI:
                     self.delete_document,
                 ),
                 web.get("/v1/search", self.search),
+                web.get("/v1/archive", self.archive),
                 web.get("/v1/documents/{document_id:[1-9][0-9]{0,18}}/file", self.download),
             ]
         )
@@ -352,6 +353,7 @@ class SeminarAPI:
                 "warning",
                 "session_id",
                 "seminar_date",
+                "uploaded_at",
                 "venue",
                 "year",
                 "link",
@@ -359,7 +361,17 @@ class SeminarAPI:
         }
         result["source"] = record.get("source_type", "discord")
         result["file_available"] = bool(record.get("file_path"))
-        result["presenter_name"] = names.get(record.get("presenter_id"), "")
+        owner_id = record.get("presenter_id")
+        presenter_name = ""
+        if owner_id is not None:
+            guild = self.bot.get_guild(self.guild_id)
+            member = guild.get_member(owner_id) if guild else None
+            presenter_name = (
+                names.get(owner_id)
+                or (member.display_name if member else None)
+                or f"발표자 {owner_id}"
+            )
+        result["presenter_name"] = presenter_name
         result["revision"] = document_version(record)
         result["editable"] = record.get("uploader_id") == presenter_id
         return result
@@ -838,6 +850,36 @@ class SeminarAPI:
                 "documents": [self.document_data(row, names) for row in rows],
                 "total": total,
                 "page": page,
+            }
+        )
+
+    async def archive(self, request):
+        for key in request.query:
+            if key not in {"kind", "q", "page"} or len(request.query.getall(key)) != 1:
+                raise APIError(400, "요청 매개변수를 확인해주세요.")
+        kind = request.query.get("kind", "all")
+        if kind not in {"all", "slides", "paper"}:
+            raise APIError(400, "발표 자료 또는 논문을 선택해주세요.")
+        raw_page = request.query.get("page", "1")
+        if not re.fullmatch(r"[1-9][0-9]{0,5}", raw_page) or int(raw_page) > 100000:
+            raise APIError(400, "조회 페이지를 확인해주세요.")
+        page = int(raw_page)
+        async with self.bot.schedule_lock:
+            rows, total = self.bot.store.archive(
+                self.guild_id,
+                request.query.get("q", ""),
+                kind=None if kind == "all" else kind,
+                page=page,
+                page_size=20,
+                visible_channel_ids=[self.config()["upload_channel_id"]],
+            )
+        names = await self.names()
+        return web.json_response(
+            {
+                "documents": [self.document_data(row, names) for row in rows],
+                "total": total,
+                "page": page,
+                "page_size": 20,
             }
         )
 

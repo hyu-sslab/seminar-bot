@@ -79,6 +79,8 @@ def validated_request(method: object, path: object, headers: object) -> tuple[di
         allowed_method, query_keys, maximum = "POST", set(), 4096
     elif parsed.path == "/v1/search":
         allowed_method, query_keys, maximum = "GET", {"q", "kind", "page"}, 0
+    elif parsed.path == "/v1/archive":
+        allowed_method, query_keys, maximum = "GET", {"q", "kind", "page"}, 0
     else:
         raise RelayProtocolError("Invalid request")
     if method != allowed_method or re.search(r"%(?![a-fA-F0-9]{2})", parsed.query):
@@ -107,6 +109,18 @@ def validated_request(method: object, path: object, headers: object) -> tuple[di
             or any(ord(char) < 32 or ord(char) == 127 for char in search)
             or query.get("kind", "paper") not in {"paper", "slides", "all", "unknown"}
             or not re.fullmatch(r"[1-9][0-9]{0,5}", query.get("page", "1"))
+        ):
+            raise RelayProtocolError("Invalid request")
+    if parsed.path == "/v1/archive":
+        search = query.get("q", "")
+        page = query.get("page", "1")
+        if (
+            len(search) > 200
+            or len(search.encode("utf-8")) > 400
+            or any(ord(char) < 32 or ord(char) == 127 for char in search)
+            or query.get("kind", "all") not in {"paper", "slides", "all"}
+            or not re.fullmatch(r"[1-9][0-9]{0,5}", page)
+            or int(page) > 100000
         ):
             raise RelayProtocolError("Invalid request")
     if not isinstance(headers, dict) or len(headers) > len(_REQUEST_HEADERS):

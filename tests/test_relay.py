@@ -35,6 +35,27 @@ class _Peer:
 
 
 class RelayValidationTests(unittest.TestCase):
+    def test_archive_feed_accepts_bounded_optional_search_and_read_only_filters(self):
+        for path in (
+            "/v1/archive",
+            "/v1/archive?q=",
+            "/v1/archive?kind=slides&page=2",
+            "/v1/archive?kind=paper&q=10.1234%2Fexample&page=100000",
+        ):
+            self.assertEqual(validated_request("GET", path, {})[1], 0)
+        for method, path in (
+            ("POST", "/v1/archive"),
+            ("GET", "/v1/archive?kind=unknown"),
+            ("GET", "/v1/archive?q=a&q=b"),
+            ("GET", "/v1/archive?page=100001"),
+            ("GET", "/v1/archive?page=01"),
+            ("GET", "/v1/archive?q=%00"),
+            ("GET", "/v1/archive?target=http://other-host"),
+            ("GET", "/v1/archive?q=" + "a" * 201),
+        ):
+            with self.subTest(method=method, path=path), self.assertRaises(RelayProtocolError):
+                validated_request(method, path, {})
+
     def test_document_edits_are_limited_to_fixed_routes_and_bounded_bodies(self):
         for method, path, maximum in (
             ("POST", "/v1/sessions/1/papers", 8192),
