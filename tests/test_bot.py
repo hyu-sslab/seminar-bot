@@ -207,6 +207,213 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.bot.tree.get_command("순서설정"))
         self.assertEqual(len(self.bot.tree.get_commands()), 11)
 
+    async def help_response(self):
+        interaction = SimpleNamespace(
+            guild_id=1, response=SimpleNamespace(send_message=AsyncMock())
+        )
+        await self.bot.tree.get_command("도움말").callback(interaction)
+        interaction.response.send_message.assert_awaited_once()
+        return interaction.response.send_message.await_args
+
+    async def test_help_is_a_single_private_message_within_the_discord_content_limit(self):
+        response = await self.help_response()
+        self.assertTrue(response.kwargs["ephemeral"])
+        text = response.args[0]
+        self.assertIsInstance(text, str)
+        self.assertGreater(len(text), 0)
+        self.assertLessEqual(len(text), 2000)
+
+    async def test_help_explains_current_seminar_submission_and_archive_workflows(self):
+        response = await self.help_response()
+        text = response.args[0].replace("*", "").replace("`", "")
+        for feature in (
+            "/설정",
+            "세미나시간",
+            "아침",
+            "저녁",
+            "config/rotation.json",
+            "presenters",
+            "/일정",
+            "휴강",
+            "/제출",
+            "예정",
+            "수정",
+            "PDF/PPT/PPTX",
+            "1개 이상",
+            "서로 다른 논문 3편 이상",
+            "자동",
+            "NAS",
+            "세미나 자료 조회",
+            "다운로드",
+            "/검색",
+        ):
+            with self.subTest(feature=feature):
+                self.assertIn(feature, text)
+        self.assertRegex(text, r"서버\s*ID\s*(?:없|불필요|입력하지)")
+        self.assertRegex(text, r"(?:과거|지난)[^\n]{0,10}예정")
+        self.assertRegex(text, r"(?:수동|직접)\s*입력")
+        self.assertRegex(text, r"아침[^\n]*저녁[^\n]*별도")
+        schedule = next(line for line in text.splitlines() if line.startswith("/일정"))
+        self.assertIn("시작", schedule)
+        self.assertIn("휴강", schedule)
+        self.assertRegex(text, r"제목(?:만)?[^\n]{0,15}필수")
+        self.assertRegex(text, r"(?:나머지|학회|연도|DOI|링크)[^\n]{0,80}선택")
+        self.assertRegex(
+            text, r"논문[^\n]*(?:PDF|원본)[^\n]*(?:미보관|보관하지|저장하지|보관\s*안)"
+        )
+        self.assertNotIn("kind:전체", text)
+
+    def assert_latest_guild_commands(self, guild_id):
+        commands = self.bot.tree.get_commands(guild=discord.Object(id=guild_id))
+        self.assertEqual(len(commands), 11)
+        self.assertEqual(
+            {command.name for command in commands},
+            {command.name for command in self.bot.tree.get_commands()},
+        )
+        settings = next(command for command in commands if command.name == "설정")
+        self.assertIn(
+            "세미나시간", {option["name"] for option in settings.to_dict(self.bot.tree)["options"]}
+        )
+
+    async def test_command_sync_respects_explicit_guild_without_global_or_other_guild_requests(
+        self,
+    ):
+        self.bot.settings = replace(self.bot.settings, guild_id=9, api_guild_id=1)
+        settings = self.bot.settings
+
+        async def sync(*, guild=None):
+            self.assertEqual(guild.id, 9)
+            self.assert_latest_guild_commands(9)
+            return []
+
+        with (
+            patch.object(
+                self.bot.tree, "copy_global_to", wraps=self.bot.tree.copy_global_to
+            ) as copy,
+            patch.object(self.bot.tree, "sync", AsyncMock(side_effect=sync)) as synced,
+            patch.object(self.bot.tree, "fetch_commands", AsyncMock()) as fetched,
+        ):
+            await self.bot.sync_commands()
+        copy.assert_called_once()
+        self.assertEqual(copy.call_args.kwargs["guild"].id, 9)
+        synced.assert_awaited_once()
+        fetched.assert_not_awaited()
+        self.assertIs(self.bot.settings, settings)
+        self.assertEqual((settings.guild_id, settings.api_guild_id), (9, 1))
+        self.assertEqual(self.bot.tree.get_commands(guild=discord.Object(id=1)), [])
+
+    async def test_global_command_sync_refreshes_only_existing_guild_scopes_in_sorted_unique_targets(
+        self,
+    ):
+        self.bot.settings = replace(self.bot.settings, api_guild_id=2)
+        events = []
+
+        async def sync(*, guild=None):
+            events.append(("sync", guild.id if guild else None))
+            if guild:
+                self.assert_latest_guild_commands(guild.id)
+            return []
+
+        async def fetch(*, guild):
+            events.append(("fetch", guild.id))
+            return [] if guild.id == 1 else [SimpleNamespace(name="설정")]
+
+        with (
+            patch.object(
+                self.bot.store,
+                "all_configs",
+                return_value=[
+                    {"guild_id": 3},
+                    {"guild_id": 1},
+                    {"guild_id": 3},
+                ],
+            ),
+            patch.object(
+                self.bot.tree, "copy_global_to", wraps=self.bot.tree.copy_global_to
+            ) as copy,
+            patch.object(self.bot.tree, "sync", AsyncMock(side_effect=sync)),
+            patch.object(self.bot.tree, "fetch_commands", AsyncMock(side_effect=fetch)) as fetched,
+        ):
+            await self.bot.sync_commands()
+        self.assertEqual(
+            events,
+            [
+                ("sync", None),
+                ("fetch", 1),
+                ("fetch", 2),
+                ("sync", 2),
+                ("fetch", 3),
+                ("sync", 3),
+            ],
+        )
+        self.assertEqual(fetched.await_count, 3)
+        self.assertEqual([call.kwargs["guild"].id for call in copy.call_args_list], [2, 3])
+        self.assertEqual(self.bot.tree.get_commands(guild=discord.Object(id=1)), [])
+        self.assertEqual(self.bot.settings.api_guild_id, 2)
+
+    async def test_command_sync_continues_after_individual_guild_fetch_and_sync_http_errors(self):
+        for guild_id in (2, 3):
+            self.bot.store.configure(guild_id, 2001, 2002, 3, "09:00", "18:00", "Asia/Seoul", NOW)
+        events = []
+
+        def forbidden():
+            return discord.HTTPException(SimpleNamespace(status=403, reason="Forbidden"), "denied")
+
+        async def sync(*, guild=None):
+            events.append(("sync", guild.id if guild else None))
+            if guild and guild.id == 2:
+                raise forbidden()
+            if guild:
+                self.assert_latest_guild_commands(guild.id)
+            return []
+
+        async def fetch(*, guild):
+            events.append(("fetch", guild.id))
+            if guild.id == 1:
+                raise forbidden()
+            return [SimpleNamespace(name="old-command")]
+
+        with (
+            patch.object(
+                self.bot.tree, "copy_global_to", wraps=self.bot.tree.copy_global_to
+            ) as copy,
+            patch.object(self.bot.tree, "sync", AsyncMock(side_effect=sync)),
+            patch.object(self.bot.tree, "fetch_commands", AsyncMock(side_effect=fetch)),
+            self.assertLogs("seminar_bot.bot", level="WARNING") as logs,
+        ):
+            await self.bot.sync_commands()
+        self.assertEqual(
+            events,
+            [
+                ("sync", None),
+                ("fetch", 1),
+                ("fetch", 2),
+                ("sync", 2),
+                ("fetch", 3),
+                ("sync", 3),
+            ],
+        )
+        self.assertEqual([call.kwargs["guild"].id for call in copy.call_args_list], [2, 3])
+        self.assertEqual(len(logs.output), 2)
+        self.assert_latest_guild_commands(3)
+
+    async def test_global_command_sync_failure_propagates_without_touching_guild_scopes(self):
+        self.bot.settings = replace(self.bot.settings, api_guild_id=3)
+        failure = discord.HTTPException(SimpleNamespace(status=503, reason="Unavailable"), "retry")
+        with (
+            patch.object(
+                self.bot.tree, "copy_global_to", wraps=self.bot.tree.copy_global_to
+            ) as copy,
+            patch.object(self.bot.tree, "sync", AsyncMock(side_effect=failure)) as synced,
+            patch.object(self.bot.tree, "fetch_commands", AsyncMock()) as fetched,
+            self.assertRaises(discord.HTTPException) as raised,
+        ):
+            await self.bot.sync_commands()
+        self.assertIs(raised.exception, failure)
+        synced.assert_awaited_once_with()
+        copy.assert_not_called()
+        fetched.assert_not_awaited()
+
     async def test_schedule_acknowledges_before_json_member_validation(self):
         interaction = SimpleNamespace(
             guild_id=1,

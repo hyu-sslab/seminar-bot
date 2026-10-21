@@ -171,13 +171,7 @@ class SeminarBot(discord.Client):
         self.add_dynamic_items(DocumentKindButton)
 
     async def setup_hook(self) -> None:
-        if self.settings.guild_id:
-            guild = discord.Object(id=self.settings.guild_id)
-            self.tree.copy_global_to(guild=guild)
-            synced = await self.tree.sync(guild=guild)
-        else:
-            synced = await self.tree.sync()
-        log.info("Registered %s commands", len(synced))
+        await self.sync_commands()
         if self.settings.api_token:
             from aiohttp import web
 
@@ -199,6 +193,37 @@ class SeminarBot(discord.Client):
                 self.relay_client = RelayClient(self.settings)
                 self.relay_client.start()
         self.reminders.start()
+
+    async def sync_commands(self) -> None:
+        if self.settings.guild_id:
+            guild = discord.Object(id=self.settings.guild_id)
+            self.tree.copy_global_to(guild=guild)
+            synced = await self.tree.sync(guild=guild)
+            log.info("Registered %s guild commands for guild %s", len(synced), guild.id)
+            return
+
+        synced = await self.tree.sync()
+        log.info("Registered %s global commands", len(synced))
+        # Older guild registrations survive global sync; refresh existing ones
+        # only in servers already selected by configuration.
+        guild_ids = {config["guild_id"] for config in self.store.all_configs()}
+        if self.settings.api_guild_id:
+            guild_ids.add(self.settings.api_guild_id)
+        for guild_id in sorted(guild_ids):
+            guild = discord.Object(id=guild_id)
+            try:
+                existing = await self.tree.fetch_commands(guild=guild)
+                if not existing:
+                    log.info("No existing guild commands to update for guild %s", guild_id)
+                    continue
+                self.tree.copy_global_to(guild=guild)
+                synced = await self.tree.sync(guild=guild)
+            except discord.HTTPException as error:
+                log.warning(
+                    "Could not update existing guild commands for guild %s: %s", guild_id, error
+                )
+                continue
+            log.info("Registered %s guild commands for guild %s", len(synced), guild_id)
 
     async def on_ready(self) -> None:
         log.info("Connected as %s (%s)", self.user, self.user.id if self.user else "?")
@@ -631,7 +656,9 @@ class SeminarBot(discord.Client):
                 text += f"\n⚠️ 발표 순서 파일 적용 오류: {safe(error, 800)}\n현재 서버 ID: `{interaction.guild_id}`"
             await interaction.followup.send(text, ephemeral=True)
 
-        @tree.command(name="일정", description="다가오는 발표자와 휴강일을 확인합니다")
+        @tree.command(
+            name="일정", description="다가오는 발표자·세미나 시작 시간과 휴강일을 확인합니다"
+        )
         @app_commands.guild_only()
         async def schedule(
             interaction: discord.Interaction, weeks: app_commands.Range[int, 1, 20] = 8
@@ -718,7 +745,7 @@ class SeminarBot(discord.Client):
 
         @tree.command(
             name="검색",
-            description="업로드한 논문·발표 자료를 제목, 파일명, DOI, arXiv ID로 검색합니다",
+            description="등록된 논문·발표 자료를 제목, 학회, 연도, DOI 등으로 검색합니다",
         )
         @app_commands.guild_only()
         @app_commands.describe(
@@ -789,7 +816,7 @@ class SeminarBot(discord.Client):
             await interaction.response.send_message(embed=embed, ephemeral=True)
 
         @tree.command(
-            name="자료수정", description="자동 인식한 자료 제목을 수정합니다 (업로더 또는 관리자)"
+            name="자료수정", description="등록된 자료의 제목을 수정합니다 (업로더 또는 관리자)"
         )
         @app_commands.guild_only()
         async def rename(interaction: discord.Interaction, record_id: int, title: str) -> None:
@@ -852,7 +879,8 @@ class SeminarBot(discord.Client):
             await interaction.response.send_message(text, ephemeral=True)
 
         @tree.command(
-            name="제출", description="내 발표 자료를 바로 올릴 수 있는 임시 링크를 받습니다"
+            name="제출",
+            description="본인 발표 회차를 선택해 자료를 제출·수정하는 임시 링크를 받습니다",
         )
         @app_commands.guild_only()
         @app_commands.checks.cooldown(
@@ -952,20 +980,27 @@ class SeminarBot(discord.Client):
         @app_commands.guild_only()
         async def help_command(interaction: discord.Interaction) -> None:
             text = (
+                "**발표 자료 제출·수정**\n"
+                "`/제출` → 본인만 보이는 임시 링크 → 본인의 지난·예정 발표 회차 선택\n"
+                "같은 페이지에서 자료를 새로 제출하거나 기존 자료를 수정·교체·삭제할 수 있습니다.\n"
+                "발표 자료 **PDF/PPT/PPTX 1개 이상** + **서로 다른 논문 3편 이상**이 필요합니다.\n"
+                "논문은 웹에 PDF를 올려 제목·DOI를 자동 추출하거나 직접 입력할 수 있습니다.\n"
+                "직접 입력은 **제목만 필수**, 학회·연도·DOI·링크는 선택입니다.\n"
+                "새 논문 PDF는 분석 후 원본을 NAS에 보관하지 않고 메타정보만 저장합니다.\n"
+                "임시 링크는 15분 안에 한 번 열 수 있고 페이지는 1시간 동안 사용할 수 있습니다.\n\n"
+                "**일정·자료 조회**\n"
+                "`/일정` 발표자·세미나 시작 시간·휴강일 확인\n"
+                "`/제출현황` 회차별 제출 자료와 부족한 항목 확인\n"
+                "연구실 사이트 **Internal → 세미나 자료 조회**에서 최신순 열람·논문 검색·발표 자료 다운로드\n"
+                "`/검색`으로도 논문 검색 가능하며 종류 옵션에서 발표 자료나 전체를 선택할 수 있습니다.\n\n"
                 "**서버 관리자**\n"
-                "`/설정` 요일·시간·알림/자료 채널 지정\n"
-                "발표 순서는 NAS의 `config/rotation.json`에서 편집 (저장 후 30초 안에 적용)\n"
-                "`/스왑` 두 날짜의 발표자 교환\n"
-                "`/연기` 해당 주 휴강 + 이후 전체 1주 연기\n\n"
-                "**모든 멤버**\n"
-                "`/일정` 발표자와 휴강일 확인\n"
-                "`/제출` 본인 회차의 임시 웹 제출 링크 받기 (로그인 없이 파일 업로드)\n"
-                "발표 자료 **PDF/PPT/PPTX 1개 이상** + **서로 다른 논문 3편 이상** 제출\n"
-                "논문은 자료 채널에 PDF 업로드하거나 웹에서 제목·학회·연도·DOI·링크 직접 입력\n"
-                "구분이 애매한 PDF는 업로드 아래 버튼으로 **발표 자료 / 논문 PDF** 선택\n"
-                "`/제출현황` 부족한 자료 확인 · `/자료분류` 구분 수정\n"
-                "`/검색` 논문 검색 (kind:전체 로 발표 자료도 검색)\n"
-                "`/자료수정` 제목 수정 · `/자료연결` 발표 회차 지정\n\n"
-                "일정·자료는 재시작해도 유지됩니다. 스캔 PDF는 OCR 없이 파일명으로 기록됩니다."
+                "`/설정` 요일·**세미나시간**(매주 고정 시작 시각)·알림/자료 채널 지정\n"
+                "아침 알림·저녁 자료 요청 시각은 세미나 시작 시각과 별도로 지정합니다.\n"
+                "발표 순서는 NAS의 `config/rotation.json`의 `presenters`에서 편집 (서버 한 곳이면 서버 ID 불필요)\n"
+                "파일 저장 후 30초 안에 적용하며 `/일정`을 열 때도 확인합니다.\n"
+                "`/스왑` 두 날짜의 발표자 교환 · `/연기` 해당 주 휴강 + 이후 전체 1주 연기\n\n"
+                "**Discord에 직접 올린 자료 관리**\n"
+                "자료 채널에 파일을 올려도 자동 등록합니다. 구분이 애매한 PDF는 아래 버튼으로 선택하세요.\n"
+                "`/자료분류` 구분 수정 · `/자료수정` 제목 수정 · `/자료연결` 발표 회차 지정"
             )
             await interaction.response.send_message(text, ephemeral=True)
