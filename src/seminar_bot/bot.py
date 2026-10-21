@@ -158,6 +158,7 @@ class SeminarBot(discord.Client):
         self.upload_slots = asyncio.Semaphore(2)
         self.rotation_errors: dict[int | None, str] = {}
         self.api_runner = None
+        self.relay_client = None
         self._register_commands()
         self.tree.error(self.on_command_error)
         self.add_dynamic_items(DocumentKindButton)
@@ -185,6 +186,11 @@ class SeminarBot(discord.Client):
                 self.api_runner = None
                 raise
             log.info("Seminar web API listening on port %s", self.settings.api_port)
+            if self.settings.api_transport == "relay":
+                from .relay import RelayClient
+
+                self.relay_client = RelayClient(self.settings)
+                self.relay_client.start()
         self.reminders.start()
 
     async def on_ready(self) -> None:
@@ -195,6 +201,9 @@ class SeminarBot(discord.Client):
         reminder_task = self.reminders.get_task()
         if reminder_task:
             await asyncio.gather(reminder_task, return_exceptions=True)
+        if self.relay_client:
+            await self.relay_client.close()
+            self.relay_client = None
         if self.api_runner:
             await self.api_runner.cleanup()
             self.api_runner = None

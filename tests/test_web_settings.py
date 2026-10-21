@@ -75,6 +75,60 @@ class WebSettingsTests(unittest.TestCase):
                 ):
                     Settings.from_env()
 
+    def test_outbound_relay_requires_a_separate_secret_and_wss_destination(self):
+        env = {
+            **self.web_environment(),
+            "SEMINAR_API_TRANSPORT": "relay",
+            "SEMINAR_RELAY_TOKEN": "c" * 64,
+            "SEMINAR_RELAY_URL": "wss://seminar-relay.example.workers.dev/connect",
+            "SEMINAR_CONNECT_TOKEN": "d" * 64,
+            "CLOUDFLARE_ACCESS_TEAM_DOMAIN": "",
+            "CLOUDFLARE_ACCESS_AUD": "",
+        }
+        with patch.dict(os.environ, env):
+            settings = Settings.from_env()
+        self.assertEqual(settings.api_transport, "relay")
+        self.assertEqual(settings.relay_url, env["SEMINAR_RELAY_URL"])
+        self.assertNotIn(settings.connect_token, repr(settings))
+        for key in ("SEMINAR_RELAY_TOKEN", "SEMINAR_RELAY_URL", "SEMINAR_CONNECT_TOKEN"):
+            with self.subTest(missing=key):
+                with (
+                    patch.dict(os.environ, {**env, key: ""}),
+                    self.assertRaisesRegex(ValueError, key),
+                ):
+                    Settings.from_env()
+        for reused in (env["SEMINAR_API_TOKEN"], env["SEMINAR_RELAY_TOKEN"]):
+            with self.subTest(reused_connector_secret=True):
+                with patch.dict(os.environ, {**env, "SEMINAR_CONNECT_TOKEN": reused}):
+                    with self.assertRaisesRegex(ValueError, "SEMINAR_CONNECT_TOKEN"):
+                        Settings.from_env()
+
+    def test_relay_destination_rejects_credentials_other_hosts_ports_and_routes(self):
+        env = {
+            **self.web_environment(),
+            "SEMINAR_API_TRANSPORT": "relay",
+            "SEMINAR_RELAY_TOKEN": "c" * 64,
+        }
+        for destination in (
+            "http://seminar-relay.example.workers.dev/connect",
+            "ws://seminar-relay.example.workers.dev/connect",
+            "wss://127.0.0.1/connect",
+            "wss://example.com/connect",
+            "wss://example.workers.dev/connect",
+            "wss://seminar-relay.example.workers.dev.evil.test/connect",
+            "wss://user@seminar-relay.example.workers.dev/connect",
+            "wss://seminar-relay.example.workers.dev:8443/connect",
+            "wss://seminar-relay.example.workers.dev:invalid/connect",
+            "wss://seminar-relay.example.workers.dev/other",
+            "wss://seminar-relay.example.workers.dev/connect?secret=hidden",
+            "wss://seminar-relay.example.workers.dev/connect#fragment",
+            "wss://seminar-relay.example.workers.dev/con nect",
+        ):
+            with self.subTest(destination=destination):
+                with patch.dict(os.environ, {**env, "SEMINAR_RELAY_URL": destination}):
+                    with self.assertRaisesRegex(ValueError, "SEMINAR_RELAY_URL"):
+                        Settings.from_env()
+
     def test_unknown_transport_never_disables_server_authentication(self):
         for transport in ("", "none", "private", "VPC"):
             with self.subTest(transport=transport):

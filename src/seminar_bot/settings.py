@@ -26,6 +26,8 @@ class Settings:
     access_audience: str = ""
     api_transport: str = "access"
     relay_token: str = field(default="", repr=False)
+    relay_url: str = ""
+    connect_token: str = field(default="", repr=False)
 
     def submission_url(self, session_id: int) -> str:
         return f"{self.seminar_page_url}?session={session_id}" if self.seminar_page_url else ""
@@ -52,22 +54,61 @@ class Settings:
         access_aud = os.getenv("CLOUDFLARE_ACCESS_AUD", "").strip()
         transport = os.getenv("SEMINAR_API_TRANSPORT", "access").strip()
         relay_token = os.getenv("SEMINAR_RELAY_TOKEN", "").strip()
+        relay_url = os.getenv("SEMINAR_RELAY_URL", "").strip()
+        connect_token = os.getenv("SEMINAR_CONNECT_TOKEN", "").strip()
         port = int(os.getenv("SEMINAR_API_PORT", "8080"))
         if not 1 <= port <= 65535:
             raise ValueError("SEMINAR_API_PORT는 1~65535여야 합니다.")
         if api_token and not re.fullmatch(r"[A-Za-z0-9_-]{32,256}", api_token):
             raise ValueError("SEMINAR_API_TOKEN은 안전한 임의 문자열 32~256자로 설정해주세요.")
-        if transport not in {"access", "vpc"}:
-            raise ValueError("SEMINAR_API_TRANSPORT는 access 또는 vpc여야 합니다.")
+        if transport not in {"access", "vpc", "relay"}:
+            raise ValueError("SEMINAR_API_TRANSPORT는 access, vpc 또는 relay여야 합니다.")
         if (
             api_token
-            and transport == "vpc"
+            and transport in {"vpc", "relay"}
             and (
                 not re.fullmatch(r"[A-Za-z0-9_-]{32,256}", relay_token) or relay_token == api_token
             )
         ):
             raise ValueError(
                 "SEMINAR_RELAY_TOKEN은 API 토큰과 다른 안전한 임의 문자열 32~256자로 설정해주세요."
+            )
+        if relay_url:
+            relay = urlsplit(relay_url)
+            try:
+                relay_port = relay.port
+            except ValueError as exc:
+                raise ValueError("SEMINAR_RELAY_URL의 포트를 확인해주세요.") from exc
+            if (
+                relay.scheme != "wss"
+                or not re.fullmatch(
+                    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\."
+                    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.workers\.dev",
+                    relay.hostname or "",
+                )
+                or relay_port not in {None, 443}
+                or relay.username
+                or relay.password
+                or relay.path != "/connect"
+                or relay.query
+                or relay.fragment
+                or any(character.isspace() or ord(character) > 127 for character in relay_url)
+            ):
+                raise ValueError(
+                    "SEMINAR_RELAY_URL은 workers.dev의 WSS 443 /connect 주소여야 합니다."
+                )
+        if api_token and transport == "relay" and not relay_url:
+            raise ValueError("중계 연결에는 SEMINAR_RELAY_URL 설정이 필요합니다.")
+        if (
+            api_token
+            and transport == "relay"
+            and (
+                not re.fullmatch(r"[A-Za-z0-9_-]{32,256}", connect_token)
+                or connect_token in {api_token, relay_token}
+            )
+        ):
+            raise ValueError(
+                "SEMINAR_CONNECT_TOKEN은 API 및 중계 토큰과 다른 안전한 임의 문자열 32~256자로 설정해주세요."
             )
         if api_guild_id is not None and not 0 < api_guild_id <= 2**63 - 1:
             raise ValueError("SEMINAR_GUILD_ID는 Discord 서버의 양수 ID여야 합니다.")
@@ -132,4 +173,6 @@ class Settings:
             access_aud,
             transport,
             relay_token,
+            relay_url,
+            connect_token,
         )

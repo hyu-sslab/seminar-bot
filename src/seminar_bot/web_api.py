@@ -80,7 +80,7 @@ class SeminarAPI:
             raise ValueError("웹 API 토큰과 서버 ID가 필요합니다.")
         if not self.settings.parser_url:
             raise ValueError("웹 업로드에는 격리된 문서 분석 서비스가 필요합니다.")
-        if self.settings.api_transport == "vpc":
+        if self.settings.api_transport in {"vpc", "relay"}:
             if (
                 not re.fullmatch(r"[A-Za-z0-9_-]{32,256}", self.settings.relay_token)
                 or self.settings.relay_token == self.settings.api_token

@@ -219,10 +219,34 @@ class WebAPITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.files(), [])
 
     async def test_private_vpc_api_constructor_cannot_bypass_missing_or_reused_relay_secret(self):
-        for secret in ("", self.bot.settings.api_token):
-            self.bot.settings = replace(self.bot.settings, api_transport="vpc", relay_token=secret)
-            with self.assertRaises(ValueError):
-                SeminarAPI(self.bot)
+        for transport in ("vpc", "relay"):
+            for secret in ("", self.bot.settings.api_token):
+                self.bot.settings = replace(
+                    self.bot.settings, api_transport=transport, relay_token=secret
+                )
+                with self.assertRaises(ValueError):
+                    SeminarAPI(self.bot)
+
+    async def test_outbound_relay_api_still_requires_both_local_credentials(self):
+        self.bot.settings = replace(self.bot.settings, api_transport="relay", relay_token="r" * 64)
+        api = SeminarAPI(self.bot)
+        self.assertIsNone(api.access)
+        client = TestClient(TestServer(api.app))
+        await client.start_server()
+        self.addAsyncCleanup(client.close)
+        bearer = "Bearer " + self.bot.settings.api_token
+        for credentials in (
+            {"Authorization": bearer},
+            {"X-Seminar-Relay-Token": "r" * 64},
+            {"Authorization": bearer, "X-Seminar-Relay-Token": "wrong"},
+        ):
+            response = await client.get("/v1/health", headers=credentials)
+            self.assertEqual(response.status, 401)
+        response = await client.get(
+            "/v1/health",
+            headers={"Authorization": bearer, "X-Seminar-Relay-Token": "r" * 64},
+        )
+        self.assertEqual(response.status, 200)
 
     async def test_session_list_and_detail_expose_names_version_and_scoped_progress(self):
         self.bot.settings.rotation_file.write_text(
