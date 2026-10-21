@@ -29,6 +29,7 @@ MAX_BODY_BYTES = 20 * 1024 * 1024
 MAX_CONTROL_BYTES = 16 * 1024
 REQUEST_TIMEOUT = 70
 HANDSHAKE_TIMEOUT = 15
+CONNECTION_SLOTS = 4
 _ID = r"[1-9][0-9]{0,18}"
 _UUID = re.compile(r"[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}")
 _REQUEST_HEADERS = {
@@ -179,7 +180,7 @@ def _control(message: str) -> dict:
 
 
 class RelayClient:
-    """Reconnect an authenticated WSS connection without exposing a NAS listener."""
+    """Maintain independent authenticated WSS connections to the local API."""
 
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -191,12 +192,29 @@ class RelayClient:
         self._task = asyncio.create_task(self.run(), name="seminar-outbound-relay")
 
     async def close(self) -> None:
-        if self._task is not None:
-            self._task.cancel()
-            await asyncio.gather(self._task, return_exceptions=True)
-            self._task = None
+        task = self._task
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            if self._task is task:
+                self._task = None
 
     async def run(self) -> None:
+        task = asyncio.current_task()
+        if self._task is not None and self._task is not task:
+            raise RuntimeError("Relay already started")
+        self._task = task
+        try:
+            async with asyncio.TaskGroup() as slots:
+                for slot in range(CONNECTION_SLOTS):
+                    slots.create_task(self._run_slot(slot), name=f"seminar-outbound-relay-{slot}")
+        finally:
+            if self._task is task:
+                self._task = None
+
+    async def _run_slot(self, slot: int) -> None:
+        # Each slot keeps v1's single active request and its own transport,
+        # loopback connection, reconnect delay, and cancellation boundary.
         trace = aiohttp.TraceConfig()
         trace.on_request_redirect.append(_no_redirect)
         timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT, sock_connect=10, sock_read=60)
@@ -219,7 +237,10 @@ class RelayClient:
                 try:
                     async with connector.ws_connect(
                         self.settings.relay_url,
-                        headers={"Authorization": f"Bearer {self.settings.connect_token}"},
+                        headers={
+                            "Authorization": f"Bearer {self.settings.connect_token}",
+                            "X-Seminar-Relay-Slot": str(slot),
+                        },
                         heartbeat=15,
                         # aiohttp rejects messages equal to max_msg_size; the
                         # explicit protocol check still caps chunks at 64 KiB.
@@ -231,7 +252,7 @@ class RelayClient:
                     raise
                 except Exception:
                     # Exceptions may embed URLs/headers: keep diagnostics generic.
-                    log.warning("Seminar relay disconnected; reconnecting")
+                    log.warning("Seminar relay slot %d disconnected; reconnecting", slot)
                 if asyncio.get_running_loop().time() - connected_at > 30:
                     delay = 1.0
                 await asyncio.sleep(delay + random.uniform(0, delay / 4))

@@ -12,7 +12,14 @@ import aiohttp
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 
-from seminar_bot.relay import CHUNK_BYTES, RelayClient, RelayProtocolError, validated_request
+from seminar_bot import relay as relay_module
+from seminar_bot.relay import (
+    CHUNK_BYTES,
+    CONNECTION_SLOTS,
+    RelayClient,
+    RelayProtocolError,
+    validated_request,
+)
 from seminar_bot.settings import Settings
 
 
@@ -435,6 +442,237 @@ class RelayIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(leaked_headers, [])
         self.assertNotIn(self.settings.connect_token, " ".join(captured.output))
         self.assertNotIn("/redirect", " ".join(captured.output))
+
+
+class RelayPoolIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.calls = []
+        self.started = asyncio.Queue()
+        self.release = asyncio.Event()
+        self.ready = asyncio.Queue()
+        self.seen_slots = []
+        self.connections = []
+        original_connection = relay_module._Connection
+
+        def track_connection(*args, **kwargs):
+            connection = original_connection(*args, **kwargs)
+            self.connections.append(connection)
+            return connection
+
+        tracker = patch("seminar_bot.relay._Connection", side_effect=track_connection)
+        tracker.start()
+        self.addCleanup(tracker.stop)
+
+        async def local_handler(request):
+            body = await request.read()
+            self.calls.append((request.path_qs, dict(request.headers), body))
+            await self.started.put(request.headers["X-Seminar-Request-ID"])
+            await self.release.wait()
+            return web.json_response({"received": len(body), "request": request.path_qs})
+
+        api_app = web.Application()
+        api_app.router.add_route("*", "/{path:.*}", local_handler)
+        self.api = TestServer(api_app)
+        await self.api.start_server()
+        self.addAsyncCleanup(self.api.close)
+
+        async def relay_handler(request):
+            slot = request.headers.get("X-Seminar-Relay-Slot")
+            self.assertIn(slot, {"0", "1", "2", "3"})
+            self.assertEqual(request.headers.get("Authorization"), "Bearer " + "c" * 64)
+            self.seen_slots.append(slot)
+            socket = web.WebSocketResponse(max_msg_size=CHUNK_BYTES + 1)
+            await socket.prepare(request)
+            await socket.send_json({"type": "connected", "version": 1})
+            peer = _Peer(socket)
+            await self.ready.put((int(slot), peer))
+            while True:
+                message = await socket.receive()
+                await peer.messages.put(message)
+                if message.type in {
+                    aiohttp.WSMsgType.CLOSE,
+                    aiohttp.WSMsgType.CLOSED,
+                    aiohttp.WSMsgType.ERROR,
+                }:
+                    break
+            return socket
+
+        worker_app = web.Application()
+        worker_app.router.add_get("/connect", relay_handler)
+        self.worker = TestServer(worker_app)
+        await self.worker.start_server()
+        self.addAsyncCleanup(self.worker.close)
+        self.settings = Settings(
+            token="test-discord-unused",
+            data_dir=Path("/tmp"),
+            api_token="a" * 64,
+            relay_token="b" * 64,
+            connect_token="c" * 64,
+            api_transport="relay",
+            api_port=self.api.port,
+            relay_url=str(self.worker.make_url("/connect")),
+        )
+        self.relay = RelayClient(self.settings)
+        self.addAsyncCleanup(self.relay.close)
+        self.relay.start()
+        self.peers = dict(
+            await asyncio.gather(
+                *(asyncio.wait_for(self.ready.get(), 3) for _ in range(CONNECTION_SLOTS))
+            )
+        )
+
+    async def asyncTearDown(self):
+        self.release.set()
+        await self.relay.close()
+
+    def request(self, slot, body=False):
+        return {
+            "type": "request",
+            "id": str(uuid.uuid4()),
+            "method": "PUT" if body else "GET",
+            "path": f"/v1/sessions/{slot + 1}/documents?kind=paper"
+            if body
+            else f"/v1/sessions/{slot + 1}",
+            "headers": {
+                "authorization": "Bearer " + self.settings.api_token,
+                "x-seminar-relay-token": self.settings.relay_token,
+                "content-type": "application/octet-stream" if body else "application/json",
+            },
+            "body": body,
+        }
+
+    async def begin(self, slot, request, body=None):
+        peer = self.peers[slot]
+        await peer.send_json(request)
+        self.assertEqual(await peer.receive_json(), {"type": "request_ready", "id": request["id"]})
+        if body is not None:
+            await peer.send_bytes(body)
+            self.assertEqual(
+                await peer.receive_json(), {"type": "request_ack", "id": request["id"]}
+            )
+
+    async def read_response(self, slot, request):
+        peer = self.peers[slot]
+        response = await peer.receive_json()
+        self.assertEqual(response["id"], request["id"])
+        self.assertEqual(response["status"], 200)
+        chunks = []
+        while True:
+            await peer.send_json({"type": "response_pull", "id": request["id"]})
+            message = await peer.receive()
+            if message.type == aiohttp.WSMsgType.BINARY:
+                chunks.append(message.data)
+            else:
+                self.assertEqual(message.json(), {"type": "response_end", "id": request["id"]})
+                return b"".join(chunks)
+
+    async def test_four_slots_forward_independent_uploads_to_loopback_concurrently(self):
+        self.assertEqual(CONNECTION_SLOTS, 4)
+        self.assertEqual(set(self.peers), {0, 1, 2, 3})
+        requests = [self.request(slot, body=True) for slot in range(CONNECTION_SLOTS)]
+        payloads = [bytes([65 + slot]) * (slot + 1) for slot in range(CONNECTION_SLOTS)]
+        await asyncio.gather(
+            *(self.begin(slot, request, payloads[slot]) for slot, request in enumerate(requests))
+        )
+        await asyncio.gather(
+            *(
+                self.peers[slot].send_json({"type": "request_end", "id": request["id"]})
+                for slot, request in enumerate(requests)
+            )
+        )
+        # All four HTTP handlers must start before any response is released.
+        # A shared single-connection client would leave three calls waiting.
+        started = await asyncio.wait_for(
+            asyncio.gather(*(self.started.get() for _ in range(CONNECTION_SLOTS))), 2
+        )
+        self.assertEqual(set(started), {request["id"] for request in requests})
+        self.assertEqual(len({id(connection.local) for connection in self.connections}), 4)
+        for path, headers, body in self.calls:
+            slot = int(path.split("/")[3]) - 1
+            self.assertEqual(body, payloads[slot])
+            self.assertEqual(headers["X-Seminar-Request-ID"], requests[slot]["id"])
+            self.assertNotIn("X-Seminar-Relay-Slot", headers)
+        self.release.set()
+        results = await asyncio.gather(
+            *(self.read_response(slot, request) for slot, request in enumerate(requests))
+        )
+        for slot, result in enumerate(results):
+            self.assertIn(f'"received": {len(payloads[slot])}'.encode(), result)
+
+    async def test_protocol_failure_reconnects_only_its_slot_and_other_slots_remain_usable(self):
+        failed = self.request(0, body=True)
+        await self.begin(0, failed, b"partial")
+        await self.peers[0].send_json({"type": "response_pull", "id": str(uuid.uuid4())})
+        closed = await self.peers[0].receive()
+        self.assertIn(closed.type, {aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED})
+        requests = {slot: self.request(slot) for slot in (1, 2, 3)}
+        await asyncio.gather(*(self.begin(slot, request) for slot, request in requests.items()))
+        await asyncio.gather(
+            *(
+                self.peers[slot].send_json({"type": "request_end", "id": request["id"]})
+                for slot, request in requests.items()
+            )
+        )
+        await asyncio.wait_for(asyncio.gather(*(self.started.get() for _ in requests)), 2)
+        self.release.set()
+        await asyncio.gather(
+            *(self.read_response(slot, request) for slot, request in requests.items())
+        )
+        slot, replacement = await asyncio.wait_for(self.ready.get(), 3)
+        self.assertEqual(slot, 0)
+        self.assertIsNot(replacement, self.peers[0])
+        self.assertEqual(sorted(self.seen_slots), ["0", "0", "1", "2", "3"])
+        for healthy in (1, 2, 3):
+            self.assertFalse(self.peers[healthy].socket.closed)
+
+    async def test_close_cancels_all_slots_http_work_and_anonymous_spools(self):
+        spools = []
+        original = tempfile.TemporaryFile
+
+        def tracked_spool(*args, **kwargs):
+            spool = original(*args, **kwargs)
+            spools.append(spool)
+            return spool
+
+        with patch("seminar_bot.relay.tempfile.TemporaryFile", side_effect=tracked_spool):
+            requests = [self.request(slot, body=True) for slot in range(CONNECTION_SLOTS)]
+            await asyncio.gather(
+                *(self.begin(slot, request, b"partial") for slot, request in enumerate(requests))
+            )
+            for slot in (0, 1):
+                await self.peers[slot].send_json(
+                    {"type": "request_end", "id": requests[slot]["id"]}
+                )
+            await asyncio.wait_for(asyncio.gather(self.started.get(), self.started.get()), 2)
+            self.assertEqual(len(spools), 4)
+            self.assertTrue(all(not spool.closed for spool in spools))
+            await self.relay.close()
+        self.assertTrue(all(spool.closed for spool in spools))
+        self.assertIsNone(self.relay._task)
+        for connection in self.connections:
+            self.assertIsNone(connection.active)
+            self.assertEqual(connection.tasks, set())
+            self.assertTrue(connection.local.closed)
+            self.assertTrue(connection.ws.closed)
+        self.assertFalse(
+            any(
+                task.get_name().startswith("seminar-outbound-relay") for task in asyncio.all_tasks()
+            )
+        )
+        await self.relay.close()
+
+    async def test_direct_run_uses_four_slots_and_close_waits_for_the_whole_pool(self):
+        await self.relay.close()
+        direct = asyncio.create_task(self.relay.run())
+        await asyncio.gather(
+            *(asyncio.wait_for(self.ready.get(), 3) for _ in range(CONNECTION_SLOTS))
+        )
+        with self.assertRaisesRegex(RuntimeError, "already started"):
+            self.relay.start()
+        await self.relay.close()
+        await asyncio.gather(direct, return_exceptions=True)
+        self.assertTrue(direct.done())
+        self.assertIsNone(self.relay._task)
 
 
 if __name__ == "__main__":
