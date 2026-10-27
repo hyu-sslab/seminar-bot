@@ -1,18 +1,36 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
 from datetime import UTC, date, datetime, time, timedelta
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .documents import DocumentInfo, normalize_search
+from .documents import DocumentInfo, normalize_search, validate_paper_fields
 from .submissions import classify_document, count_submission
 
 
 class UserError(ValueError):
     """An actionable error safe to show in Discord."""
+
+
+_DOCUMENT_JOINS = (
+    " LEFT JOIN sessions s ON s.id=d.session_id AND s.guild_id=d.guild_id "
+    "LEFT JOIN archive_presentations a ON a.id=d.archive_presentation_id AND a.guild_id=d.guild_id "
+)
+_DOCUMENT_COLUMNS = """
+    d.*,COALESCE(s.seminar_date,a.seminar_date) AS seminar_date,
+    COALESCE(s.presenter_id,a.presenter_id) AS presenter_id,
+    a.presenter_name_snapshot,
+    COALESCE(a.seminar_year,CAST(substr(s.seminar_date,1,4) AS INTEGER)) AS seminar_year,
+    CASE WHEN a.id IS NOT NULL THEN 'archive:'||a.id
+         WHEN s.id IS NOT NULL THEN 'session:'||s.id END AS record_key,
+    a.archive_kind,a.label AS archive_label,(a.id IS NOT NULL) AS archived,
+    CASE WHEN COALESCE(s.seminar_date,a.seminar_date) IS NOT NULL THEN 'day'
+         WHEN a.id IS NOT NULL THEN 'year' ELSE 'unknown' END AS date_precision
+"""
 
 
 def parse_date(value: str) -> date:
@@ -69,7 +87,7 @@ class Store:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.execute("PRAGMA busy_timeout=5000")
-        if self.db.execute("PRAGMA user_version").fetchone()[0] > 8:
+        if self.db.execute("PRAGMA user_version").fetchone()[0] > 9:
             self.db.close()
             raise ValueError("데이터베이스 버전이 봇보다 새롭습니다. 봇을 업데이트해주세요.")
         self.db.executescript("""
@@ -94,6 +112,19 @@ class Store:
                 seminar_date TEXT NOT NULL,
                 presenter_id INTEGER NOT NULL,
                 UNIQUE(guild_id, seminar_date)
+            );
+            CREATE TABLE IF NOT EXISTS archive_presentations (
+                id INTEGER PRIMARY KEY,
+                guild_id INTEGER NOT NULL REFERENCES guilds(guild_id),
+                presenter_id INTEGER,
+                presenter_name_snapshot TEXT NOT NULL DEFAULT '',
+                seminar_year INTEGER NOT NULL CHECK(seminar_year BETWEEN 1000 AND 9999),
+                seminar_date TEXT,
+                label TEXT NOT NULL DEFAULT '',
+                archive_kind TEXT NOT NULL CHECK(archive_kind IN ('presentation','unassigned')),
+                import_key TEXT NOT NULL,
+                imported_at TEXT NOT NULL,
+                UNIQUE(guild_id, import_key)
             );
             CREATE TABLE IF NOT EXISTS holidays (
                 id INTEGER PRIMARY KEY,
@@ -134,6 +165,14 @@ class Store:
             );
             CREATE INDEX IF NOT EXISTS document_guild ON documents(guild_id, id);
             CREATE INDEX IF NOT EXISTS document_session ON documents(session_id);
+            CREATE TABLE IF NOT EXISTS archive_import_items (
+                guild_id INTEGER NOT NULL REFERENCES guilds(guild_id),
+                import_key TEXT NOT NULL,
+                archive_presentation_id INTEGER NOT NULL REFERENCES archive_presentations(id),
+                document_id INTEGER REFERENCES documents(id) ON DELETE SET NULL,
+                input_fingerprint TEXT NOT NULL,
+                PRIMARY KEY(guild_id, import_key)
+            );
             CREATE TABLE IF NOT EXISTS rotation_file_state (
                 guild_id INTEGER PRIMARY KEY REFERENCES guilds(guild_id),
                 fingerprint TEXT NOT NULL
@@ -218,6 +257,10 @@ class Store:
                 ("year", "INTEGER"),
                 ("link", "TEXT"),
                 ("edit_revision", "INTEGER NOT NULL DEFAULT 0"),
+                (
+                    "archive_presentation_id",
+                    "INTEGER REFERENCES archive_presentations(id) ON DELETE SET NULL",
+                ),
             ):
                 if name not in columns:
                     self.db.execute(f"ALTER TABLE documents ADD COLUMN {name} {definition}")
@@ -232,7 +275,19 @@ class Store:
                 "CREATE UNIQUE INDEX IF NOT EXISTS web_upload_key ON documents(guild_id, upload_key) "
                 "WHERE upload_key IS NOT NULL"
             )
-            self.db.execute("PRAGMA user_version=8")
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS document_archive ON documents(archive_presentation_id)"
+            )
+            for operation in ("INSERT", "UPDATE"):
+                self.db.execute(
+                    f"CREATE TRIGGER IF NOT EXISTS archive_document_{operation.lower()} "
+                    f"BEFORE {operation} ON documents "
+                    "WHEN NEW.archive_presentation_id IS NOT NULL AND "
+                    "(NEW.session_id IS NOT NULL OR NOT EXISTS(SELECT 1 FROM archive_presentations a "
+                    "WHERE a.id=NEW.archive_presentation_id AND a.guild_id=NEW.guild_id)) "
+                    "BEGIN SELECT RAISE(ABORT,'Invalid archive presentation reference'); END"
+                )
+            self.db.execute("PRAGMA user_version=9")
 
     def close(self) -> None:
         self.db.close()
@@ -765,6 +820,310 @@ class Store:
             )
         return cursor.lastrowid, duplicates
 
+    def insert_archive_batch(
+        self,
+        guild_id: int,
+        groups: list[dict],
+        *,
+        imported_at: datetime,
+        commit: bool = True,
+    ) -> dict:
+        """Import reviewed history atomically without touching operational schedules.
+
+        ``commit=False`` leaves a transaction open for the caller's final
+        invariant checks. A pre-existing caller transaction is never committed.
+        File copying and checksum verification happen before this method.
+        """
+        config = self.require_config(guild_id)
+        if not isinstance(imported_at, datetime) or imported_at.utcoffset() is None:
+            raise UserError("이관 시각에는 시간대가 필요합니다.")
+        if not isinstance(groups, list) or len(groups) > 10000:
+            raise UserError("이관할 과거 발표 목록을 확인해주세요.")
+        today = local_now(config, imported_at).date()
+
+        def text(value: object, limit: int, *, required: bool = False) -> str:
+            if (
+                not isinstance(value, str)
+                or len(value) > limit
+                or any(
+                    ord(char) < 32 or ord(char) == 127 or 0xD800 <= ord(char) <= 0xDFFF
+                    for char in value
+                )
+                or required
+                and (not value or value != value.strip())
+            ):
+                raise UserError("이관 정보에 올바르지 않은 문자열이 있습니다.")
+            return value
+
+        prepared = []
+        group_keys, document_keys = set(), set()
+        for group in groups:
+            if not isinstance(group, dict):
+                raise UserError("과거 발표 정보를 확인해주세요.")
+            key = text(group.get("import_key"), 512, required=True)
+            if key in group_keys:
+                raise UserError("같은 과거 발표 이관 키가 중복되었습니다.")
+            group_keys.add(key)
+            year, day = group.get("seminar_year"), group.get("seminar_date")
+            if type(year) is not int or not 1000 <= year <= today.year:
+                raise UserError("과거 발표 연도를 확인해주세요.")
+            if day is not None and (type(day) is not date or day.year != year or day > today):
+                raise UserError("확인된 실제 발표 날짜 또는 날짜 미상을 지정해주세요.")
+            presenter = group.get("presenter_id")
+            if presenter is not None and (type(presenter) is not int or not 0 < presenter < 2**63):
+                raise UserError("과거 발표자 ID를 확인해주세요.")
+            archive_kind = group.get("archive_kind", "presentation")
+            if archive_kind not in {"presentation", "unassigned"}:
+                raise UserError("과거 발표 자료의 묶음 종류를 확인해주세요.")
+            name = text(group.get("presenter_name_snapshot", ""), 100)
+            label = text(group.get("label", ""), 300)
+            documents = group.get("documents", [])
+            if not isinstance(documents, list) or len(documents) > 10000:
+                raise UserError("이관 자료 목록을 확인해주세요.")
+            materials = []
+            for item in documents:
+                if not isinstance(item, dict) or not isinstance(item.get("info"), DocumentInfo):
+                    raise UserError("분석된 이관 자료 정보를 확인해주세요.")
+                material_key = text(item.get("import_key"), 512, required=True)
+                if material_key in document_keys:
+                    raise UserError("자료 이관 키는 회차별로 서로 달라야 합니다.")
+                document_keys.add(material_key)
+                kind = item.get("kind")
+                filename = text(item.get("filename"), 240, required=True)
+                if (
+                    kind not in {"slides", "paper"}
+                    or "/" in filename
+                    or "\\" in filename
+                    or len(filename.encode("utf-8")) > 240
+                    or Path(filename).suffix.casefold() not in {".pdf", ".ppt", ".pptx"}
+                ):
+                    raise UserError("이관 파일의 이름 또는 구분을 확인해주세요.")
+                self._validate_kind(kind, filename)
+                info = item["info"]
+                fields = validate_paper_fields(
+                    {
+                        "title": info.title,
+                        "doi": info.doi,
+                        "venue": item.get("venue"),
+                        "year": item.get("year"),
+                        "link": item.get("link"),
+                    }
+                )
+                sha = text(info.sha256, 64).casefold()
+                if sha and not re.fullmatch(r"[a-f0-9]{64}", sha) or not sha and kind == "slides":
+                    raise UserError("이관 파일의 SHA-256을 확인해주세요.")
+                arxiv_id = text(info.arxiv_id, 128) if info.arxiv_id is not None else None
+                warning = text(info.warning, 1024) if info.warning is not None else None
+                method = text(info.extraction_method, 100, required=True)
+                body = info.text if kind == "slides" else ""
+                if (
+                    not isinstance(body, str)
+                    or len(body) > 50000
+                    or any(0xD800 <= ord(char) <= 0xDFFF for char in body)
+                ):
+                    raise UserError("분석된 발표 자료 본문을 확인해주세요.")
+                path = text(item.get("file_path", ""), 512) if kind == "slides" else ""
+                if kind == "slides":
+                    parts = PurePosixPath(path)
+                    if (
+                        not path
+                        or "\\" in path
+                        or parts.is_absolute()
+                        or ".." in parts.parts
+                        or len(parts.parts) < 2
+                        or parts.parts[0] != "files"
+                        or parts.suffix.casefold() != Path(filename).suffix.casefold()
+                    ):
+                        raise UserError("발표 자료는 NAS 자료 폴더 내부의 상대경로가 필요합니다.")
+                if not sha:
+                    method = "user_metadata"
+                # Compare the original package input, not mutable DB fields.
+                # Reapplying an unchanged package preserves later user edits;
+                # changed metadata must be reviewed even if file bytes match.
+                identity = {
+                    "group": key,
+                    "kind": kind,
+                    "sha256": sha,
+                    "metadata": fields,
+                    "arxiv_id": arxiv_id,
+                    "filename": filename,
+                    "file_path": path,
+                    "extraction_method": method,
+                    "warning": warning,
+                    "extracted_text": body,
+                }
+                fingerprint = hashlib.sha256(
+                    json.dumps(identity, ensure_ascii=False, sort_keys=True).encode()
+                ).hexdigest()
+                materials.append(
+                    {
+                        "key": material_key,
+                        "fields": fields,
+                        "sha": sha,
+                        "arxiv": arxiv_id,
+                        "warning": warning,
+                        "method": method,
+                        "body": body,
+                        "path": path,
+                        "filename": filename,
+                        "kind": kind,
+                        "fingerprint": fingerprint,
+                    }
+                )
+            prepared.append(
+                {
+                    "key": key,
+                    "presenter": presenter,
+                    "name": name,
+                    "year": year,
+                    "day": day.isoformat() if day is not None else None,
+                    "label": label,
+                    "kind": archive_kind,
+                    "documents": materials,
+                }
+            )
+
+        own_transaction = not self.db.in_transaction
+        if own_transaction:
+            self.db.execute("BEGIN IMMEDIATE")
+        self.db.execute("SAVEPOINT archive_batch")
+        result = {
+            "inserted_groups": 0,
+            "inserted_documents": 0,
+            "skipped_documents": 0,
+            "tombstoned_documents": 0,
+            "groups": [],
+            "documents": [],
+        }
+        try:
+            for group in prepared:
+                existing = self.db.execute(
+                    "SELECT * FROM archive_presentations WHERE guild_id=? AND import_key=?",
+                    (guild_id, group["key"]),
+                ).fetchone()
+                values = (
+                    group["presenter"],
+                    group["name"],
+                    group["year"],
+                    group["day"],
+                    group["label"],
+                    group["kind"],
+                )
+                if existing:
+                    if (
+                        tuple(
+                            existing[field]
+                            for field in (
+                                "presenter_id",
+                                "presenter_name_snapshot",
+                                "seminar_year",
+                                "seminar_date",
+                                "label",
+                                "archive_kind",
+                            )
+                        )
+                        != values
+                    ):
+                        raise UserError("기존 과거 발표 이관 키의 날짜·발표자 정보가 다릅니다.")
+                    archive_id = existing["id"]
+                else:
+                    archive_id = self.db.execute(
+                        "INSERT INTO archive_presentations(guild_id,presenter_id,presenter_name_snapshot,"
+                        "seminar_year,seminar_date,label,archive_kind,import_key,imported_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                        (guild_id, *values, group["key"], imported_at.isoformat()),
+                    ).lastrowid
+                    result["inserted_groups"] += 1
+                result["groups"].append({"import_key": group["key"], "id": archive_id})
+                for item in group["documents"]:
+                    output = {
+                        "import_key": item["key"],
+                        "group_import_key": group["key"],
+                        "created": False,
+                    }
+                    if self.web_upload_deleted(guild_id, item["key"]):
+                        result["tombstoned_documents"] += 1
+                        result["documents"].append({**output, "id": None, "tombstoned": True})
+                        continue
+                    ledger = self.db.execute(
+                        "SELECT * FROM archive_import_items WHERE guild_id=? AND import_key=?",
+                        (guild_id, item["key"]),
+                    ).fetchone()
+                    if ledger:
+                        if (
+                            ledger["input_fingerprint"] != item["fingerprint"]
+                            or ledger["archive_presentation_id"] != archive_id
+                        ):
+                            raise UserError(
+                                "기존 자료 이관 키에 다른 파일 또는 발표가 지정되었습니다."
+                            )
+                        if ledger["document_id"] is None:
+                            raise UserError("삭제된 이관 자료는 자동으로 다시 등록할 수 없습니다.")
+                        result["skipped_documents"] += 1
+                        result["documents"].append({**output, "id": ledger["document_id"]})
+                        continue
+                    if self.web_upload(guild_id, item["key"]) is not None:
+                        raise UserError("이관 키가 다른 제출 자료에 이미 사용되었습니다.")
+                    attachment_id = -(
+                        int(hashlib.sha256(item["key"].encode()).hexdigest(), 16) % (2**63 - 1) + 1
+                    )
+                    if self.has_attachment(guild_id, attachment_id):
+                        raise UserError("기존 자료와 이관 식별자가 충돌했습니다.")
+                    fields = item["fields"]
+                    document_id = self.db.execute(
+                        "INSERT INTO documents(guild_id,attachment_id,uploader_id,source_channel_id,"
+                        "session_id,archive_presentation_id,title,filename,doi,arxiv_id,sha256,search_text,"
+                        "extracted_text,extraction_method,warning,file_path,message_url,uploaded_at,kind,"
+                        "classification_reason,source_type,upload_key,venue,year,link) "
+                        "VALUES(?,?,?,?,NULL,?,?,?,?,?,?,?,?,?,?,?,'',?,?,'검토한 과거 자료 이관','import',?,?,?,?)",
+                        (
+                            guild_id,
+                            attachment_id,
+                            group["presenter"] or 0,
+                            config["upload_channel_id"],
+                            archive_id,
+                            fields["title"],
+                            item["filename"],
+                            fields["doi"],
+                            item["arxiv"],
+                            item["sha"],
+                            self._search_text(
+                                fields["title"],
+                                item["filename"],
+                                fields["doi"],
+                                item["arxiv"],
+                                fields["venue"],
+                                fields["year"],
+                                fields["link"],
+                            ),
+                            item["body"],
+                            item["method"],
+                            item["warning"],
+                            item["path"],
+                            imported_at.isoformat(),
+                            item["kind"],
+                            item["key"],
+                            fields["venue"],
+                            fields["year"],
+                            fields["link"],
+                        ),
+                    ).lastrowid
+                    self.db.execute(
+                        "INSERT INTO archive_import_items VALUES(?,?,?,?,?)",
+                        (guild_id, item["key"], archive_id, document_id, item["fingerprint"]),
+                    )
+                    result["inserted_documents"] += 1
+                    result["documents"].append({**output, "id": document_id, "created": True})
+            self.db.execute("RELEASE SAVEPOINT archive_batch")
+            if own_transaction and commit:
+                self.db.commit()
+            return result
+        except BaseException:
+            self.db.execute("ROLLBACK TO SAVEPOINT archive_batch")
+            self.db.execute("RELEASE SAVEPOINT archive_batch")
+            if own_transaction:
+                self.db.rollback()
+            raise
+
     def web_upload(self, guild_id: int, upload_key: str) -> dict | None:
         row = self.db.execute(
             "SELECT id FROM documents WHERE guild_id=? AND upload_key=?", (guild_id, upload_key)
@@ -796,10 +1155,11 @@ class Store:
 
     def document(self, guild_id: int, record_id: int) -> dict:
         row = self.db.execute(
-            """
-            SELECT d.*, s.seminar_date, s.presenter_id FROM documents d
-            LEFT JOIN sessions s ON s.id=d.session_id WHERE d.guild_id=? AND d.id=?
-        """,
+            "SELECT "
+            + _DOCUMENT_COLUMNS
+            + " FROM documents d"
+            + _DOCUMENT_JOINS
+            + "WHERE d.guild_id=? AND d.id=?",
             (guild_id, record_id),
         ).fetchone()
         if not row:
@@ -847,11 +1207,11 @@ class Store:
             (guild_id, term, *channel_params),
         ).fetchone()[0]
         rows = self.db.execute(
-            """
-            SELECT d.*, s.seminar_date, s.presenter_id FROM documents d
-            LEFT JOIN sessions s ON s.id=d.session_id
-            WHERE d.guild_id=? AND instr(d.search_text, ?)>0
-        """
+            "SELECT "
+            + _DOCUMENT_COLUMNS
+            + " FROM documents d"
+            + _DOCUMENT_JOINS
+            + "WHERE d.guild_id=? AND instr(d.search_text, ?)>0"
             + visibility
             + """
             ORDER BY d.id DESC LIMIT ? OFFSET ?
@@ -897,11 +1257,18 @@ class Store:
             "SELECT COUNT(*) FROM documents d WHERE " + where, parameters
         ).fetchone()[0]
         rows = self.db.execute(
-            "SELECT d.*,s.seminar_date,s.presenter_id FROM documents d "
-            "LEFT JOIN sessions s ON s.id=d.session_id WHERE "
+            "SELECT "
+            + _DOCUMENT_COLUMNS
+            + " FROM documents d"
+            + _DOCUMENT_JOINS
+            + "WHERE "
             + where
-            + " ORDER BY COALESCE(s.seminar_date,substr(d.uploaded_at,1,10)) DESC,"
-            "d.uploaded_at DESC,d.id DESC LIMIT ? OFFSET ?",
+            + " ORDER BY COALESCE(a.seminar_year,CAST(substr(s.seminar_date,1,4) AS INTEGER),"
+            "CAST(substr(d.uploaded_at,1,4) AS INTEGER)) DESC,"
+            "CASE WHEN a.id IS NOT NULL THEN a.seminar_date IS NOT NULL ELSE 1 END DESC,"
+            "COALESCE(s.seminar_date,a.seminar_date,CASE WHEN a.id IS NULL THEN substr(d.uploaded_at,1,10) END) DESC,"
+            "CASE WHEN a.id IS NULL THEN d.uploaded_at END DESC,"
+            "COALESCE(a.id,s.id) DESC,d.id DESC LIMIT ? OFFSET ?",
             (*parameters, page_size, (page - 1) * page_size),
         ).fetchall()
         return [dict(row) for row in rows], count
@@ -924,7 +1291,11 @@ class Store:
         if type(through) is not date:
             raise UserError("조회 날짜를 확인해주세요.")
         term = archive_search_term(q)
-        document_conditions = ["d.guild_id=s.guild_id", "d.session_id=s.id"]
+        document_conditions = [
+            "d.guild_id=p.guild_id",
+            "((p.record_type='session' AND d.session_id=p.id) OR "
+            "(p.record_type='archive' AND d.archive_presentation_id=p.id))",
+        ]
         document_parameters: list = []
         if visible_channel_ids is not None:
             if not visible_channel_ids:
@@ -941,40 +1312,96 @@ class Store:
             matching_parameters.append(term)
             if presenter_ids:
                 match_conditions.append(
-                    "s.presenter_id IN (" + ",".join("?" for _ in presenter_ids) + ")"
+                    "p.presenter_id IN (" + ",".join("?" for _ in presenter_ids) + ")"
                 )
                 matching_parameters.extend(presenter_ids)
+            named_archives = [
+                row["id"]
+                for row in self.db.execute(
+                    "SELECT id,presenter_name_snapshot,label,seminar_year FROM archive_presentations WHERE guild_id=?",
+                    (guild_id,),
+                )
+                if any(
+                    term in normalize_search(str(row[field]))
+                    for field in ("presenter_name_snapshot", "label", "seminar_year")
+                )
+            ]
+            if named_archives:
+                match_conditions.append(
+                    "(p.record_type='archive' AND p.id IN ("
+                    + ",".join("?" for _ in named_archives)
+                    + "))"
+                )
+                matching_parameters.extend(named_archives)
             matching_where += " AND (" + " OR ".join(match_conditions) + ")"
+        catalog = """
+            SELECT id,guild_id,presenter_id,'' AS presenter_name_snapshot,
+                   CAST(substr(seminar_date,1,4) AS INTEGER) AS seminar_year,seminar_date,
+                   'session' AS record_type,'session:'||id AS record_key,
+                   'day' AS date_precision,0 AS archived,NULL AS archive_kind,NULL AS archive_label
+            FROM sessions
+            UNION ALL
+            SELECT id,guild_id,presenter_id,presenter_name_snapshot,seminar_year,seminar_date,
+                   'archive','archive:'||id,
+                   CASE WHEN seminar_date IS NULL THEN 'year' ELSE 'day' END,1,archive_kind,label
+            FROM archive_presentations
+        """
         where = (
-            "s.guild_id=? AND s.seminar_date<=? AND EXISTS ("
+            "p.guild_id=? AND p.seminar_year<=? AND (p.seminar_date IS NULL OR p.seminar_date<=?) AND EXISTS ("
             "SELECT 1 FROM documents d WHERE " + matching_where + ")"
         )
-        parameters = [guild_id, through.isoformat(), *matching_parameters]
+        parameters = [guild_id, through.year, through.isoformat(), *matching_parameters]
         total = self.db.execute(
-            "SELECT COUNT(*) FROM sessions s WHERE " + where, parameters
+            "SELECT COUNT(*) FROM (" + catalog + ") p WHERE " + where, parameters
         ).fetchone()[0]
         rows = self.db.execute(
-            "SELECT s.* FROM sessions s WHERE "
+            "SELECT p.* FROM ("
+            + catalog
+            + ") p WHERE "
             + where
-            + " ORDER BY s.seminar_date DESC,s.id DESC LIMIT ? OFFSET ?",
+            + " ORDER BY p.seminar_year DESC,(p.seminar_date IS NOT NULL) DESC,"
+            "p.seminar_date DESC,p.record_type DESC,p.id DESC LIMIT ? OFFSET ?",
             (*parameters, page_size, (page - 1) * page_size),
         ).fetchall()
         if not rows:
             return [], total
-        session_ids = [row["id"] for row in rows]
+        session_ids = [row["id"] for row in rows if row["record_type"] == "session"]
+        archive_ids = [row["id"] for row in rows if row["record_type"] == "archive"]
+        selections, selected_parameters = [], []
+        for field, ids in (("session_id", session_ids), ("archive_presentation_id", archive_ids)):
+            if ids:
+                selections.append("d." + field + " IN (" + ",".join("?" for _ in ids) + ")")
+                selected_parameters.extend(ids)
+        visible = ""
+        visible_parameters = []
+        if visible_channel_ids is not None:
+            visible = (
+                " AND d.source_channel_id IN (" + ",".join("?" for _ in visible_channel_ids) + ")"
+            )
+            visible_parameters.extend(visible_channel_ids)
         documents = self.db.execute(
-            "SELECT d.*,s.seminar_date,s.presenter_id FROM documents d "
-            "JOIN sessions s ON s.id=d.session_id WHERE "
-            + document_where
-            + " AND s.guild_id=? AND s.id IN ("
-            + ",".join("?" for _ in session_ids)
-            + ") ORDER BY d.uploaded_at DESC,d.id DESC",
-            (*document_parameters, guild_id, *session_ids),
+            "SELECT "
+            + _DOCUMENT_COLUMNS
+            + " FROM documents d"
+            + _DOCUMENT_JOINS
+            + "WHERE d.guild_id=? AND ("
+            + " OR ".join(selections)
+            + ")"
+            + visible
+            + " ORDER BY d.uploaded_at DESC,d.id DESC",
+            (guild_id, *selected_parameters, *visible_parameters),
         ).fetchall()
-        by_session: dict[int, list[dict]] = {session_id: [] for session_id in session_ids}
+        by_session = {row["record_key"]: [] for row in rows}
         for document in documents:
-            by_session[document["session_id"]].append(dict(document))
-        return [{"session": dict(row), "documents": by_session[row["id"]]} for row in rows], total
+            if document["record_key"] in by_session:
+                by_session[document["record_key"]].append(dict(document))
+        return [
+            {
+                "session": {**dict(row), "archived": bool(row["archived"])},
+                "documents": by_session[row["record_key"]],
+            }
+            for row in rows
+        ], total
 
     def rename_document(
         self, guild_id: int, record_id: int, title: str, user_id: int, manager: bool

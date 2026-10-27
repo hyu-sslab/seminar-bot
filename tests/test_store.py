@@ -131,7 +131,7 @@ class StoreTests(unittest.TestCase):
         self.store.close()
         self.store = Store(self.path)
         self.assertEqual(self.store.require_config(1)["seminar_time"], "14:30")
-        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 8)
+        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 9)
 
     def test_seminar_time_accepts_midnight_and_last_minute_without_reminder_order_constraints(self):
         for value in ("00:00", "23:59"):
@@ -197,7 +197,7 @@ class StoreTests(unittest.TestCase):
         )
         self.store.close()
         self.store = Store(self.path)
-        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 8)
+        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 9)
         column = next(
             row
             for row in self.store.db.execute("PRAGMA table_info(guilds)")
@@ -216,11 +216,11 @@ class StoreTests(unittest.TestCase):
         with sqlite3.connect(future) as db:
             db.execute("CREATE TABLE sentinel(value TEXT)")
             db.execute("INSERT INTO sentinel VALUES('keep')")
-            db.execute("PRAGMA user_version=9")
+            db.execute("PRAGMA user_version=10")
         with self.assertRaisesRegex(ValueError, "버전"):
             Store(future)
         with sqlite3.connect(future) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 9)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 10)
             self.assertEqual(db.execute("SELECT * FROM sentinel").fetchall(), [("keep",)])
             self.assertEqual(
                 db.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall(),
@@ -241,7 +241,7 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.store.require_config(1)["notifications_enabled"], 0)
         self.assertIsNone(self.store.require_config(1)["reminder_start_date"])
         self.assertEqual(self.history(), before)
-        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 8)
+        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 9)
         self.assertEqual(
             SubmissionAccess(self.store).validate(token, 1, now=1_700_000_003)["presenter_id"], 101
         )

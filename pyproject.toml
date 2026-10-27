@@ -21,6 +21,7 @@ dev = ["ruff>=0.12,<1"]
 
 [project.scripts]
 seminar-bot = "seminar_bot.__main__:main"
+seminar-archive-import = "seminar_bot.archive_import:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

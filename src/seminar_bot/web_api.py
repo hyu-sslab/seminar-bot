@@ -442,6 +442,25 @@ class SeminarAPI:
         return {}
 
     def session_data(self, row: dict, names: dict[int, str]) -> dict:
+        if row.get("record_type") == "archive":
+            guild = self.bot.get_guild(self.guild_id)
+            member = guild.get_member(row["presenter_id"]) if guild else None
+            return {
+                "id": row["id"],
+                "record_type": "archive",
+                "record_key": row["record_key"],
+                "archived": True,
+                "archive_kind": row["archive_kind"],
+                "archive_label": row.get("archive_label") or "",
+                "seminar_date": row["seminar_date"],
+                "seminar_year": row["seminar_year"],
+                "date_precision": row["date_precision"],
+                "presenter_id": str(row["presenter_id"]) if row["presenter_id"] else "",
+                "presenter_name": row.get("presenter_name_snapshot")
+                or names.get(row["presenter_id"])
+                or (member.display_name if member else None)
+                or (f"발표자 {row['presenter_id']}" if row["presenter_id"] else "발표자 미상"),
+            }
         guild = self.bot.get_guild(self.guild_id)
         member = guild.get_member(row["presenter_id"]) if guild else None
         name = names.get(row["presenter_id"]) or (member.display_name if member else None)
@@ -451,6 +470,10 @@ class SeminarAPI:
             "presenter_id": str(row["presenter_id"]),
             "presenter_name": name or f"발표자 {row['presenter_id']}",
             "version": session_version(row),
+            "record_type": "session",
+            "record_key": f"session:{row['id']}",
+            "seminar_year": int(row["seminar_date"][:4]),
+            "date_precision": "day",
         }
 
     def document_data(
@@ -475,20 +498,32 @@ class SeminarAPI:
             )
         }
         result["source"] = record.get("source_type", "discord")
+        archived = bool(record.get("archive_presentation_id"))
+        if archived:
+            result.update(
+                archived=True,
+                record_key=record.get("record_key")
+                or f"archive:{record['archive_presentation_id']}",
+                archive_kind=record.get("archive_kind", "presentation"),
+                archive_label=record.get("archive_label") or "",
+                seminar_year=record.get("seminar_year"),
+                date_precision=record.get("date_precision")
+                or ("day" if record.get("seminar_date") else "year"),
+            )
         result["file_available"] = bool(record.get("file_path"))
         owner_id = record.get("presenter_id")
-        presenter_name = ""
+        presenter_name = record.get("presenter_name_snapshot") if archived else ""
         if owner_id is not None:
             guild = self.bot.get_guild(self.guild_id)
             member = guild.get_member(owner_id) if guild else None
-            presenter_name = (
+            presenter_name = presenter_name or (
                 names.get(owner_id)
                 or (member.display_name if member else None)
                 or f"발표자 {owner_id}"
             )
         result["presenter_name"] = presenter_name
         result["revision"] = document_version(record)
-        result["editable"] = record.get("uploader_id") == presenter_id
+        result["editable"] = not archived and record.get("uploader_id") == presenter_id
         return result
 
     async def health(self, request):

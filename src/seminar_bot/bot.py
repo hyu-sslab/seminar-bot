@@ -5,6 +5,7 @@ import hashlib
 import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import discord
 from discord import app_commands
@@ -296,6 +297,21 @@ class SeminarBot(discord.Client):
         return await self.paper_metadata.enrich(info) if kind == "paper" else info
 
     def source_url(self, record: dict) -> str:
+        if record.get("source_type") == "import":
+            if not self.settings.seminar_page_url:
+                return ""
+            page = urlsplit(self.settings.seminar_page_url)
+            tab = "papers" if record.get("kind") == "paper" else "presentations"
+            query = record["title"][:180].encode("utf-8")[:400].decode("utf-8", errors="ignore")
+            return urlunsplit(
+                (
+                    page.scheme,
+                    page.netloc,
+                    f"/internal/seminars/{tab}/",
+                    "q=" + quote(query),
+                    "",
+                )
+            )
         if record.get("source_type") in {"web", "manual"} and record.get("session_id"):
             return self.settings.submission_url(record["session_id"]) or record["message_url"]
         return record["message_url"]
@@ -649,17 +665,40 @@ class SeminarBot(discord.Client):
             )
             today = local_now(config).date().isoformat()
             for row in rows:
-                if row["seminar_date"]:
+                archived = row.get("source_type") == "import"
+                if archived:
+                    timing = row["seminar_date"] or f"{row['seminar_year']}년 · 날짜 미상"
+                    if row.get("archive_kind") == "unassigned":
+                        timing = f"{row['seminar_year']}년 · 회차 미상"
+                    historical_presenter = safe(row.get("presenter_name_snapshot") or "", 100) or (
+                        f"<@{row['presenter_id']}>" if row.get("presenter_id") else "발표자 미상"
+                    )
+                    linked = f"과거 발표: {timing} · {historical_presenter}"
+                elif row["seminar_date"]:
                     status = "발표 예정/당일" if row["seminar_date"] >= today else "발표일"
                     linked = f"{status}: {row['seminar_date']} · <@{row['presenter_id']}>"
                 else:
                     linked = "발표 회차 미연결"
-                author = "회차 발표자" if row.get("source_type") in {"web", "manual"} else "업로더"
-                manual = row.get("source_type") == "manual"
-                source = (
-                    "직접 입력한 논문 정보" if manual else f"파일: {safe(row['filename'], 160)}"
+                author = (
+                    "회차 발표자"
+                    if row.get("source_type") in {"web", "manual", "import"}
+                    else "업로더"
                 )
-                value = f"구분: {'논문 정보' if manual else KIND_LABELS[row['kind']]}\n{linked}\n{source}\n[발표 회차]({self.source_url(row)}) · {author} <@{row['uploader_id']}>"
+                manual = row.get("source_type") == "manual" or (
+                    archived and row["kind"] == "paper" and not row["sha256"]
+                )
+                source = (
+                    "발표자료에서 확인한 논문 정보"
+                    if manual and archived
+                    else "직접 입력한 논문 정보"
+                    if manual
+                    else f"파일: {safe(row['filename'], 160)}"
+                )
+                source_url = self.source_url(row)
+                link_label = "자료 조회" if archived else "발표 회차"
+                source_link = f"[{link_label}]({source_url}) · " if source_url else ""
+                owner = historical_presenter if archived else f"<@{row['uploader_id']}>"
+                value = f"구분: {'논문 정보' if manual else KIND_LABELS[row['kind']]}\n{linked}\n{source}\n{source_link}{author} {owner}"
                 if row.get("venue") or row.get("year"):
                     value += "\n" + safe(
                         " · ".join(str(row[key]) for key in ("venue", "year") if row.get(key)), 220

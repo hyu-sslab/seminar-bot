@@ -1408,6 +1408,51 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             len(interaction.response.send_message.await_args.kwargs["embed"].fields), 1
         )
 
+    async def test_historical_search_shows_unknown_round_without_fabricated_date_or_mentions(self):
+        self.enable_web_submission()
+        group = {
+            "import_key": "sample:year-history",
+            "presenter_id": None,
+            "presenter_name_snapshot": "과거 발표자",
+            "seminar_year": 2026,
+            "seminar_date": None,
+            "archive_kind": "unassigned",
+            "documents": [
+                {
+                    "import_key": "sample:title-only",
+                    "info": DocumentInfo(
+                        "Attention Historical Research", "", None, None, "", "user_metadata"
+                    ),
+                    "filename": "historical-paper.pdf",
+                    "kind": "paper",
+                }
+            ],
+        }
+        self.bot.store.insert_archive_batch(1, [group], imported_at=NOW)
+        channel = SimpleNamespace(
+            id=1002,
+            permissions_for=lambda _: SimpleNamespace(view_channel=True, read_message_history=True),
+        )
+        interaction = SimpleNamespace(
+            guild_id=1,
+            guild=SimpleNamespace(text_channels=[channel]),
+            user=SimpleNamespace(id=101),
+            response=SimpleNamespace(send_message=AsyncMock()),
+        )
+        await self.bot.tree.get_command("검색").callback(interaction, "attention")
+        response = interaction.response.send_message.await_args
+        value = response.kwargs["embed"].fields[0].value
+        self.assertIn("과거 발표: 2026년 · 회차 미상", value)
+        self.assertIn("회차 발표자 과거 발표자", value)
+        self.assertIn("발표자료에서 확인한 논문 정보", value)
+        self.assertIn(
+            "https://example.test/internal/seminars/papers/?q=Attention%20Historical%20Research",
+            value,
+        )
+        self.assertNotIn("<@", value)
+        self.assertNotIn(DAY.isoformat(), value)
+        self.assertTrue(response.kwargs["ephemeral"])
+
     async def test_evening_reminder_requests_personal_submission_link_without_shared_url_or_channel_upload(
         self,
     ):

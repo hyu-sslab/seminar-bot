@@ -77,6 +77,11 @@ rotation.*.json
 !rotation.example.json
 /config/rotation.json*
 
+# Reviewed history packages and presenter maps remain private.
+archive-imports/
+presenter-map*.json
+*.private.json
+
 # Deployment and handoff notes stay local.
 /WEB_SETUP.md
 /WEB_ACCESS_SETUP.md

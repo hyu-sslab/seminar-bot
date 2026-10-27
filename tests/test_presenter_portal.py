@@ -427,7 +427,7 @@ class PresenterMigrationTests(unittest.TestCase):
         grant = self.access.validate(token, 1, now=102)
         self.assertEqual(grant["scope"], "session")
         self.assertEqual(len(self.access.sessions(grant)), 1)
-        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 8)
+        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 9)
         upgraded = self.store.document(1, record_id)
         self.assertEqual({key: upgraded[key] for key in old_archive}, old_archive)
         self.store.swap(1, fixtures.DAY, fixtures.DAY + timedelta(days=7), fixtures.DAY)
