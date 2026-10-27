@@ -377,7 +377,7 @@ class ArchiveHistoryTests(unittest.TestCase):
             old.execute("DROP TABLE archive_presentations")
             old.execute("PRAGMA user_version=8")
         self.store = Store(self.path)
-        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 9)
+        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 10)
         self.assertEqual(self.snapshot(), before)
         upgraded = dict(
             self.store.db.execute("SELECT * FROM documents WHERE id=?", (record_id,)).fetchone()

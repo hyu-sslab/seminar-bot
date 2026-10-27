@@ -87,7 +87,7 @@ class Store:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.execute("PRAGMA busy_timeout=5000")
-        if self.db.execute("PRAGMA user_version").fetchone()[0] > 9:
+        if self.db.execute("PRAGMA user_version").fetchone()[0] > 10:
             self.db.close()
             raise ValueError("데이터베이스 버전이 봇보다 새롭습니다. 봇을 업데이트해주세요.")
         self.db.executescript("""
@@ -98,6 +98,7 @@ class Store:
                 weekday INTEGER NOT NULL CHECK (weekday BETWEEN 0 AND 6),
                 morning TEXT NOT NULL,
                 evening TEXT NOT NULL,
+                before_reminder TEXT,
                 timezone TEXT NOT NULL,
                 seminar_time TEXT,
                 notifications_enabled INTEGER NOT NULL DEFAULT 0 CHECK(notifications_enabled IN (0,1)),
@@ -221,6 +222,7 @@ class Store:
                     "INTEGER NOT NULL DEFAULT 0 CHECK(notifications_enabled IN (0,1))",
                 ),
                 ("reminder_start_date", "TEXT"),
+                ("before_reminder", "TEXT"),
             ):
                 if name not in guild_columns:
                     self.db.execute(f"ALTER TABLE guilds ADD COLUMN {name} {definition}")
@@ -287,7 +289,7 @@ class Store:
                     "WHERE a.id=NEW.archive_presentation_id AND a.guild_id=NEW.guild_id)) "
                     "BEGIN SELECT RAISE(ABORT,'Invalid archive presentation reference'); END"
                 )
-            self.db.execute("PRAGMA user_version=9")
+            self.db.execute("PRAGMA user_version=10")
 
     def close(self) -> None:
         self.db.close()
@@ -319,6 +321,7 @@ class Store:
         seminar_time: str | None = None,
         notifications_enabled: bool | None = None,
         reminder_start_date: date | None = None,
+        before_reminder: str | None = None,
     ) -> int:
         if weekday not in range(7):
             raise UserError("요일 값이 올바르지 않습니다.")
@@ -330,14 +333,29 @@ class Store:
             raise UserError("알림 설정은 켜기 또는 끄기를 선택해주세요.")
         if reminder_start_date is not None and type(reminder_start_date) is not date:
             raise UserError("알림 시작일은 YYYY-MM-DD 날짜로 입력해주세요.")
-        if parse_time(morning) >= parse_time(evening):
-            raise UserError("아침 알림 시간은 저녁 요청 시간보다 빨라야 합니다.")
+        announcement_time, after_time = parse_time(morning), parse_time(evening)
+        if announcement_time >= after_time:
+            raise UserError("일정 안내 시간은 종료 후 요청 시간보다 빨라야 합니다.")
+        old = self.config(guild_id)
+        before = (
+            before_reminder
+            if before_reminder is not None
+            else old.get("before_reminder")
+            if old
+            else None
+        )
+        if before is not None:
+            if not isinstance(before, str):
+                raise UserError("시작 전 알림 시간은 HH:MM 형식으로 입력해주세요.")
+            if not announcement_time < parse_time(before) < after_time:
+                raise UserError(
+                    "알림 시간은 일정 안내 < 시작 전 요청 < 종료 후 요청 순서여야 합니다."
+                )
         try:
             zone = ZoneInfo(timezone)
         except (ZoneInfoNotFoundError, ValueError) as exc:
             raise UserError("시간대를 확인해주세요. 예: Asia/Seoul, UTC") from exc
         today = (now or datetime.now(UTC)).astimezone(zone).date()
-        old = self.config(guild_id)
         enabled = bool(old["notifications_enabled"]) if old else False
         if notifications_enabled is not None:
             enabled = notifications_enabled
@@ -383,14 +401,15 @@ class Store:
                 """
                 INSERT INTO guilds(guild_id, channel_id, upload_channel_id, weekday,
                     morning, evening, timezone, seminar_time, notifications_enabled,
-                    reminder_start_date) VALUES(?,?,?,?,?,?,?,?,?,?)
+                    reminder_start_date, before_reminder) VALUES(?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(guild_id) DO UPDATE SET
                     channel_id=excluded.channel_id, upload_channel_id=excluded.upload_channel_id,
                     weekday=excluded.weekday, morning=excluded.morning,
                     evening=excluded.evening, timezone=excluded.timezone,
                     seminar_time=COALESCE(excluded.seminar_time, guilds.seminar_time),
                     notifications_enabled=excluded.notifications_enabled,
-                    reminder_start_date=excluded.reminder_start_date
+                    reminder_start_date=excluded.reminder_start_date,
+                    before_reminder=excluded.before_reminder
             """,
                 (
                     guild_id,
@@ -403,6 +422,7 @@ class Store:
                     seminar_time,
                     int(enabled),
                     reminder_start,
+                    before,
                 ),
             )
         return delta
@@ -631,11 +651,8 @@ class Store:
             """,
                 (one["id"], two["id"], one["id"], guild_id, one["id"], two["id"]),
             )
-            # If swapping today's speaker after a reminder, notify the new speaker on next tick.
-            self.db.execute(
-                "DELETE FROM deliveries WHERE session_id IN (?,?) AND on_date>=? AND kind='morning'",
-                (one["id"], two["id"], today.isoformat()),
-            )
+            # Preserve sent slots: swapping speakers must not replay today's
+            # announcements. Any later slot reads the newly assigned speaker.
 
     def _revoke_submission_sessions(self, session_ids: list[int]) -> None:
         """Caller owns the schedule transaction; old links never revive after a swap back."""

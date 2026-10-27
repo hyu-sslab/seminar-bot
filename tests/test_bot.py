@@ -107,6 +107,11 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         option = next(item for item in options if item["name"] == "세미나시간")
         self.assertTrue(option["required"])
         self.assertNotIn("upload_channel", {item["name"] for item in options})
+        self.assertTrue(
+            {"일정안내", "시작전알림", "종료후알림"}.issubset({item["name"] for item in options})
+        )
+        self.assertNotIn("morning", {item["name"] for item in options})
+        self.assertNotIn("evening", {item["name"] for item in options})
         interaction, target = self.configuration_interaction()
         sessions = [
             dict(row) for row in self.bot.store.db.execute("SELECT * FROM sessions ORDER BY id")
@@ -120,7 +125,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             )
             response = interaction.followup.send.await_args.args[0]
             self.assertIn("매주 목요일 14:00 (Asia/Seoul)", response)
-            self.assertIn("알림: 아침 09:00 / 저녁 18:00", response)
+            self.assertIn("알림: 일정 안내 09:00 / 종료 후 18:00", response)
             self.assertIn("알림 상태: OFF", response)
             await command.callback(
                 interaction, 3, target, "15:30", morning="08:20", evening="19:10"
@@ -132,7 +137,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         )
         response = interaction.followup.send.await_args.args[0]
         self.assertIn("매주 목요일 15:30 (Asia/Seoul)", response)
-        self.assertIn("알림: 아침 08:20 / 저녁 19:10", response)
+        self.assertIn("알림: 일정 안내 08:20 / 종료 후 19:10", response)
         self.assertEqual(
             [dict(row) for row in self.bot.store.db.execute("SELECT * FROM sessions ORDER BY id")],
             sessions,
@@ -152,7 +157,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         )
         text = interaction.followup.send.await_args.args[0]
         self.assertIn("매주 목요일 14:00 (Asia/Seoul)", text)
-        self.assertIn("알림: 아침 09:00 / 저녁 18:00", text)
+        self.assertIn("알림: 일정 안내 12:00 / 시작 전 15:45 / 종료 후 17:00", text)
         self.assertNotIn("자료:", text)
         self.assertFalse(config["notifications_enabled"])
         self.assertIsNone(config["reminder_start_date"])
@@ -306,46 +311,55 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(path.read_bytes(), content)
         self.assertEqual(access.validate(token, 1, now=1_700_000_002)["presenter_id"], 101)
 
-    async def test_oldest_unsubmitted_request_is_once_per_day_and_records_actual_delivery_date(
+    async def test_unsubmitted_request_is_for_today_only_and_never_replays_older_backlog(
         self,
     ):
         self.enable_web_submission()
         self.enable_notifications()
-        # Complete materials in another channel must neither hide this seminar
-        # nor be counted in the progress displayed to the presenter.
+        # Even a large older backlog must not create requests on other days.
+        # Today's materials in another channel do not count in this scope.
         self.seed_legacy_document(kind="slides")
         for index in range(1, 4):
             self.seed_legacy_document(
                 attachment_id=500 + index, title=f"Hidden Source Research Paper {index}"
             )
+        today = date(2026, 10, 29)
+        session = self.bot.store.session_on(1, today)
         with self.bot.store.db:
-            self.bot.store.db.execute("UPDATE documents SET source_channel_id=999")
+            self.bot.store.db.execute(
+                "UPDATE documents SET source_channel_id=999, session_id=?", (session["id"],)
+            )
         channel = Mock(spec=discord.TextChannel)
         channel.guild = SimpleNamespace(id=1)
         channel.send = AsyncMock(return_value=SimpleNamespace(id=903))
-        first_day = date(2026, 10, 28)
-        next_day = date(2026, 10, 29)
         with (
             patch.object(self.bot, "reload_rotation_file", AsyncMock()),
             patch.object(self.bot, "get_guild", return_value=SimpleNamespace(id=1)),
+            patch.object(
+                self.bot,
+                "presenter_names",
+                AsyncMock(return_value={101: "Presenter One", 102: "Presenter Two"}),
+            ),
             patch.object(self.bot, "get_channel", return_value=channel),
             patch("seminar_bot.bot.datetime") as clock,
         ):
             clock.now.return_value = datetime(2026, 10, 28, 9, tzinfo=UTC)
             await self.bot.reminders()
             await self.bot.reminders()
-            self.assertEqual(channel.send.await_count, 1)
-            first_text = channel.send.await_args.args[0]
-            self.assertIn(str(DAY), first_text)
-            self.assertNotIn("오늘", first_text)
-            self.assertIn("현재: 발표 자료 0개", first_text)
-            self.assertIn("논문 0", first_text)
+            channel.send.assert_not_awaited()
             clock.now.return_value = datetime(2026, 10, 29, 9, tzinfo=UTC)
             await self.bot.reminders()
             await self.bot.reminders()
-        self.assertEqual(channel.send.await_count, 2)
-        second_text = channel.send.await_args.args[0]
-        self.assertIn(str(DAY + timedelta(weeks=1)), second_text)
+            self.assertEqual(channel.send.await_count, 1)
+            text = channel.send.await_args.args[0]
+            self.assertIn(str(today), text)
+            self.assertNotIn(str(DAY), text)
+            self.assertNotIn(str(DAY + timedelta(weeks=1)), text)
+            self.assertIn("현재: 발표 자료 0개", text)
+            self.assertIn("논문 0", text)
+            clock.now.return_value = datetime(2026, 10, 30, 9, tzinfo=UTC)
+            await self.bot.reminders()
+        self.assertEqual(channel.send.await_count, 1)
         deliveries = [
             dict(row)
             for row in self.bot.store.db.execute(
@@ -356,13 +370,8 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             deliveries,
             [
                 {
-                    "session_id": self.bot.store.session_on(1, DAY)["id"],
-                    "on_date": str(first_day),
-                    "kind": "evening",
-                },
-                {
-                    "session_id": self.bot.store.session_on(1, DAY + timedelta(weeks=1))["id"],
-                    "on_date": str(next_day),
+                    "session_id": session["id"],
+                    "on_date": str(today),
                     "kind": "evening",
                 },
             ],
@@ -392,7 +401,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(DAY.isoformat(), holiday)
         self.assertNotIn("14:00", holiday)
         self.assertIn((DAY + timedelta(days=7)).isoformat(), presentations[0])
-        for text in ("매주 목요일", "14:00", "Asia/Seoul", "아침 09:00", "저녁 18:00"):
+        for text in ("매주 목요일", "14:00", "Asia/Seoul", "일정 안내 09:00", "종료 후 18:00"):
             self.assertIn(text, embed.footer.text)
 
     async def test_schedule_without_seminar_time_has_explicit_unset_footer(self):
@@ -431,8 +440,10 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             await self.bot.tree.get_command("일정").callback(interaction, 2)
         lines = interaction.followup.send.await_args.kwargs["embed"].description.splitlines()
         self.assertEqual(len(lines), 3)
-        self.assertEqual(lines[0], f"**{DAY}** · Presenter A (지난 발표)")
-        self.assertEqual(lines[1], f"**{DAY + timedelta(weeks=1)}** · Presenter B")
+        self.assertEqual(lines[0], f"{DAY} · Presenter A (지난 발표)")
+        self.assertEqual(
+            lines[1], f"🔵 **이번 주 발표 · {DAY + timedelta(weeks=1)} · Presenter B**"
+        )
         self.assertNotIn("지난 발표", lines[1])
         self.assertEqual("\n".join(self.bot.store.db.iterdump()), before)
         with self.bot.store.db:
@@ -568,6 +579,11 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(self.bot, "reload_rotation_file", AsyncMock()),
             patch.object(self.bot, "get_guild", return_value=SimpleNamespace(id=1)),
+            patch.object(
+                self.bot,
+                "presenter_names",
+                AsyncMock(return_value={101: "Presenter One", 102: "Presenter Two"}),
+            ),
             patch.object(self.bot, "get_channel", return_value=channel),
             patch("seminar_bot.bot.datetime") as clock,
         ):
@@ -629,8 +645,9 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         for feature in (
             "/설정",
             "세미나시간",
-            "아침",
-            "저녁",
+            "일정안내",
+            "시작전알림",
+            "종료후알림",
             "config/rotation.json",
             "presenters",
             "/일정",
@@ -652,7 +669,10 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertRegex(text, r"서버\s*ID\s*(?:없|불필요|입력하지)")
         self.assertRegex(text, r"(?:과거|지난)[^\n]{0,10}예정")
         self.assertRegex(text, r"(?:수동|직접)\s*입력")
-        self.assertRegex(text, r"아침[^\n]*저녁[^\n]*별도")
+        self.assertIn("12:00·15:45·17:00", text)
+        self.assertIn("당일 포함 4주", text)
+        self.assertIn("당일 발표", text)
+        self.assertIn("지난 회차는 요청하지 않", text)
         schedule = next(line for line in text.splitlines() if line.startswith("/일정"))
         self.assertIn("시작", schedule)
         self.assertIn("휴강", schedule)
@@ -667,7 +687,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("자료 채널", configure)
         self.assertNotIn("자동 등록", text)
         self.assertNotIn("upload_channel", text)
-        for term in ("OFF", "알림시작일", "하루 1건", "회차별 한 번"):
+        for term in ("OFF", "알림시작일", "시작 전·종료 후", "각 한 번"):
             self.assertIn(term, text)
 
     async def test_help_without_web_configuration_never_advertises_discord_attachment_submission(
@@ -1221,6 +1241,11 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(self.bot, "reload_rotation_file", AsyncMock()),
             patch.object(self.bot, "get_guild", return_value=SimpleNamespace(id=1)) as guild,
+            patch.object(
+                self.bot,
+                "presenter_names",
+                AsyncMock(return_value={101: "Presenter One", 102: "Presenter Two"}),
+            ),
             patch.object(self.bot, "get_channel", return_value=channel) as get_channel,
             patch("seminar_bot.bot.datetime") as clock,
         ):
@@ -1244,6 +1269,11 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         channel.send = AsyncMock(return_value=SimpleNamespace(id=999))
         with (
             patch.object(self.bot, "get_guild", return_value=SimpleNamespace(id=1)),
+            patch.object(
+                self.bot,
+                "presenter_names",
+                AsyncMock(return_value={101: "Presenter One", 102: "Presenter Two"}),
+            ),
             patch.object(self.bot, "get_channel", return_value=channel),
             patch("seminar_bot.bot.datetime") as clock,
         ):
@@ -1273,6 +1303,11 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         )
         with (
             patch.object(self.bot, "get_guild", return_value=SimpleNamespace(id=1)),
+            patch.object(
+                self.bot,
+                "presenter_names",
+                AsyncMock(return_value={101: "Presenter One", 102: "Presenter Two"}),
+            ),
             patch.object(self.bot, "get_channel", return_value=channel),
             patch("seminar_bot.bot.datetime") as clock,
         ):
@@ -1463,6 +1498,11 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         channel.send = AsyncMock(return_value=SimpleNamespace(id=1000))
         with (
             patch.object(self.bot, "get_guild", return_value=SimpleNamespace(id=1)),
+            patch.object(
+                self.bot,
+                "presenter_names",
+                AsyncMock(return_value={101: "Presenter One", 102: "Presenter Two"}),
+            ),
             patch.object(self.bot, "get_channel", return_value=channel),
             patch("seminar_bot.bot.datetime") as clock,
         ):
@@ -1489,6 +1529,11 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(self.bot, "reload_rotation_file", AsyncMock()),
             patch.object(self.bot, "get_guild", return_value=SimpleNamespace(id=1)),
+            patch.object(
+                self.bot,
+                "presenter_names",
+                AsyncMock(return_value={101: "Presenter One", 102: "Presenter Two"}),
+            ),
             patch.object(self.bot, "get_channel", return_value=channel),
             patch("seminar_bot.bot.datetime") as clock,
         ):
