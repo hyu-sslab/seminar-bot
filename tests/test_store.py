@@ -131,7 +131,7 @@ class StoreTests(unittest.TestCase):
         self.store.close()
         self.store = Store(self.path)
         self.assertEqual(self.store.require_config(1)["seminar_time"], "14:30")
-        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 10)
+        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 11)
 
     def test_seminar_time_accepts_midnight_and_last_minute_without_reminder_order_constraints(self):
         for value in ("00:00", "23:59"):
@@ -172,7 +172,7 @@ class StoreTests(unittest.TestCase):
         )
         config = self.store.require_config(1)
         before = self.history()
-        for value in ("", "9:00", "24:00", "12:60", "14:30:00", " 14:30 ", True, 1430):
+        for value in ("", "9:00", "24:00", "12:60", "14:30:00", True, 1430):
             for guild_id in (1, 2):
                 with self.subTest(value=value, guild_id=guild_id), self.assertRaises(UserError):
                     self.store.configure(
@@ -197,7 +197,7 @@ class StoreTests(unittest.TestCase):
         )
         self.store.close()
         self.store = Store(self.path)
-        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 10)
+        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 11)
         column = next(
             row
             for row in self.store.db.execute("PRAGMA table_info(guilds)")
@@ -216,11 +216,11 @@ class StoreTests(unittest.TestCase):
         with sqlite3.connect(future) as db:
             db.execute("CREATE TABLE sentinel(value TEXT)")
             db.execute("INSERT INTO sentinel VALUES('keep')")
-            db.execute("PRAGMA user_version=11")
+            db.execute("PRAGMA user_version=12")
         with self.assertRaisesRegex(ValueError, "버전"):
             Store(future)
         with sqlite3.connect(future) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 11)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 12)
             self.assertEqual(db.execute("SELECT * FROM sentinel").fetchall(), [("keep",)])
             self.assertEqual(
                 db.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall(),
@@ -241,7 +241,7 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.store.require_config(1)["notifications_enabled"], 0)
         self.assertIsNone(self.store.require_config(1)["reminder_start_date"])
         self.assertEqual(self.history(), before)
-        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 10)
+        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 11)
         self.assertEqual(
             SubmissionAccess(self.store).validate(token, 1, now=1_700_000_003)["presenter_id"], 101
         )
@@ -291,10 +291,12 @@ class StoreTests(unittest.TestCase):
         }
         with self.store.db:
             self.store.db.execute("ALTER TABLE guilds DROP COLUMN before_reminder")
+            self.store.db.execute("ALTER TABLE guilds DROP COLUMN before_minutes")
+            self.store.db.execute("ALTER TABLE guilds DROP COLUMN after_minutes")
             self.store.db.execute("PRAGMA user_version=9")
         self.store.close()
         self.store = Store(self.path)
-        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 10)
+        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 11)
         self.assertEqual(self.store.require_config(1), config)
         self.assertIsNone(self.store.require_config(1)["before_reminder"])
         self.assertEqual(self.history(), before)
@@ -471,6 +473,244 @@ class StoreTests(unittest.TestCase):
             SubmissionAccess(self.store).validate(token, 1, now=1_700_000_003)["presenter_id"],
             101,
         )
+
+    def test_minute_offsets_follow_start_time_and_keep_all_existing_history(self):
+        _, token = self.seed_history_and_submission_access()
+        before = self.history()
+        cursor = {
+            key: self.store.require_config(1)[key]
+            for key in ("rotation", "next_date", "next_index")
+        }
+        self.store.configure(
+            1,
+            1001,
+            1002,
+            3,
+            "12:00",
+            "17:00",
+            "Asia/Seoul",
+            NOW,
+            seminar_time="16:00",
+            before_minutes=15,
+            after_minutes=60,
+            notifications_enabled=True,
+            reminder_start_date=TODAY,
+        )
+        config = self.store.require_config(1)
+        self.assertEqual((config["before_reminder"], config["evening"]), ("15:45", "17:00"))
+        self.assertEqual((config["before_minutes"], config["after_minutes"]), (15, 60))
+        self.store.configure(
+            1,
+            1001,
+            1002,
+            3,
+            "12:00",
+            "17:00",
+            "Asia/Seoul",
+            NOW,
+            seminar_time="15:00",
+        )
+        config = self.store.require_config(1)
+        self.assertEqual((config["before_reminder"], config["evening"]), ("14:45", "16:00"))
+        self.assertEqual((config["before_minutes"], config["after_minutes"]), (15, 60))
+        self.store.configure(
+            1,
+            1001,
+            1002,
+            3,
+            "12:00",
+            "16:00",
+            "Asia/Seoul",
+            NOW,
+            before_minutes=30,
+            after_minutes=90,
+        )
+        config = self.store.require_config(1)
+        self.assertEqual((config["before_reminder"], config["evening"]), ("14:30", "16:30"))
+        self.assertEqual((config["before_minutes"], config["after_minutes"]), (30, 90))
+        self.store.close()
+        self.store = Store(self.path)
+        self.assertEqual(self.store.require_config(1), config)
+        self.assertEqual({key: config[key] for key in cursor}, cursor)
+        self.assertEqual(self.history(), before)
+        self.assertEqual(
+            SubmissionAccess(self.store).validate(token, 1, now=1_700_000_003)["presenter_id"],
+            101,
+        )
+
+    def test_independent_and_zero_minute_offsets_are_supported(self):
+        self.store.configure(
+            1,
+            1001,
+            1002,
+            3,
+            "12:00",
+            "17:00",
+            "Asia/Seoul",
+            NOW,
+            seminar_time="16:00",
+            before_minutes=0,
+        )
+        config = self.store.require_config(1)
+        self.assertEqual((config["before_reminder"], config["evening"]), ("16:00", "17:00"))
+        self.assertIsNone(config["after_minutes"])
+        self.store.configure(
+            2,
+            2001,
+            2002,
+            3,
+            "12:00",
+            "17:00",
+            "Asia/Seoul",
+            NOW,
+            seminar_time="16:00",
+            before_reminder="15:45",
+            after_minutes=0,
+        )
+        config = self.store.require_config(2)
+        self.assertEqual((config["before_reminder"], config["evening"]), ("15:45", "16:00"))
+        self.assertIsNone(config["before_minutes"])
+
+    def test_invalid_offsets_report_the_field_without_partial_mutation(self):
+        before = self.history()
+        config = self.store.require_config(1)
+        for field, label in (("before_minutes", "시작전분"), ("after_minutes", "시작후분")):
+            for value in (-1, 1440, True, False, "15", 15.0):
+                for guild_id in (1, 2):
+                    with (
+                        self.subTest(field=field, value=value, guild_id=guild_id),
+                        self.assertRaisesRegex(UserError, label),
+                    ):
+                        self.store.configure(
+                            guild_id,
+                            1001,
+                            1002,
+                            3,
+                            "12:00",
+                            "17:00",
+                            "Asia/Seoul",
+                            NOW,
+                            seminar_time="16:00",
+                            **{field: value},
+                        )
+                    self.assertEqual(self.store.require_config(1), config)
+                    self.assertEqual(self.history(), before)
+                    self.assertIsNone(self.store.config(2))
+        for kwargs, label in (
+            ({"before_minutes": 15}, "세미나시간"),
+            ({"seminar_time": "00:05", "before_minutes": 15}, "시작전분.*전날"),
+            ({"seminar_time": "23:45", "after_minutes": 60}, "시작후분.*다음 날"),
+            ({"seminar_time": "12:00", "before_minutes": 15}, "시작전분"),
+            ({"seminar_time": "16:00", "before_minutes": 0, "after_minutes": 0}, "시작전분"),
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaisesRegex(UserError, label):
+                self.store.configure(
+                    1, 1001, 1002, 3, "12:00", "17:00", "Asia/Seoul", NOW, **kwargs
+                )
+            self.assertEqual(self.store.require_config(1), config)
+            self.assertEqual(self.history(), before)
+
+    def test_schema_ten_upgrade_keeps_absolute_times_and_disables_offsets(self):
+        _, token = self.seed_history_and_submission_access()
+        self.store.configure(
+            1,
+            1001,
+            1002,
+            3,
+            "12:00",
+            "17:00",
+            "Asia/Seoul",
+            NOW,
+            seminar_time="16:00",
+            before_reminder="15:45",
+            notifications_enabled=True,
+            reminder_start_date=TODAY,
+        )
+        config, before = self.store.require_config(1), self.history()
+        with self.store.db:
+            self.store.db.execute("ALTER TABLE guilds DROP COLUMN before_minutes")
+            self.store.db.execute("ALTER TABLE guilds DROP COLUMN after_minutes")
+            self.store.db.execute("PRAGMA user_version=10")
+        self.store.close()
+        self.store = Store(self.path)
+        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 11)
+        self.assertEqual(self.store.require_config(1), config)
+        self.assertIsNone(self.store.require_config(1)["before_minutes"])
+        self.assertIsNone(self.store.require_config(1)["after_minutes"])
+        self.store.configure(
+            1,
+            1001,
+            1002,
+            3,
+            "12:00",
+            "17:00",
+            "Asia/Seoul",
+            NOW,
+            seminar_time="15:00",
+        )
+        updated = self.store.require_config(1)
+        self.assertEqual((updated["before_reminder"], updated["evening"]), ("15:45", "17:00"))
+        self.assertEqual(self.history(), before)
+        self.assertEqual(
+            SubmissionAccess(self.store).validate(token, 1, now=1_700_000_003)["presenter_id"],
+            101,
+        )
+
+    def test_time_input_normalizes_whitespace_and_fullwidth_then_stores_canonical_values(self):
+        self.assertEqual(parse_time("　１６：００　").isoformat(), "16:00:00")
+        self.assertEqual(parse_time(" 12:00 ").isoformat(), "12:00:00")
+        self.store.configure(
+            1,
+            1001,
+            1002,
+            3,
+            " １２：００ ",
+            "１７：００",
+            "Asia/Seoul",
+            NOW,
+            seminar_time="　１６：００　",
+            before_reminder="１５：４５",
+        )
+        config = self.store.require_config(1)
+        self.assertEqual(
+            (
+                config["morning"],
+                config["seminar_time"],
+                config["before_reminder"],
+                config["evening"],
+            ),
+            ("12:00", "16:00", "15:45", "17:00"),
+        )
+        for field, label in (
+            ("seminar_time", "세미나시간"),
+            ("morning", "일정안내"),
+            ("before_reminder", "시작 전 알림 시각"),
+            ("evening", "시작 후 알림 시각"),
+        ):
+            for value in ("bad", "16:00:00", "16시", "4:00", True):
+                arguments = {
+                    "morning": "12:00",
+                    "evening": "17:00",
+                    "seminar_time": "16:00",
+                    "before_reminder": "15:45",
+                    field: value,
+                }
+                with (
+                    self.subTest(field=field, value=value),
+                    self.assertRaisesRegex(UserError, label),
+                ):
+                    self.store.configure(
+                        1,
+                        1001,
+                        1002,
+                        3,
+                        arguments.pop("morning"),
+                        arguments.pop("evening"),
+                        "Asia/Seoul",
+                        NOW,
+                        **arguments,
+                    )
+                self.assertEqual(self.store.require_config(1), config)
 
     def test_postpone_moves_entire_schedule_and_generation_cursor(self):
         before = self.store.upcoming(1, TODAY, 20)

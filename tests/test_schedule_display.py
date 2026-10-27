@@ -12,6 +12,8 @@ CONFIG = {
     "morning": "12:00",
     "before_reminder": "15:45",
     "evening": "17:00",
+    "before_minutes": 15,
+    "after_minutes": 60,
 }
 
 
@@ -88,13 +90,43 @@ class ScheduleDisplayTests(unittest.TestCase):
         self.assertEqual(embed.title, "📢 앞으로 4주 세미나 일정")
         self.assertEqual(
             embed.footer.text,
-            "매주 목요일 16:00 (Asia/Seoul) · 일정 안내 12:00 / 시작 전 15:45 / 종료 후 17:00",
+            "매주 목요일 16:00 (Asia/Seoul) · 일정 안내 12:00 / 시작 15분 전 15:45 / 시작 60분 후 17:00",
         )
         legacy = build_schedule_embed(
-            {**CONFIG, "before_reminder": None}, [], [], date(2026, 10, 27), {}
+            {**CONFIG, "before_reminder": None, "before_minutes": None, "after_minutes": None},
+            [],
+            [],
+            date(2026, 10, 27),
+            {},
         )
         self.assertNotIn("시작 전", legacy.footer.text)
         self.assertNotIn("None", legacy.footer.text)
+        self.assertIn("종료 후 17:00", legacy.footer.text)
+
+    def test_custom_minute_offsets_show_the_resolved_times_after_a_start_time_change(self):
+        changed = {
+            **CONFIG,
+            "seminar_time": "14:30",
+            "before_minutes": 30,
+            "after_minutes": 90,
+            "before_reminder": "14:00",
+            "evening": "16:00",
+        }
+        embed = build_schedule_embed(
+            changed, [session("2026-10-29")], [], date(2026, 10, 27), {101: "발표자 하나"}
+        )
+        self.assertIn("14:30 · 발표자 하나", embed.description)
+        self.assertEqual(
+            embed.footer.text,
+            "매주 목요일 14:30 (Asia/Seoul) · 일정 안내 12:00 / 시작 30분 전 14:00 / 시작 90분 후 16:00",
+        )
+        self.assertNotIn("종료 후", embed.footer.text)
+
+    def test_legacy_absolute_alarm_times_remain_visible_without_minute_offsets(self):
+        config = {**CONFIG, "before_minutes": None, "after_minutes": None}
+        embed = build_schedule_embed(config, [], [], date(2026, 10, 27), {})
+        self.assertIn("시작 전 15:45 / 종료 후 17:00", embed.footer.text)
+        self.assertNotIn("None분", embed.footer.text)
 
     def test_missing_name_is_plain_text_and_input_collections_are_not_mutated(self):
         rows = [session("2026-10-29", 103)]

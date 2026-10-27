@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import unicodedata
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path, PurePosixPath
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -43,6 +44,9 @@ def parse_date(value: str) -> date:
 
 
 def parse_time(value: str) -> time:
+    if not isinstance(value, str):
+        raise UserError("시간은 HH:MM 형식으로 입력해주세요. 예: 09:00")
+    value = unicodedata.normalize("NFKC", value.strip())
     if not re.fullmatch(r"[0-9]{2}:[0-9]{2}", value):
         raise UserError("시간은 HH:MM 형식으로 입력해주세요. 예: 09:00")
     try:
@@ -87,7 +91,7 @@ class Store:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.execute("PRAGMA busy_timeout=5000")
-        if self.db.execute("PRAGMA user_version").fetchone()[0] > 10:
+        if self.db.execute("PRAGMA user_version").fetchone()[0] > 11:
             self.db.close()
             raise ValueError("데이터베이스 버전이 봇보다 새롭습니다. 봇을 업데이트해주세요.")
         self.db.executescript("""
@@ -99,6 +103,8 @@ class Store:
                 morning TEXT NOT NULL,
                 evening TEXT NOT NULL,
                 before_reminder TEXT,
+                before_minutes INTEGER CHECK(before_minutes BETWEEN 0 AND 1439),
+                after_minutes INTEGER CHECK(after_minutes BETWEEN 0 AND 1439),
                 timezone TEXT NOT NULL,
                 seminar_time TEXT,
                 notifications_enabled INTEGER NOT NULL DEFAULT 0 CHECK(notifications_enabled IN (0,1)),
@@ -223,6 +229,8 @@ class Store:
                 ),
                 ("reminder_start_date", "TEXT"),
                 ("before_reminder", "TEXT"),
+                ("before_minutes", "INTEGER CHECK(before_minutes BETWEEN 0 AND 1439)"),
+                ("after_minutes", "INTEGER CHECK(after_minutes BETWEEN 0 AND 1439)"),
             ):
                 if name not in guild_columns:
                     self.db.execute(f"ALTER TABLE guilds ADD COLUMN {name} {definition}")
@@ -289,7 +297,7 @@ class Store:
                     "WHERE a.id=NEW.archive_presentation_id AND a.guild_id=NEW.guild_id)) "
                     "BEGIN SELECT RAISE(ABORT,'Invalid archive presentation reference'); END"
                 )
-            self.db.execute("PRAGMA user_version=10")
+            self.db.execute("PRAGMA user_version=11")
 
     def close(self) -> None:
         self.db.close()
@@ -322,21 +330,33 @@ class Store:
         notifications_enabled: bool | None = None,
         reminder_start_date: date | None = None,
         before_reminder: str | None = None,
+        before_minutes: int | None = None,
+        after_minutes: int | None = None,
     ) -> int:
         if weekday not in range(7):
             raise UserError("요일 값이 올바르지 않습니다.")
-        if seminar_time is not None:
-            if not isinstance(seminar_time, str):
-                raise UserError("세미나 시작 시간은 HH:MM 형식으로 입력해주세요.")
-            parse_time(seminar_time)
-        if notifications_enabled is not None and type(notifications_enabled) is not bool:
-            raise UserError("알림 설정은 켜기 또는 끄기를 선택해주세요.")
-        if reminder_start_date is not None and type(reminder_start_date) is not date:
-            raise UserError("알림 시작일은 YYYY-MM-DD 날짜로 입력해주세요.")
-        announcement_time, after_time = parse_time(morning), parse_time(evening)
-        if announcement_time >= after_time:
-            raise UserError("일정 안내 시간은 종료 후 요청 시간보다 빨라야 합니다.")
+
+        def clock(value: object, label: str) -> time:
+            try:
+                return parse_time(value)
+            except UserError as exc:
+                raise UserError(f"{label}: {exc}") from exc
+
+        def offset(value: object, label: str) -> int | None:
+            if value is not None and (type(value) is not int or not 0 <= value <= 1439):
+                raise UserError(f"{label}: 0~1439분 범위의 정수를 입력해주세요.")
+            return value
+
         old = self.config(guild_id)
+        start = (
+            seminar_time if seminar_time is not None else old.get("seminar_time") if old else None
+        )
+        start_time = clock(start, "세미나시간") if start is not None else None
+        start = start_time.strftime("%H:%M") if start_time is not None else None
+        announcement_time, after_time = (
+            clock(morning, "일정안내"),
+            clock(evening, "시작 후 알림 시각"),
+        )
         before = (
             before_reminder
             if before_reminder is not None
@@ -344,12 +364,57 @@ class Store:
             if old
             else None
         )
-        if before is not None:
-            if not isinstance(before, str):
-                raise UserError("시작 전 알림 시간은 HH:MM 형식으로 입력해주세요.")
-            if not announcement_time < parse_time(before) < after_time:
+        before_time = clock(before, "시작 전 알림 시각") if before is not None else None
+        before_offset = offset(
+            before_minutes
+            if before_minutes is not None
+            else old.get("before_minutes")
+            if old
+            else None,
+            "시작전분",
+        )
+        after_offset = offset(
+            after_minutes
+            if after_minutes is not None
+            else old.get("after_minutes")
+            if old
+            else None,
+            "시작후분",
+        )
+        if before_offset is not None or after_offset is not None:
+            if start_time is None:
                 raise UserError(
-                    "알림 시간은 일정 안내 < 시작 전 요청 < 종료 후 요청 순서여야 합니다."
+                    "세미나시간: 시작 전·후 알림을 분 단위로 설정하려면 세미나 시작 시간을 지정해주세요."
+                )
+            start_minute = start_time.hour * 60 + start_time.minute
+            if before_offset is not None:
+                value = start_minute - before_offset
+                if value < 0:
+                    raise UserError(
+                        "시작전분: 계산한 알림이 전날로 넘어갑니다. 같은 날 00:00 이후가 되도록 분 값을 줄여주세요."
+                    )
+                before_time = time(value // 60, value % 60)
+            if after_offset is not None:
+                value = start_minute + after_offset
+                if value >= 1440:
+                    raise UserError(
+                        "시작후분: 계산한 알림이 다음 날로 넘어갑니다. 같은 날 23:59 이내가 되도록 분 값을 줄여주세요."
+                    )
+                after_time = time(value // 60, value % 60)
+        morning = announcement_time.strftime("%H:%M")
+        evening = after_time.strftime("%H:%M")
+        before = before_time.strftime("%H:%M") if before_time is not None else None
+        if notifications_enabled is not None and type(notifications_enabled) is not bool:
+            raise UserError("알림 설정은 켜기 또는 끄기를 선택해주세요.")
+        if reminder_start_date is not None and type(reminder_start_date) is not date:
+            raise UserError("알림 시작일은 YYYY-MM-DD 날짜로 입력해주세요.")
+        if announcement_time >= after_time:
+            raise UserError("일정안내: 시작 후 요청 시각보다 빨라야 합니다.")
+        if before_time is not None:
+            if not announcement_time < before_time < after_time:
+                label = "시작전분" if before_offset is not None else "시작 전 알림 시각"
+                raise UserError(
+                    f"{label}: 알림 시각은 일정안내 < 시작 전 요청 < 시작 후 요청 순서여야 합니다."
                 )
         try:
             zone = ZoneInfo(timezone)
@@ -401,7 +466,7 @@ class Store:
                 """
                 INSERT INTO guilds(guild_id, channel_id, upload_channel_id, weekday,
                     morning, evening, timezone, seminar_time, notifications_enabled,
-                    reminder_start_date, before_reminder) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                    reminder_start_date, before_reminder, before_minutes, after_minutes) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(guild_id) DO UPDATE SET
                     channel_id=excluded.channel_id, upload_channel_id=excluded.upload_channel_id,
                     weekday=excluded.weekday, morning=excluded.morning,
@@ -409,7 +474,9 @@ class Store:
                     seminar_time=COALESCE(excluded.seminar_time, guilds.seminar_time),
                     notifications_enabled=excluded.notifications_enabled,
                     reminder_start_date=excluded.reminder_start_date,
-                    before_reminder=excluded.before_reminder
+                    before_reminder=excluded.before_reminder,
+                    before_minutes=excluded.before_minutes,
+                    after_minutes=excluded.after_minutes
             """,
                 (
                     guild_id,
@@ -419,10 +486,12 @@ class Store:
                     morning,
                     evening,
                     timezone,
-                    seminar_time,
+                    start,
                     int(enabled),
                     reminder_start,
                     before,
+                    before_offset,
+                    after_offset,
                 ),
             )
         return delta

@@ -259,7 +259,14 @@ class SeminarBot(discord.Client):
                                 else "`/제출` 명령으로 본인 전용 임시 링크를 받아 발표 자료와 참고 논문을 등록해주세요."
                             )
                         else:
-                            phase = "⏰ 시작 전" if kind == "before" else "🌙 종료 후"
+                            if kind == "before":
+                                phase = "⏰ 시작 전"
+                                if config.get("before_minutes") is not None:
+                                    phase += f" ({config['before_minutes']}분 전)"
+                            elif config.get("after_minutes") is not None:
+                                phase = f"⏰ 시작 {config['after_minutes']}분 후"
+                            else:
+                                phase = "🌙 종료 후"
                             if self.web_submission_enabled(config["guild_id"]):
                                 text = (
                                     f"{phase} 자료 확인 · {mention}\n"
@@ -497,17 +504,17 @@ class SeminarBot(discord.Client):
             notifications="알림",
             reminder_start_date="알림시작일",
             morning="일정안내",
-            before_reminder="시작전알림",
-            evening="종료후알림",
+            before_minutes="시작전분",
+            after_minutes="시작후분",
         )
         @app_commands.describe(
             weekday="세미나 요일",
             channel="알림을 보낼 채널",
             morning="당일 포함 4주 일정 안내 HH:MM (신규 기본 12:00, 생략 시 기존 유지)",
-            before_reminder="시작 전 미제출 자료 요청 HH:MM (신규 기본 15:45, 생략 시 기존 유지)",
-            evening="종료 후 미제출 자료 요청 HH:MM (신규 기본 17:00, 생략 시 기존 유지)",
+            before_minutes="시작 몇 분 전에 자료를 요청할지 (기본 15분, 생략 시 기존 분 설정 유지)",
+            after_minutes="시작 몇 분 후에 자료를 요청할지 (기본 60분, 생략 시 기존 분 설정 유지)",
             timezone="시간대 (기본 Asia/Seoul)",
-            seminar_time="매주 세미나 시작 시각 HH:MM (필수, 예: 14:00)",
+            seminar_time="매주 세미나 시작 시각 HH:MM (필수, 예: 16:00)",
             notifications="알림 끄기/켜기 (생략하면 기존 설정 유지, 최초 OFF)",
             reminder_start_date="처음 알림을 켤 때 기준으로 삼을 등록된 회차 날짜 YYYY-MM-DD",
         )
@@ -517,11 +524,11 @@ class SeminarBot(discord.Client):
             channel: discord.TextChannel,
             seminar_time: str,
             morning: str | None = None,
-            evening: str | None = None,
             timezone: str = "Asia/Seoul",
             notifications: str | None = None,
             reminder_start_date: str | None = None,
-            before_reminder: str | None = None,
+            before_minutes: app_commands.Range[int, 0, 1439] | None = None,
+            after_minutes: app_commands.Range[int, 0, 1439] | None = None,
         ) -> None:
             if notifications is not None and notifications not in {"off", "on"}:
                 raise UserError("알림은 끄기 또는 켜기를 선택해주세요.")
@@ -544,6 +551,12 @@ class SeminarBot(discord.Client):
             async with self.schedule_lock:
                 previous = self.store.config(interaction.guild_id)
                 upload_channel_id = previous["upload_channel_id"] if previous else channel.id
+                before = before_minutes
+                after = after_minutes
+                if before is None and previous:
+                    before = previous.get("before_minutes")
+                if after is None and previous:
+                    after = previous.get("after_minutes")
                 delta = self.store.configure(
                     interaction.guild_id,
                     channel.id,
@@ -554,33 +567,22 @@ class SeminarBot(discord.Client):
                     else previous["morning"]
                     if previous
                     else "12:00",
-                    evening
-                    if evening is not None
-                    else previous["evening"]
-                    if previous
-                    else "17:00",
+                    previous["evening"] if previous else "17:00",
                     timezone,
                     seminar_time=seminar_time,
                     notifications_enabled=notifications == "on"
                     if notifications is not None
                     else None,
                     reminder_start_date=start_date,
-                    before_reminder=before_reminder
-                    if before_reminder is not None
-                    else None
-                    if previous
-                    else "15:45",
+                    before_minutes=15 if before is None else before,
+                    after_minutes=60 if after is None else after,
                 )
                 config = self.store.require_config(interaction.guild_id)
             text = (
                 f"{safe(weekly_schedule(config))}\n"
                 f"알림: 일정 안내 {config['morning']}"
-                + (
-                    f" / 시작 전 {config['before_reminder']}"
-                    if config.get("before_reminder")
-                    else ""
-                )
-                + f" / 종료 후 {config['evening']}\n"
+                f" / 시작 {config['before_minutes']}분 전 {config['before_reminder']}"
+                f" / 시작 {config['after_minutes']}분 후 {config['evening']}\n"
                 f"알림 상태: {'ON' if config['notifications_enabled'] else 'OFF'} · "
                 f"알림 시작일: {config['reminder_start_date'] or '미설정'}\n"
                 f"알림 채널: {channel.mention}"
@@ -891,11 +893,13 @@ class SeminarBot(discord.Client):
                 "`/검색`으로도 논문 검색 가능하며 종류 옵션에서 발표 자료나 전체를 선택할 수 있습니다.\n\n"
                 "**서버 관리자**\n"
                 "`/설정` 요일·**세미나시간**(매주 고정 시작 시각, 필수)·알림 채널 지정\n"
-                "`일정안내`·`시작전알림`·`종료후알림`에 시각을 지정합니다. 신규 기본값은 12:00·15:45·17:00입니다.\n"
+                "`일정안내`는 시각을 지정하며 신규 기본값은 12:00입니다.\n"
+                "자료 요청은 기본 **시작 15분 전 / 시작 60분 후**이며, `시작전분`·`시작후분`으로 변경할 수 있습니다.\n"
+                "세미나 시작 시각을 바꾸면 자료 요청 시각도 자동으로 변경됩니다.\n"
                 "일정 안내는 당일 포함 4주 일정을 보내고 이번 주 발표자만 멘션합니다.\n"
                 "알림은 기본 OFF. `/설정`의 `알림`(켜기/끄기)으로 변경하며 생략하면 기존 상태를 유지합니다.\n"
                 "처음 켤 때 `알림시작일`에 등록된 회차 날짜를 지정하세요.\n"
-                "시작 전·종료 후 요청은 시작일 이후 당일 발표의 자료가 미완료일 때 각 한 번만 보냅니다.\n"
+                "시작 전·시작 후 요청은 시작일 이후 당일 발표의 자료가 미완료일 때 각 한 번만 보냅니다.\n"
                 "지난 회차는 요청하지 않으며 재시작 때 지난 알림 시간을 몰아 보내지 않습니다.\n"
                 "발표 순서는 NAS의 `config/rotation.json`의 `presenters`에서 편집 (서버 한 곳이면 서버 ID 불필요)\n"
                 "파일 저장 후 30초 안에 적용하며 `/일정`을 열 때도 확인합니다.\n"

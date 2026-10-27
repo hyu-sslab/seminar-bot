@@ -214,7 +214,7 @@ class SubmissionAccessStoreTests(unittest.TestCase):
         self.access = SubmissionAccess(self.store)
         self.assertEqual(self.store.document(1, record_id), original)
         self.assertEqual(self.store.session(1, self.row["id"]), self.row)
-        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 10)
+        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 11)
         invitation, _ = self.issue()
         grant, _ = self.access.redeem(invitation, 1, now=101)
         self.assertEqual(self.access.validate(grant, 1, now=102)["session_id"], self.row["id"])

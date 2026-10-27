@@ -81,7 +81,11 @@ def build_schedule_embed(
     weekly += f" ({_safe(config['timezone'])})"
     stages = [f"일정 안내 {_safe(config['morning'])}"]
     if config.get("before_reminder"):
-        stages.append(f"시작 전 {_safe(config['before_reminder'])}")
-    stages.append(f"종료 후 {_safe(config['evening'])}")
+        before_minutes = config.get("before_minutes")
+        before_label = f"시작 {before_minutes}분 전" if before_minutes is not None else "시작 전"
+        stages.append(f"{before_label} {_safe(config['before_reminder'])}")
+    after_minutes = config.get("after_minutes")
+    after_label = f"시작 {after_minutes}분 후" if after_minutes is not None else "종료 후"
+    stages.append(f"{after_label} {_safe(config['evening'])}")
     embed.set_footer(text=weekly + " · " + " / ".join(stages))
     return embed

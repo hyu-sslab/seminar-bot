@@ -45,7 +45,8 @@ class NotificationWorkflowTests(unittest.IsolatedAsyncioTestCase):
             "Asia/Seoul",
             NOW,
             seminar_time="16:00",
-            before_reminder="15:45",
+            before_minutes=15,
+            after_minutes=60,
         )
         self.bot.store.set_rotation(1, [101, 102, 103, 104, 105], DAY, NOW.date())
         self.bot.store.configure(
@@ -136,7 +137,8 @@ class NotificationWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("<@", embed.description)
         self.assertIn("**이번 주 발표자: <@101>**", announcement.args[0])
         self.assertIn("시작 전", before.args[0])
-        self.assertIn("종료 후", after.args[0])
+        self.assertIn("시작 60분 후", after.args[0])
+        self.assertNotIn("종료 후", after.args[0])
         for call in (announcement, before, after):
             self.assertIn("/제출", call.args[0])
             self.assertIn("16:00 (Asia/Seoul)", call.args[0])
@@ -158,6 +160,64 @@ class NotificationWorkflowTests(unittest.IsolatedAsyncioTestCase):
         await self.tick(15, 45)
         await self.tick(17)
         self.assertEqual(self.channel.send.await_count, 1)
+
+    async def test_changing_start_time_moves_both_default_requests_without_repeating_announcement(
+        self,
+    ):
+        await self.tick(12)
+        self.bot.store.configure(
+            1,
+            1001,
+            1002,
+            3,
+            "12:00",
+            "17:00",
+            "Asia/Seoul",
+            NOW,
+            seminar_time="15:00",
+        )
+        for hour, minute, count in ((14, 44, 1), (14, 45, 2), (15, 45, 2), (16, 0, 3), (17, 0, 3)):
+            await self.tick(hour, minute)
+            self.assertEqual(self.channel.send.await_count, count)
+        before, after = self.channel.send.await_args_list[1:]
+        self.assertIn("15:00 (Asia/Seoul)", before.args[0])
+        self.assertIn("15:00 (Asia/Seoul)", after.args[0])
+        self.assertIn("15분 전", before.args[0])
+        self.assertIn("시작 60분 후", after.args[0])
+
+    async def test_custom_relative_offsets_follow_the_new_start_in_the_actual_delivery_loop(self):
+        self.bot.store.configure(
+            1,
+            1001,
+            1002,
+            3,
+            "12:00",
+            "17:00",
+            "Asia/Seoul",
+            NOW,
+            seminar_time="16:00",
+            before_minutes=30,
+            after_minutes=90,
+        )
+        self.bot.store.configure(
+            1,
+            1001,
+            1002,
+            3,
+            "12:00",
+            "17:30",
+            "Asia/Seoul",
+            NOW,
+            seminar_time="17:00",
+        )
+        for hour, minute, count in ((12, 0, 1), (16, 29, 1), (16, 30, 2), (18, 29, 2), (18, 30, 3)):
+            await self.tick(hour, minute)
+            self.assertEqual(self.channel.send.await_count, count)
+        before, after = self.channel.send.await_args_list[1:]
+        self.assertIn("30분 전", before.args[0])
+        self.assertIn("시작 90분 후", after.args[0])
+        self.assertIn("17:00 (Asia/Seoul)", before.args[0])
+        self.assertIn("17:00 (Asia/Seoul)", after.args[0])
 
     async def test_submission_between_requests_suppresses_the_after_seminar_request(self):
         await self.tick(15, 45)

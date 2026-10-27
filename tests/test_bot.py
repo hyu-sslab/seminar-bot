@@ -107,11 +107,15 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         option = next(item for item in options if item["name"] == "세미나시간")
         self.assertTrue(option["required"])
         self.assertNotIn("upload_channel", {item["name"] for item in options})
-        self.assertTrue(
-            {"일정안내", "시작전알림", "종료후알림"}.issubset({item["name"] for item in options})
-        )
-        self.assertNotIn("morning", {item["name"] for item in options})
-        self.assertNotIn("evening", {item["name"] for item in options})
+        names = {item["name"] for item in options}
+        self.assertTrue({"일정안내", "시작전분", "시작후분"}.issubset(names))
+        for removed in ("morning", "evening", "시작전알림", "종료후알림"):
+            self.assertNotIn(removed, names)
+        for name in ("시작전분", "시작후분"):
+            option = next(item for item in options if item["name"] == name)
+            self.assertEqual(option["type"], 4)
+            self.assertEqual((option["min_value"], option["max_value"]), (0, 1439))
+            self.assertFalse(option.get("required", False))
         interaction, target = self.configuration_interaction()
         sessions = [
             dict(row) for row in self.bot.store.db.execute("SELECT * FROM sessions ORDER BY id")
@@ -120,24 +124,46 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             await command.callback(interaction, 3, target, "14:00")
             configured = self.bot.store.require_config(1)
             self.assertEqual(
-                (configured["seminar_time"], configured["morning"], configured["evening"]),
-                ("14:00", "09:00", "18:00"),
+                (
+                    configured["seminar_time"],
+                    configured["morning"],
+                    configured["before_reminder"],
+                    configured["evening"],
+                    configured["before_minutes"],
+                    configured["after_minutes"],
+                ),
+                ("14:00", "09:00", "13:45", "15:00", 15, 60),
             )
             response = interaction.followup.send.await_args.args[0]
             self.assertIn("매주 목요일 14:00 (Asia/Seoul)", response)
-            self.assertIn("알림: 일정 안내 09:00 / 종료 후 18:00", response)
+            self.assertIn(
+                "알림: 일정 안내 09:00 / 시작 15분 전 13:45 / 시작 60분 후 15:00", response
+            )
             self.assertIn("알림 상태: OFF", response)
             await command.callback(
-                interaction, 3, target, "15:30", morning="08:20", evening="19:10"
+                interaction,
+                3,
+                target,
+                "15:30",
+                morning="08:20",
+                before_minutes=30,
+                after_minutes=90,
             )
         configured = self.bot.store.require_config(1)
         self.assertEqual(
-            (configured["seminar_time"], configured["morning"], configured["evening"]),
-            ("15:30", "08:20", "19:10"),
+            (
+                configured["seminar_time"],
+                configured["morning"],
+                configured["before_reminder"],
+                configured["evening"],
+                configured["before_minutes"],
+                configured["after_minutes"],
+            ),
+            ("15:30", "08:20", "15:00", "17:00", 30, 90),
         )
         response = interaction.followup.send.await_args.args[0]
         self.assertIn("매주 목요일 15:30 (Asia/Seoul)", response)
-        self.assertIn("알림: 일정 안내 08:20 / 종료 후 19:10", response)
+        self.assertIn("알림: 일정 안내 08:20 / 시작 30분 전 15:00 / 시작 90분 후 17:00", response)
         self.assertEqual(
             [dict(row) for row in self.bot.store.db.execute("SELECT * FROM sessions ORDER BY id")],
             sessions,
@@ -157,10 +183,97 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         )
         text = interaction.followup.send.await_args.args[0]
         self.assertIn("매주 목요일 14:00 (Asia/Seoul)", text)
-        self.assertIn("알림: 일정 안내 12:00 / 시작 전 15:45 / 종료 후 17:00", text)
+        self.assertIn("알림: 일정 안내 12:00 / 시작 15분 전 13:45 / 시작 60분 후 15:00", text)
+        self.assertEqual((config["before_minutes"], config["after_minutes"]), (15, 60))
         self.assertNotIn("자료:", text)
         self.assertFalse(config["notifications_enabled"])
         self.assertIsNone(config["reminder_start_date"])
+
+    async def test_relative_reminder_defaults_follow_a_changed_start_time(self):
+        command = self.bot.tree.get_command("설정")
+        interaction, target = self.configuration_interaction()
+        before = {
+            table: [
+                tuple(row)
+                for row in self.bot.store.db.execute(f"SELECT * FROM {table} ORDER BY rowid")
+            ]
+            for table in ("sessions", "documents", "deliveries", "submission_grants")
+        }
+        cursor = self.bot.store.require_config(1)
+        with patch.object(self.bot, "reload_rotation_file", AsyncMock()):
+            await command.callback(interaction, 3, target, "16:00")
+            configured = self.bot.store.require_config(1)
+            self.assertEqual(
+                (configured["before_reminder"], configured["evening"]), ("15:45", "17:00")
+            )
+            await command.callback(interaction, 3, target, "15:00")
+        configured = self.bot.store.require_config(1)
+        self.assertEqual(
+            (
+                configured["before_minutes"],
+                configured["after_minutes"],
+                configured["before_reminder"],
+                configured["evening"],
+            ),
+            (15, 60, "14:45", "16:00"),
+        )
+        for field in ("rotation", "next_date", "next_index"):
+            self.assertEqual(configured[field], cursor[field])
+        after = {
+            table: [
+                tuple(row)
+                for row in self.bot.store.db.execute(f"SELECT * FROM {table} ORDER BY rowid")
+            ]
+            for table in before
+        }
+        self.assertEqual(after, before)
+
+    async def test_custom_relative_minutes_are_preserved_when_options_are_omitted(self):
+        command = self.bot.tree.get_command("설정")
+        interaction, target = self.configuration_interaction()
+        with patch.object(self.bot, "reload_rotation_file", AsyncMock()):
+            await command.callback(
+                interaction,
+                3,
+                target,
+                "16:00",
+                morning="08:20",
+                before_minutes=30,
+                after_minutes=90,
+            )
+            await command.callback(interaction, 3, target, "17:00")
+        configured = self.bot.store.require_config(1)
+        self.assertEqual(
+            (
+                configured["morning"],
+                configured["before_minutes"],
+                configured["after_minutes"],
+                configured["before_reminder"],
+                configured["evening"],
+            ),
+            ("08:20", 30, 90, "16:30", "18:30"),
+        )
+        response = interaction.followup.send.await_args.args[0]
+        self.assertIn("시작 30분 전 16:30", response)
+        self.assertIn("시작 90분 후 18:30", response)
+
+    async def test_configuration_errors_identify_the_invalid_time_field_without_mutation(self):
+        command = self.bot.tree.get_command("설정")
+        interaction, target = self.configuration_interaction()
+        before = "\n".join(self.bot.store.db.iterdump())
+        with patch.object(self.bot, "reload_rotation_file", AsyncMock()):
+            for seminar_time, options, field in (
+                ("16", {}, "세미나시간"),
+                ("16:60", {}, "세미나시간"),
+                ("16:00", {"morning": "12"}, "일정안내"),
+                ("16:00", {"morning": "12:60"}, "일정안내"),
+            ):
+                with self.subTest(field=field, options=options):
+                    with self.assertRaises(UserError) as error:
+                        await command.callback(interaction, 3, target, seminar_time, **options)
+                    self.assertIn(field, str(error.exception))
+                    self.assertRegex(str(error.exception), r"HH:MM|00:00~23:59")
+                    self.assertEqual("\n".join(self.bot.store.db.iterdump()), before)
 
     async def test_configuration_toggle_is_explicit_preserves_start_date_and_never_resets_schedule(
         self,
@@ -251,7 +364,15 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             await self.bot.tree.get_command("설정").callback(interaction, 3, target, "14:00")
         self.assertEqual(
             self.bot.store.require_config(1),
-            {**before, "channel_id": 1009, "seminar_time": "14:00"},
+            {
+                **before,
+                "channel_id": 1009,
+                "seminar_time": "14:00",
+                "before_reminder": "13:45",
+                "evening": "15:00",
+                "before_minutes": 15,
+                "after_minutes": 60,
+            },
         )
         self.assertEqual(history(), original)
         self.assertEqual(self.bot.store.submission(1, session["id"]), progress)
@@ -646,8 +767,8 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             "/설정",
             "세미나시간",
             "일정안내",
-            "시작전알림",
-            "종료후알림",
+            "시작전분",
+            "시작후분",
             "config/rotation.json",
             "presenters",
             "/일정",
@@ -669,7 +790,9 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertRegex(text, r"서버\s*ID\s*(?:없|불필요|입력하지)")
         self.assertRegex(text, r"(?:과거|지난)[^\n]{0,10}예정")
         self.assertRegex(text, r"(?:수동|직접)\s*입력")
-        self.assertIn("12:00·15:45·17:00", text)
+        self.assertIn("12:00", text)
+        self.assertIn("시작 15분 전 / 시작 60분 후", text)
+        self.assertIn("시작 시각을 바꾸면", text)
         self.assertIn("당일 포함 4주", text)
         self.assertIn("당일 발표", text)
         self.assertIn("지난 회차는 요청하지 않", text)
@@ -687,7 +810,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("자료 채널", configure)
         self.assertNotIn("자동 등록", text)
         self.assertNotIn("upload_channel", text)
-        for term in ("OFF", "알림시작일", "시작 전·종료 후", "각 한 번"):
+        for term in ("OFF", "알림시작일", "시작 전·시작 후", "각 한 번"):
             self.assertIn(term, text)
 
     async def test_help_without_web_configuration_never_advertises_discord_attachment_submission(
