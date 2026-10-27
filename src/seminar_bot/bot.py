@@ -513,7 +513,6 @@ class SeminarBot(discord.Client):
             morning="당일 포함 4주 일정 안내 HH:MM (신규 기본 12:00, 생략 시 기존 유지)",
             before_minutes="시작 몇 분 전에 자료를 요청할지 (기본 15분, 생략 시 기존 분 설정 유지)",
             after_minutes="시작 몇 분 후에 자료를 요청할지 (기본 60분, 생략 시 기존 분 설정 유지)",
-            timezone="시간대 (기본 Asia/Seoul)",
             seminar_time="매주 세미나 시작 시각 HH:MM (필수, 예: 16:00)",
             notifications="알림 끄기/켜기 (생략하면 기존 설정 유지, 최초 OFF)",
             reminder_start_date="처음 알림을 켤 때 기준으로 삼을 등록된 회차 날짜 YYYY-MM-DD",
@@ -524,7 +523,6 @@ class SeminarBot(discord.Client):
             channel: discord.TextChannel,
             seminar_time: str,
             morning: str | None = None,
-            timezone: str = "Asia/Seoul",
             notifications: str | None = None,
             reminder_start_date: str | None = None,
             before_minutes: app_commands.Range[int, 0, 1439] | None = None,
@@ -568,7 +566,7 @@ class SeminarBot(discord.Client):
                     if previous
                     else "12:00",
                     previous["evening"] if previous else "17:00",
-                    timezone,
+                    "Asia/Seoul",
                     seminar_time=seminar_time,
                     notifications_enabled=notifications == "on"
                     if notifications is not None
@@ -893,6 +891,7 @@ class SeminarBot(discord.Client):
                 "`/검색`으로도 논문 검색 가능하며 종류 옵션에서 발표 자료나 전체를 선택할 수 있습니다.\n\n"
                 "**서버 관리자**\n"
                 "`/설정` 요일·**세미나시간**(매주 고정 시작 시각, 필수)·알림 채널 지정\n"
+                "모든 시각은 한국 시간(Asia/Seoul) 기준입니다.\n"
                 "`일정안내`는 시각을 지정하며 신규 기본값은 12:00입니다.\n"
                 "자료 요청은 기본 **시작 15분 전 / 시작 60분 후**이며, `시작전분`·`시작후분`으로 변경할 수 있습니다.\n"
                 "세미나 시작 시각을 바꾸면 자료 요청 시각도 자동으로 변경됩니다.\n"

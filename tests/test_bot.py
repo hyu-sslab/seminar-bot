@@ -109,7 +109,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("upload_channel", {item["name"] for item in options})
         names = {item["name"] for item in options}
         self.assertTrue({"일정안내", "시작전분", "시작후분"}.issubset(names))
-        for removed in ("morning", "evening", "시작전알림", "종료후알림"):
+        for removed in ("morning", "evening", "timezone", "시작전알림", "종료후알림"):
             self.assertNotIn(removed, names)
         for name in ("시작전분", "시작후분"):
             option = next(item for item in options if item["name"] == name)
@@ -169,6 +169,25 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             sessions,
         )
         self.assertTrue(interaction.followup.send.await_args.kwargs["ephemeral"])
+
+    async def test_configuration_uses_korean_time_without_a_timezone_option(self):
+        self.bot.store.configure(
+            1, 1001, 1002, 3, "09:00", "18:00", "UTC", NOW, seminar_time="16:00"
+        )
+        before = [
+            tuple(row) for row in self.bot.store.db.execute("SELECT * FROM sessions ORDER BY id")
+        ]
+        interaction, target = self.configuration_interaction()
+        with patch.object(self.bot, "reload_rotation_file", AsyncMock()):
+            await self.bot.tree.get_command("설정").callback(interaction, 3, target, "16:00")
+        config = self.bot.store.require_config(1)
+        self.assertEqual(config["timezone"], "Asia/Seoul")
+        self.assertEqual((config["before_reminder"], config["evening"]), ("15:45", "17:00"))
+        self.assertEqual(
+            [tuple(row) for row in self.bot.store.db.execute("SELECT * FROM sessions ORDER BY id")],
+            before,
+        )
+        self.assertIn("Asia/Seoul", interaction.followup.send.await_args.args[0])
 
     async def test_first_configuration_initializes_internal_scope_to_the_single_notification_channel(
         self,

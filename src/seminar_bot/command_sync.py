@@ -17,6 +17,16 @@ def _restore_commands(tree, commands, *, guild) -> None:
         tree.add_command(command, guild=guild, override=True)
 
 
+def _log_configure_options(commands) -> None:
+    """Report the schema Discord returned without exposing credentials or values."""
+    for command in commands:
+        if command.name != "설정":
+            continue
+        options = getattr(command, "options", None)
+        if options is not None:
+            log.info("Configured /설정 options: %s", ", ".join(option.name for option in options))
+
+
 async def sync_commands(bot: SeminarBot) -> None:
     """Register commands in one remote scope while retaining local callbacks."""
     tree = bot.tree
@@ -31,6 +41,7 @@ async def sync_commands(bot: SeminarBot) -> None:
             _restore_commands(tree, previous, guild=guild)
             raise
         log.info("Registered %s guild commands for guild %s", len(synced), guild.id)
+        _log_configure_options(synced)
 
         # Guild sync does not remove old global registrations. An empty global
         # sync removes them remotely, but local definitions still serve callbacks.
@@ -45,6 +56,7 @@ async def sync_commands(bot: SeminarBot) -> None:
 
     synced = await tree.sync()
     log.info("Registered %s global commands", len(synced))
+    _log_configure_options(synced)
     guild_ids = {config["guild_id"] for config in bot.store.all_configs()}
     for guild_id in sorted(guild_ids):
         guild = discord.Object(id=guild_id)

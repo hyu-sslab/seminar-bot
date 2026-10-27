@@ -778,10 +778,10 @@ class WebAPITests(unittest.IsolatedAsyncioTestCase):
             self.day.weekday(),
             target,
             "14:00",
-            timezone="UTC",
         )
         config = self.bot.store.require_config(1)
         self.assertEqual((config["channel_id"], config["upload_channel_id"]), (2001, 1002))
+        self.assertEqual(config["timezone"], "Asia/Seoul")
         context = await self.client.get("/v1/submission/context", headers=self.headers(**scoped))
         self.assertEqual(context.status, 200)
         self.assertEqual((await context.json())["session_id"], self.row["id"])

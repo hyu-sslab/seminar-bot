@@ -110,6 +110,15 @@ class CommandSyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.remote.payloads), 4)
         self.assert_local_definitions()
 
+    async def test_mock_responses_without_options_do_not_report_an_unverified_schema(self):
+        settings = command("설정")
+        self.tree.add_command(settings)
+        self.definitions.append(settings)
+        with self.assertLogs("seminar_bot.command_sync", level="INFO") as logs:
+            await sync_commands(self.bot)
+        self.assertFalse(any("Configured /설정 options:" in line for line in logs.output))
+        self.assert_local_definitions()
+
     async def test_guild_sync_failure_restores_local_scope_and_keeps_remote_globals(self):
         target = discord.Object(id=7)
         old = command("old_guild")
