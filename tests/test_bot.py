@@ -205,7 +205,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         text = interaction.followup.send.await_args.args[0]
         self.assertIn("매주 목요일 14:00", text)
         self.assertNotIn("Asia/Seoul", text)
-        self.assertIn("알림: 일정 안내 12:00 / 시작 15분 전 13:45 / 시작 60분 후 15:00", text)
+        self.assertIn("알림: 일정 안내 11:00 / 시작 15분 전 13:45 / 시작 60분 후 15:00", text)
         self.assertEqual((config["before_minutes"], config["after_minutes"]), (15, 60))
         self.assertNotIn("자료:", text)
         self.assertFalse(config["notifications_enabled"])
@@ -814,7 +814,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertRegex(text, r"서버\s*ID\s*(?:없|불필요|입력하지)")
         self.assertRegex(text, r"(?:과거|지난)[^\n]{0,10}예정")
         self.assertRegex(text, r"(?:수동|직접)\s*입력")
-        self.assertIn("12:00", text)
+        self.assertIn("11:00", text)
         self.assertIn("시작 15분 전 / 시작 60분 후", text)
         self.assertIn("시작 시각을 바꾸면", text)
         self.assertIn("당일 포함 4주", text)

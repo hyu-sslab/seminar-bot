@@ -510,7 +510,7 @@ class SeminarBot(discord.Client):
         @app_commands.describe(
             weekday="세미나 요일",
             channel="알림을 보낼 채널",
-            morning="당일 포함 4주 일정 안내 HH:MM (신규 기본 12:00, 생략 시 기존 유지)",
+            morning="당일 포함 4주 일정 안내 HH:MM (신규 기본 11:00, 생략 시 기존 유지)",
             before_minutes="시작 몇 분 전에 자료를 요청할지 (기본 15분, 생략 시 기존 분 설정 유지)",
             after_minutes="시작 몇 분 후에 자료를 요청할지 (기본 60분, 생략 시 기존 분 설정 유지)",
             seminar_time="매주 세미나 시작 시각 HH:MM (필수, 예: 16:00)",
@@ -564,7 +564,7 @@ class SeminarBot(discord.Client):
                     if morning is not None
                     else previous["morning"]
                     if previous
-                    else "12:00",
+                    else "11:00",
                     previous["evening"] if previous else "17:00",
                     "Asia/Seoul",
                     seminar_time=seminar_time,
@@ -891,7 +891,7 @@ class SeminarBot(discord.Client):
                 "`/검색`으로도 논문 검색 가능하며 종류 옵션에서 발표 자료나 전체를 선택할 수 있습니다.\n\n"
                 "**서버 관리자**\n"
                 "`/설정` 요일·**세미나시간**(매주 고정 시작 시각, 필수)·알림 채널 지정\n"
-                "`일정안내`는 시각을 지정하며 신규 기본값은 12:00입니다.\n"
+                "`일정안내`는 시각을 지정하며 신규 기본값은 11:00입니다. 생략하면 기존 시각을 유지합니다.\n"
                 "자료 요청은 기본 **시작 15분 전 / 시작 60분 후**이며, `시작전분`·`시작후분`으로 변경할 수 있습니다.\n"
                 "세미나 시작 시각을 바꾸면 자료 요청 시각도 자동으로 변경됩니다.\n"
                 "일정 안내는 당일 포함 4주 일정을 보내고 이번 주 발표자만 멘션합니다.\n"
