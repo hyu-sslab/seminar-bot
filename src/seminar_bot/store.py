@@ -419,7 +419,7 @@ class Store:
         try:
             zone = ZoneInfo(timezone)
         except (ZoneInfoNotFoundError, ValueError) as exc:
-            raise UserError("시간대를 확인해주세요. 예: Asia/Seoul, UTC") from exc
+            raise UserError("시간대 설정을 확인해주세요.") from exc
         today = (now or datetime.now(UTC)).astimezone(zone).date()
         enabled = bool(old["notifications_enabled"]) if old else False
         if notifications_enabled is not None:

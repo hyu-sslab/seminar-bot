@@ -135,7 +135,8 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
                 ("14:00", "09:00", "13:45", "15:00", 15, 60),
             )
             response = interaction.followup.send.await_args.args[0]
-            self.assertIn("매주 목요일 14:00 (Asia/Seoul)", response)
+            self.assertIn("매주 목요일 14:00", response)
+            self.assertNotIn("Asia/Seoul", response)
             self.assertIn(
                 "알림: 일정 안내 09:00 / 시작 15분 전 13:45 / 시작 60분 후 15:00", response
             )
@@ -162,7 +163,8 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             ("15:30", "08:20", "15:00", "17:00", 30, 90),
         )
         response = interaction.followup.send.await_args.args[0]
-        self.assertIn("매주 목요일 15:30 (Asia/Seoul)", response)
+        self.assertIn("매주 목요일 15:30", response)
+        self.assertNotIn("Asia/Seoul", response)
         self.assertIn("알림: 일정 안내 08:20 / 시작 30분 전 15:00 / 시작 90분 후 17:00", response)
         self.assertEqual(
             [dict(row) for row in self.bot.store.db.execute("SELECT * FROM sessions ORDER BY id")],
@@ -187,7 +189,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             [tuple(row) for row in self.bot.store.db.execute("SELECT * FROM sessions ORDER BY id")],
             before,
         )
-        self.assertIn("Asia/Seoul", interaction.followup.send.await_args.args[0])
+        self.assertNotIn("Asia/Seoul", interaction.followup.send.await_args.args[0])
 
     async def test_first_configuration_initializes_internal_scope_to_the_single_notification_channel(
         self,
@@ -201,7 +203,8 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             (2001, 2001, "14:00"),
         )
         text = interaction.followup.send.await_args.args[0]
-        self.assertIn("매주 목요일 14:00 (Asia/Seoul)", text)
+        self.assertIn("매주 목요일 14:00", text)
+        self.assertNotIn("Asia/Seoul", text)
         self.assertIn("알림: 일정 안내 12:00 / 시작 15분 전 13:45 / 시작 60분 후 15:00", text)
         self.assertEqual((config["before_minutes"], config["after_minutes"]), (15, 60))
         self.assertNotIn("자료:", text)
@@ -541,8 +544,9 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(DAY.isoformat(), holiday)
         self.assertNotIn("14:00", holiday)
         self.assertIn((DAY + timedelta(days=7)).isoformat(), presentations[0])
-        for text in ("매주 목요일", "14:00", "Asia/Seoul", "일정 안내 09:00", "종료 후 18:00"):
+        for text in ("매주 목요일", "14:00", "일정 안내 09:00", "종료 후 18:00"):
             self.assertIn(text, embed.footer.text)
+        self.assertNotIn("Asia/Seoul", embed.description + embed.footer.text)
 
     async def test_schedule_without_seminar_time_has_explicit_unset_footer(self):
         interaction = SimpleNamespace(
@@ -557,7 +561,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             await self.bot.tree.get_command("일정").callback(interaction)
         embed = interaction.followup.send.await_args.kwargs["embed"]
         self.assertIn("시작 시간 미설정", embed.footer.text)
-        self.assertIn("Asia/Seoul", embed.footer.text)
+        self.assertNotIn("Asia/Seoul", embed.description + embed.footer.text)
         self.assertNotIn("None", embed.description + embed.footer.text)
 
     async def test_schedule_includes_only_recorded_recent_past_without_creating_history(self):
@@ -748,7 +752,8 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("☀️", morning.args[0])
         self.assertIn("🌙", evening.args[0])
         for sent in (morning, evening):
-            self.assertIn("14:00 (Asia/Seoul)", sent.args[0])
+            self.assertIn("14:00", sent.args[0])
+            self.assertNotIn("Asia/Seoul", sent.args[0])
             self.assertIn("<@101>", sent.args[0])
             mentions = sent.kwargs["allowed_mentions"].to_dict()
             self.assertEqual(mentions["users"], [101])
@@ -829,6 +834,8 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("자료 채널", configure)
         self.assertNotIn("자동 등록", text)
         self.assertNotIn("upload_channel", text)
+        self.assertNotIn("Asia/Seoul", text)
+        self.assertNotIn("모든 시각은 한국 시간", text)
         for term in ("OFF", "알림시작일", "시작 전·시작 후", "각 한 번"):
             self.assertIn(term, text)
 

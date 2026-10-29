@@ -38,7 +38,7 @@ def safe(value: str, limit: int = 300) -> str:
 def weekly_schedule(config: dict) -> str:
     start = config.get("seminar_time")
     when = f" {start}" if start else " · 시작 시간 미설정"
-    return f"매주 {WEEKDAYS[config['weekday']]}{when} ({config['timezone']})"
+    return f"매주 {WEEKDAYS[config['weekday']]}{when}"
 
 
 class DocumentKindButton(
@@ -218,7 +218,7 @@ class SeminarBot(discord.Client):
                             raise UserError("알림 채널을 확인해주세요.")
                         mention = f"<@{session['presenter_id']}>"
                         start = config.get("seminar_time")
-                        when = f" {start} ({safe(config['timezone'])})" if start else ""
+                        when = f" {start}" if start else ""
                         embed = None
                         status = self.store.submission(
                             config["guild_id"],
@@ -891,7 +891,6 @@ class SeminarBot(discord.Client):
                 "`/검색`으로도 논문 검색 가능하며 종류 옵션에서 발표 자료나 전체를 선택할 수 있습니다.\n\n"
                 "**서버 관리자**\n"
                 "`/설정` 요일·**세미나시간**(매주 고정 시작 시각, 필수)·알림 채널 지정\n"
-                "모든 시각은 한국 시간(Asia/Seoul) 기준입니다.\n"
                 "`일정안내`는 시각을 지정하며 신규 기본값은 12:00입니다.\n"
                 "자료 요청은 기본 **시작 15분 전 / 시작 60분 후**이며, `시작전분`·`시작후분`으로 변경할 수 있습니다.\n"
                 "세미나 시작 시각을 바꾸면 자료 요청 시각도 자동으로 변경됩니다.\n"

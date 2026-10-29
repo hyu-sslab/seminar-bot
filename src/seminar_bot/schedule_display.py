@@ -78,7 +78,6 @@ def build_schedule_embed(
     )
     weekly = f"매주 {WEEKDAYS[config['weekday']]}"
     weekly += f" {start}" if start else " · 시작 시간 미설정"
-    weekly += f" ({_safe(config['timezone'])})"
     stages = [f"일정 안내 {_safe(config['morning'])}"]
     if config.get("before_reminder"):
         before_minutes = config.get("before_minutes")

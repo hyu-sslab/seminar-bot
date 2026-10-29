@@ -90,8 +90,9 @@ class ScheduleDisplayTests(unittest.TestCase):
         self.assertEqual(embed.title, "📢 앞으로 4주 세미나 일정")
         self.assertEqual(
             embed.footer.text,
-            "매주 목요일 16:00 (Asia/Seoul) · 일정 안내 12:00 / 시작 15분 전 15:45 / 시작 60분 후 17:00",
+            "매주 목요일 16:00 · 일정 안내 12:00 / 시작 15분 전 15:45 / 시작 60분 후 17:00",
         )
+        self.assertNotIn("Asia/Seoul", embed.description + embed.footer.text)
         legacy = build_schedule_embed(
             {**CONFIG, "before_reminder": None, "before_minutes": None, "after_minutes": None},
             [],
@@ -102,6 +103,7 @@ class ScheduleDisplayTests(unittest.TestCase):
         self.assertNotIn("시작 전", legacy.footer.text)
         self.assertNotIn("None", legacy.footer.text)
         self.assertIn("종료 후 17:00", legacy.footer.text)
+        self.assertNotIn("Asia/Seoul", legacy.footer.text)
 
     def test_custom_minute_offsets_show_the_resolved_times_after_a_start_time_change(self):
         changed = {
@@ -118,8 +120,9 @@ class ScheduleDisplayTests(unittest.TestCase):
         self.assertIn("14:30 · 발표자 하나", embed.description)
         self.assertEqual(
             embed.footer.text,
-            "매주 목요일 14:30 (Asia/Seoul) · 일정 안내 12:00 / 시작 30분 전 14:00 / 시작 90분 후 16:00",
+            "매주 목요일 14:30 · 일정 안내 12:00 / 시작 30분 전 14:00 / 시작 90분 후 16:00",
         )
+        self.assertNotIn("Asia/Seoul", embed.description + embed.footer.text)
         self.assertNotIn("종료 후", embed.footer.text)
 
     def test_legacy_absolute_alarm_times_remain_visible_without_minute_offsets(self):

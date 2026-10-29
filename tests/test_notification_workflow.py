@@ -135,13 +135,15 @@ class NotificationWorkflowTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(day, embed.description)
         self.assertNotIn("2026-11-26", embed.description)
         self.assertNotIn("<@", embed.description)
+        self.assertNotIn("Asia/Seoul", embed.description + embed.footer.text)
         self.assertIn("**이번 주 발표자: <@101>**", announcement.args[0])
         self.assertIn("시작 전", before.args[0])
         self.assertIn("시작 60분 후", after.args[0])
         self.assertNotIn("종료 후", after.args[0])
         for call in (announcement, before, after):
             self.assertIn("/제출", call.args[0])
-            self.assertIn("16:00 (Asia/Seoul)", call.args[0])
+            self.assertIn("16:00", call.args[0])
+            self.assertNotIn("Asia/Seoul", call.args[0])
             self.assertEqual(call.args[0].count("<@101>"), 1)
             mentions = call.kwargs["allowed_mentions"].to_dict()
             self.assertEqual(mentions["users"], [101])
@@ -180,8 +182,9 @@ class NotificationWorkflowTests(unittest.IsolatedAsyncioTestCase):
             await self.tick(hour, minute)
             self.assertEqual(self.channel.send.await_count, count)
         before, after = self.channel.send.await_args_list[1:]
-        self.assertIn("15:00 (Asia/Seoul)", before.args[0])
-        self.assertIn("15:00 (Asia/Seoul)", after.args[0])
+        self.assertIn("15:00", before.args[0])
+        self.assertIn("15:00", after.args[0])
+        self.assertNotIn("Asia/Seoul", before.args[0] + after.args[0])
         self.assertIn("15분 전", before.args[0])
         self.assertIn("시작 60분 후", after.args[0])
 
@@ -216,8 +219,9 @@ class NotificationWorkflowTests(unittest.IsolatedAsyncioTestCase):
         before, after = self.channel.send.await_args_list[1:]
         self.assertIn("30분 전", before.args[0])
         self.assertIn("시작 90분 후", after.args[0])
-        self.assertIn("17:00 (Asia/Seoul)", before.args[0])
-        self.assertIn("17:00 (Asia/Seoul)", after.args[0])
+        self.assertIn("17:00", before.args[0])
+        self.assertIn("17:00", after.args[0])
+        self.assertNotIn("Asia/Seoul", before.args[0] + after.args[0])
 
     async def test_submission_between_requests_suppresses_the_after_seminar_request(self):
         await self.tick(15, 45)
