@@ -42,23 +42,23 @@ class ScheduleDisplayTests(unittest.TestCase):
             ]
         )
         lines = embed.description.splitlines()
-        self.assertEqual(lines[0], "🔵 **이번 주 발표 · 2026-10-29 · 16:00 · 발표자 하나**")
-        self.assertIn("다음 주 · 2026-11-05", lines[1])
-        self.assertIn("다다음 주 · 2026-11-12", lines[2])
-        self.assertIn("3주 후 · 2026-11-19", lines[3])
+        self.assertEqual(lines[0], "🔵 **이번 주 발표 · 2026-10-29 (목) · 16:00 · 발표자 하나**")
+        self.assertIn("다음 주 · 2026-11-05 (목)", lines[1])
+        self.assertIn("다다음 주 · 2026-11-12 (목)", lines[2])
+        self.assertIn("3주 후 · 2026-11-19 (목)", lines[3])
         self.assertEqual(sum(line.startswith("🔵 **") for line in lines), 1)
 
     def test_week_boundaries_follow_monday_and_keep_a_past_current_week_distinct(self):
         rows = [session("2026-10-29"), session("2026-11-05", 102)]
         sunday = self.render(rows, today=date(2026, 11, 1)).description.splitlines()
         self.assertEqual(
-            sunday[0], "🔵 **이번 주 발표 · 2026-10-29 · 16:00 · 발표자 하나 (지난 발표)**"
+            sunday[0], "🔵 **이번 주 발표 · 2026-10-29 (목) · 16:00 · 발표자 하나 (지난 발표)**"
         )
         self.assertIn("다음 주", sunday[1])
         monday = self.render(rows, today=date(2026, 11, 2)).description.splitlines()
         self.assertNotIn("이번 주", monday[0])
         self.assertIn("지난 발표", monday[0])
-        self.assertEqual(monday[1], "🔵 **이번 주 발표 · 2026-11-05 · 16:00 · 발표자 둘**")
+        self.assertEqual(monday[1], "🔵 **이번 주 발표 · 2026-11-05 (목) · 16:00 · 발표자 둘**")
 
     def test_today_is_current_without_being_marked_as_a_past_talk(self):
         text = self.render([session("2026-10-29")], today=date(2026, 10, 29)).description
@@ -71,7 +71,7 @@ class ScheduleDisplayTests(unittest.TestCase):
             holidays=[{"seminar_date": "2026-10-29"}],
         )
         lines = embed.description.splitlines()
-        self.assertEqual(lines[0], "🔵 **이번 주 · 2026-10-29 · 💤 휴강**")
+        self.assertEqual(lines[0], "🔵 **이번 주 · 2026-10-29 (목) · 💤 휴강**")
         self.assertNotIn("발표자 하나", embed.description)
         self.assertIn("발표자 둘", lines[1])
         self.assertEqual(embed.description.count("2026-10-29"), 1)
@@ -90,7 +90,7 @@ class ScheduleDisplayTests(unittest.TestCase):
         self.assertEqual(embed.title, "📢 앞으로 4주 세미나 일정")
         self.assertEqual(
             embed.footer.text,
-            "매주 목요일 16:00 · 일정 안내 12:00 / 시작 15분 전 15:45 / 시작 60분 후 17:00",
+            "기본 일정: 매주 목요일 16:00 · 일정 안내 12:00 / 시작 15분 전 15:45 / 시작 60분 후 17:00",
         )
         self.assertNotIn("Asia/Seoul", embed.description + embed.footer.text)
         legacy = build_schedule_embed(
@@ -120,7 +120,7 @@ class ScheduleDisplayTests(unittest.TestCase):
         self.assertIn("14:30 · 발표자 하나", embed.description)
         self.assertEqual(
             embed.footer.text,
-            "매주 목요일 14:30 · 일정 안내 12:00 / 시작 30분 전 14:00 / 시작 90분 후 16:00",
+            "기본 일정: 매주 목요일 14:30 · 일정 안내 12:00 / 시작 30분 전 14:00 / 시작 90분 후 16:00",
         )
         self.assertNotIn("Asia/Seoul", embed.description + embed.footer.text)
         self.assertNotIn("종료 후", embed.footer.text)
@@ -130,6 +130,54 @@ class ScheduleDisplayTests(unittest.TestCase):
         embed = build_schedule_embed(config, [], [], date(2026, 10, 27), {})
         self.assertIn("시작 전 15:45 / 종료 후 17:00", embed.footer.text)
         self.assertNotIn("None분", embed.footer.text)
+
+    def test_changed_friday_is_highlighted_with_actual_weekday_and_original_date(self):
+        rows = [{**session("2026-11-20"), "original_date": "2026-11-19"}]
+        embed = self.render(rows, today=date(2026, 11, 16))
+        self.assertEqual(
+            embed.description,
+            "🔵 **이번 주 발표 · 2026-11-20 (금) · 16:00 · 발표자 하나 · 일정 변경 (기존 11/19 목)**",
+        )
+        self.assertTrue(embed.footer.text.startswith("기본 일정: 매주 목요일 16:00"))
+        self.assertNotIn("Asia/Seoul", embed.description + embed.footer.text)
+
+    def test_moving_again_keeps_the_first_original_date_and_a_return_has_no_change_badge(self):
+        moved = self.render(
+            [{**session("2026-11-18"), "original_date": "2026-11-19"}],
+            today=date(2026, 11, 16),
+        )
+        self.assertIn("2026-11-18 (수)", moved.description)
+        self.assertIn("일정 변경 (기존 11/19 목)", moved.description)
+        restored = self.render(
+            [{**session("2026-11-19"), "original_date": None}], today=date(2026, 11, 16)
+        )
+        self.assertIn("2026-11-19 (목)", restored.description)
+        self.assertNotIn("일정 변경", restored.description)
+
+    def test_fourth_week_friday_remains_in_the_supplied_calendar_week_range(self):
+        embed = self.render(
+            [
+                session("2026-11-05"),
+                session("2026-11-12"),
+                session("2026-11-19"),
+                {**session("2026-11-27"), "original_date": "2026-11-26"},
+            ],
+            today=date(2026, 11, 5),
+        )
+        lines = embed.description.splitlines()
+        self.assertEqual(len(lines), 4)
+        self.assertIn("3주 후 · 2026-11-27 (금)", lines[3])
+        self.assertIn("일정 변경 (기존 11/26 목)", lines[3])
+
+    def test_holiday_precedence_also_applies_to_a_changed_occurrence(self):
+        embed = self.render(
+            [{**session("2026-11-20"), "original_date": "2026-11-19"}],
+            holidays=[{"seminar_date": "2026-11-20"}],
+            today=date(2026, 11, 16),
+        )
+        self.assertEqual(embed.description, "🔵 **이번 주 · 2026-11-20 (금) · 💤 휴강**")
+        self.assertNotIn("일정 변경", embed.description)
+        self.assertNotIn("발표자 하나", embed.description)
 
     def test_missing_name_is_plain_text_and_input_collections_are_not_mutated(self):
         rows = [session("2026-10-29", 103)]

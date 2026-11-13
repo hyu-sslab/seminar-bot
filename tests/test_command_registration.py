@@ -118,7 +118,7 @@ class CommandRegistrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             tuple(option["name"] for option in settings[0]["options"]), EXPECTED_OPTIONS
         )
-        self.assertEqual(len(commands), 8)
+        self.assertEqual(len(commands), 9)
 
     async def test_guild_bulk_replacement_keeps_korean_option_names_and_cleans_global_duplicates(
         self,

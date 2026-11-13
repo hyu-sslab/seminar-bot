@@ -584,9 +584,9 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             await self.bot.tree.get_command("일정").callback(interaction, 2)
         lines = interaction.followup.send.await_args.kwargs["embed"].description.splitlines()
         self.assertEqual(len(lines), 3)
-        self.assertEqual(lines[0], f"{DAY} · Presenter A (지난 발표)")
+        self.assertEqual(lines[0], f"{DAY} (목) · Presenter A (지난 발표)")
         self.assertEqual(
-            lines[1], f"🔵 **이번 주 발표 · {DAY + timedelta(weeks=1)} · Presenter B**"
+            lines[1], f"🔵 **이번 주 발표 · {DAY + timedelta(weeks=1)} (목) · Presenter B**"
         )
         self.assertNotIn("지난 발표", lines[1])
         self.assertEqual("\n".join(self.bot.store.db.iterdump()), before)
@@ -762,7 +762,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
     async def test_only_current_web_workflow_commands_are_registered(self):
         self.assertEqual(
             {command.name for command in self.bot.tree.get_commands()},
-            {"설정", "일정", "스왑", "연기", "검색", "제출", "제출현황", "도움말"},
+            {"설정", "일정", "스왑", "연기", "일정변경", "검색", "제출", "제출현황", "도움말"},
         )
         for retired in ("순서설정", "자료분류", "자료수정", "자료연결"):
             self.assertIsNone(self.bot.tree.get_command(retired))
@@ -849,7 +849,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
 
     def assert_latest_guild_commands(self, guild_id):
         commands = self.bot.tree.get_commands(guild=discord.Object(id=guild_id))
-        self.assertEqual(len(commands), 8)
+        self.assertEqual(len(commands), 9)
         self.assertEqual(
             {command.name for command in commands},
             {command.name for command in self.bot.tree.get_commands()},
@@ -880,7 +880,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(remote, {None: set(), 2: commands, 9: {"unrelated"}})
         self.assert_latest_guild_commands(2)
         self.assertEqual({command.name for command in self.bot.tree.get_commands()}, commands)
-        self.assertEqual(len(commands), 8)
+        self.assertEqual(len(commands), 9)
         for retired in ("자료분류", "자료수정", "자료연결"):
             self.assertNotIn(retired, commands)
         fetched.assert_not_awaited()

@@ -77,8 +77,10 @@ class NotificationWorkflowTests(unittest.IsolatedAsyncioTestCase):
         await self.bot.close()
         self.temp.cleanup()
 
-    async def tick(self, hour, minute=0, *, day=29):
-        stamp = datetime(2026, 10, day, hour, minute, tzinfo=ZoneInfo("Asia/Seoul")).astimezone(UTC)
+    async def tick(self, hour, minute=0, *, day=29, month=10):
+        stamp = datetime(2026, month, day, hour, minute, tzinfo=ZoneInfo("Asia/Seoul")).astimezone(
+            UTC
+        )
         with patch("seminar_bot.bot.datetime") as clock:
             clock.now.return_value = stamp
             await self.bot.reminders()
@@ -130,7 +132,9 @@ class NotificationWorkflowTests(unittest.IsolatedAsyncioTestCase):
         announcement, before, after = self.channel.send.await_args_list
         embed = announcement.kwargs["embed"]
         self.assertEqual(len(embed.description.splitlines()), 4)
-        self.assertIn("🔵 **이번 주 발표 · 2026-10-29 · 16:00 · Presenter 101**", embed.description)
+        self.assertIn(
+            "🔵 **이번 주 발표 · 2026-10-29 (목) · 16:00 · Presenter 101**", embed.description
+        )
         for day in ("2026-11-05", "2026-11-12", "2026-11-19"):
             self.assertIn(day, embed.description)
         self.assertNotIn("2026-11-26", embed.description)
@@ -162,6 +166,82 @@ class NotificationWorkflowTests(unittest.IsolatedAsyncioTestCase):
         await self.tick(15, 45)
         await self.tick(17)
         self.assertEqual(self.channel.send.await_count, 1)
+
+    async def test_four_week_announcement_keeps_a_friday_move_in_the_fourth_week(self):
+        self.bot.store.reschedule(1, date(2026, 11, 19), date(2026, 11, 20), DAY)
+        await self.tick(12)
+        embed = self.channel.send.await_args.kwargs["embed"]
+        lines = embed.description.splitlines()
+        self.assertEqual(len(lines), 4)
+        self.assertIn("2026-11-20 (금)", lines[-1])
+        self.assertIn("Presenter 104", lines[-1])
+        self.assertIn("일정 변경", lines[-1])
+        self.assertNotIn("2026-11-26", embed.description)
+
+    async def test_one_week_date_change_moves_all_notices_to_friday_only(self):
+        self.bot.store.configure(
+            1,
+            1001,
+            1002,
+            3,
+            "11:00",
+            "17:00",
+            "Asia/Seoul",
+            NOW,
+            seminar_time="16:00",
+        )
+        self.bot.store.reschedule(1, DAY, date(2026, 10, 30), DAY)
+        for hour, minute in ((11, 0), (15, 45), (17, 0)):
+            await self.tick(hour, minute)
+        self.channel.send.assert_not_awaited()
+        for hour, minute, count in (
+            (10, 59, 0),
+            (11, 0, 1),
+            (11, 1, 1),
+            (15, 45, 2),
+            (17, 0, 3),
+            (17, 1, 3),
+        ):
+            await self.tick(hour, minute, day=30)
+            self.assertEqual(self.channel.send.await_count, count)
+        for call in self.channel.send.await_args_list:
+            self.assertIn("2026-10-30", call.args[0])
+            self.assertIn("<@101>", call.args[0])
+        await self.tick(11, day=5, month=11)
+        self.assertEqual(self.channel.send.await_count, 4)
+        self.assertIn("<@102>", self.channel.send.await_args.args[0])
+        self.assertIn("2026-11-05", self.channel.send.await_args.args[0])
+
+    async def test_same_stage_can_send_once_on_the_moved_day_after_original_day_delivery(self):
+        self.bot.store.configure(
+            1,
+            1001,
+            1002,
+            3,
+            "11:00",
+            "17:00",
+            "Asia/Seoul",
+            NOW,
+            seminar_time="16:00",
+        )
+        await self.tick(11)
+        first_nonce = self.channel.send.await_args.kwargs["nonce"]
+        self.bot.store.reschedule(1, DAY, date(2026, 10, 30), DAY)
+        await self.tick(15, 45)
+        self.assertEqual(self.channel.send.await_count, 1)
+        await self.tick(11, day=30)
+        await self.tick(11, 1, day=30)
+        self.assertEqual(self.channel.send.await_count, 2)
+        self.assertNotEqual(self.channel.send.await_args.kwargs["nonce"], first_nonce)
+        self.assertEqual(
+            [
+                tuple(row)
+                for row in self.bot.store.db.execute(
+                    "SELECT on_date,kind FROM deliveries ORDER BY on_date"
+                )
+            ],
+            [("2026-10-29", "morning"), ("2026-10-30", "morning")],
+        )
 
     async def test_changing_start_time_moves_both_default_requests_without_repeating_announcement(
         self,

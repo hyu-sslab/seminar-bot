@@ -243,6 +243,119 @@ class SchedulingTests(unittest.TestCase):
         for hour in (12, 16, 17):
             self.assertEqual(self.at(hour, day=friday), [])
 
+    def test_explicit_friday_move_sends_all_stages_once_then_returns_to_thursday(self):
+        self.store.configure(
+            1,
+            2,
+            3,
+            3,
+            "11:00",
+            "17:00",
+            "Asia/Seoul",
+            NOW,
+            seminar_time="16:00",
+            before_minutes=15,
+            after_minutes=60,
+        )
+        original = self.store.session_on(1, DAY)
+        friday = DAY + timedelta(days=1)
+        self.store.reschedule(1, DAY, friday, DAY)
+        self.config = self.store.require_config(1)
+        self.assertEqual(self.config["weekday"], 3)
+        self.assertEqual(self.config["reminder_start_date"], str(friday))
+        for hour in (11, 16, 17):
+            self.assertEqual(self.at(hour), [])
+        self.assertEqual(self.at(10, 59, day=friday), [])
+        for hour, minute, expected in ((11, 0, "morning"), (15, 45, "before"), (17, 0, "evening")):
+            moved, kind = self.at(hour, minute, day=friday)[0]
+            self.assertEqual(
+                (moved["id"], moved["presenter_id"], kind),
+                (original["id"], original["presenter_id"], expected),
+            )
+            self.assertEqual(moved["original_date"], str(DAY))
+            self.store.mark_sent(moved["id"], str(friday), kind, 123)
+            self.assertEqual(self.at(hour, minute + 1, day=friday), [])
+        next_week = DAY + timedelta(weeks=1)
+        regular, kind = self.at(11, day=next_week)[0]
+        self.assertEqual((regular["seminar_date"], kind), (str(next_week), "morning"))
+        self.assertIsNone(regular["original_date"])
+        self.assertEqual(self.at(11, day=next_week + timedelta(days=1)), [])
+
+    def test_moved_completed_materials_announce_without_further_submission_mentions(self):
+        original = self.complete()
+        friday = DAY + timedelta(days=1)
+        self.store.reschedule(1, DAY, friday, DAY)
+        self.config = self.store.require_config(1)
+        moved, kind = self.at(12, day=friday)[0]
+        self.assertEqual((moved["id"], kind), (original["id"], "morning"))
+        self.assertEqual(self.at(15, 45, day=friday), [])
+        self.assertEqual(self.at(17, day=friday), [])
+
+    def test_delivery_on_the_original_day_does_not_suppress_one_notice_on_the_new_day(self):
+        original, kind = self.at(12)[0]
+        self.store.mark_sent(original["id"], str(DAY), kind, 123)
+        friday = DAY + timedelta(days=1)
+        self.store.reschedule(1, DAY, friday, DAY)
+        self.config = self.store.require_config(1)
+        moved, kind = self.at(12, day=friday)[0]
+        self.assertEqual((moved["id"], kind), (original["id"], "morning"))
+        self.store.mark_sent(moved["id"], str(friday), kind, 124)
+        self.assertEqual(self.at(13, day=friday), [])
+        self.assertEqual(self.at(13), [])
+        self.assertEqual(
+            [
+                tuple(row)
+                for row in self.store.db.execute(
+                    "SELECT session_id,on_date,kind FROM deliveries ORDER BY on_date"
+                )
+            ],
+            [(original["id"], str(DAY), "morning"), (original["id"], str(friday), "morning")],
+        )
+
+    def test_moved_session_still_obeys_activation_holidays_and_late_restart_windows(self):
+        friday = DAY + timedelta(days=1)
+        self.store.reschedule(1, DAY, friday, DAY)
+        self.config = self.store.require_config(1)
+        self.assertEqual([kind for _, kind in self.at(18, day=friday)], ["evening"])
+        self.assertEqual(
+            self.at(12, day=friday, config={**self.config, "notifications_enabled": False}), []
+        )
+        self.assertEqual(
+            self.at(12, day=friday, config={**self.config, "reminder_start_date": "2026-11-05"}), []
+        )
+        with self.store.db:
+            self.store.db.execute(
+                "INSERT INTO holidays(guild_id,seminar_date) VALUES(?,?)", (1, str(friday))
+            )
+        for hour in (12, 16, 17):
+            self.assertEqual(self.at(hour, day=friday), [])
+
+    def test_returning_to_the_original_weekday_preserves_previously_sent_stages(self):
+        original, kind = self.at(12)[0]
+        self.store.mark_sent(original["id"], str(DAY), kind, 123)
+        friday = DAY + timedelta(days=1)
+        self.store.reschedule(1, DAY, friday, DAY)
+        self.store.reschedule(1, friday, DAY, DAY)
+        self.config = self.store.require_config(1)
+        restored = self.store.session_on(1, DAY)
+        self.assertIsNone(restored["original_date"])
+        self.assertEqual(self.at(13), [])
+        self.assertEqual(self.at(15, 45)[0][0]["id"], original["id"])
+        self.assertEqual(self.at(12, day=friday), [])
+
+    def test_moving_the_first_active_session_earlier_follows_the_new_activation_day(self):
+        tuesday = DAY - timedelta(days=2)
+        self.store.reschedule(1, DAY, tuesday, tuesday)
+        self.config = self.store.require_config(1)
+        self.assertEqual(self.config["reminder_start_date"], str(tuesday))
+        moved, kind = self.at(12, day=tuesday)[0]
+        self.assertEqual(
+            (moved["seminar_date"], moved["original_date"], kind),
+            (str(tuesday), str(DAY), "morning"),
+        )
+        self.assertEqual(self.at(12), [])
+        self.assertEqual(self.at(17, day=DAY - timedelta(weeks=1)), [])
+
     def test_completed_submission_keeps_noon_announcement_but_suppresses_both_requests(self):
         self.complete()
         self.assertEqual(self.at(12)[0][1], "morning")

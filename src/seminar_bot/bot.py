@@ -227,7 +227,11 @@ class SeminarBot(discord.Client):
                         )
                         if kind == "morning":
                             today = parse_date(session["seminar_date"])
-                            through = (today + timedelta(weeks=3)).isoformat()
+                            # Cover four calendar weeks, including a fourth
+                            # presentation moved to a later weekday that week.
+                            through = (
+                                today - timedelta(days=today.weekday()) + timedelta(days=27)
+                            ).isoformat()
                             rows = [
                                 dict(row)
                                 for row in self.store.db.execute(
@@ -680,6 +684,37 @@ class SeminarBot(discord.Client):
             )
 
         @tree.command(
+            name="일정변경", description="해당 주 발표 한 회차의 날짜만 바꿉니다 (서버 관리자)"
+        )
+        @app_commands.guild_only()
+        @app_commands.default_permissions(manage_guild=True)
+        @app_commands.checks.has_permissions(manage_guild=True)
+        @app_commands.rename(from_date="기존날짜", to_date="변경날짜")
+        @app_commands.describe(
+            from_date="옮길 발표의 현재 날짜 YYYY-MM-DD",
+            to_date="같은 주 안에서 새로 발표할 날짜 YYYY-MM-DD",
+        )
+        async def reschedule(
+            interaction: discord.Interaction, from_date: str, to_date: str
+        ) -> None:
+            source, target = parse_date(from_date), parse_date(to_date)
+            await interaction.response.defer()
+            async with self.schedule_lock:
+                config = self.store.require_config(interaction.guild_id)
+                moved = self.store.reschedule(
+                    interaction.guild_id, source, target, local_now(config).date()
+                )
+            names = await self.presenter_names(interaction.guild_id, {moved["presenter_id"]})
+            await interaction.followup.send(
+                f"🗓️ **{source.isoformat()} ({WEEKDAYS[source.weekday()]}) → "
+                f"{target.isoformat()} ({WEEKDAYS[target.weekday()]})**\n"
+                f"발표자: {safe(names[moved['presenter_id']], 100)}\n"
+                "해당 회차의 자료·제출 내역과 알림을 변경된 날짜로 옮겼습니다. 나머지 발표 순서는 유지됩니다.\n"
+                "기존 제출 링크는 만료됩니다. `/제출`로 새 링크를 받아주세요.",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
+        @tree.command(
             name="검색",
             description="등록된 논문·발표 자료를 제목, 학회, 연도, DOI 등으로 검색합니다",
         )
@@ -901,7 +936,9 @@ class SeminarBot(discord.Client):
                 "지난 회차는 요청하지 않으며 재시작 때 지난 알림 시간을 몰아 보내지 않습니다.\n"
                 "발표 순서는 NAS의 `config/rotation.json`의 `presenters`에서 편집 (서버 한 곳이면 서버 ID 불필요)\n"
                 "파일 저장 후 30초 안에 적용하며 `/일정`을 열 때도 확인합니다.\n"
-                "`/스왑` 두 날짜의 발표자 교환 · `/연기` 해당 주 휴강 + 이후 전체 1주 연기"
+                "`/스왑` 두 날짜의 발표자 교환\n"
+                "`/일정변경` 같은 주 안에서 해당 회차 날짜만 변경 (예: 목요일 → 금요일)\n"
+                "`/연기` 해당 주 휴강 + 이후 전체 1주 연기"
             )
             if not self.web_submission_enabled(interaction.guild_id):
                 text += "\n\n웹 제출이 설정되지 않았습니다. 서버 관리자에게 웹 연동 설정을 요청해주세요."

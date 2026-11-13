@@ -12,7 +12,7 @@ def due_reminders(store: Store, config: dict, now: datetime) -> list[tuple[dict,
         return []
     current = local_now(config, now)
     today = current.date()
-    if floor > today.isoformat() or today.weekday() != config["weekday"]:
+    if floor > today.isoformat():
         return []
     clock = current.time().replace(tzinfo=None)
     if clock < parse_time(config["morning"]):
@@ -34,7 +34,13 @@ def due_reminders(store: Store, config: dict, now: datetime) -> list[tuple[dict,
         "AND h.seminar_date=s.seminar_date)",
         (config["guild_id"], today.isoformat()),
     ).fetchone()
-    if row is None or store.was_sent(row["id"], today.isoformat(), kind):
+    if row is None:
+        return []
+    # One explicitly moved occurrence may use another weekday. Arbitrary old
+    # rows left over from an earlier weekly setting remain ineligible.
+    if today.weekday() != config["weekday"] and row["original_date"] is None:
+        return []
+    if store.was_sent(row["id"], today.isoformat(), kind):
         return []
     if kind != "morning":
         status = store.submission(

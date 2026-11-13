@@ -45,8 +45,9 @@ def build_schedule_embed(
     lines = []
     for day, row in sorted(items.items()):
         week = _week_label(day, monday)
+        day_label = f"{day.isoformat()} ({WEEKDAYS[day.weekday()][0]})"
         if row is None:
-            line = " · ".join(filter(None, (week, day.isoformat(), "💤 휴강")))
+            line = " · ".join(filter(None, (week, day_label, "💤 휴강")))
         else:
             presenter_id = row["presenter_id"]
             name = _safe(names.get(presenter_id) or f"발표자 {presenter_id} (이름 확인 불가)")
@@ -55,9 +56,13 @@ def build_schedule_embed(
             line = " · ".join(
                 filter(
                     None,
-                    ((week + " 발표") if week == "이번 주" else week, day.isoformat(), start, name),
+                    ((week + " 발표") if week == "이번 주" else week, day_label, start, name),
                 )
             )
+            original_date = row.get("original_date")
+            if original_date and original_date != day.isoformat():
+                original = date.fromisoformat(original_date)
+                line += f" · 일정 변경 (기존 {original.month}/{original.day} {WEEKDAYS[original.weekday()][0]})"
         if week == "이번 주":
             line = f"🔵 **{line}**"
         lines.append(line)
@@ -76,7 +81,7 @@ def build_schedule_embed(
         description="\n".join(selected) or "아직 등록된 일정이 없습니다.",
         color=0x5B8DEF,
     )
-    weekly = f"매주 {WEEKDAYS[config['weekday']]}"
+    weekly = f"기본 일정: 매주 {WEEKDAYS[config['weekday']]}"
     weekly += f" {start}" if start else " · 시작 시간 미설정"
     stages = [f"일정 안내 {_safe(config['morning'])}"]
     if config.get("before_reminder"):

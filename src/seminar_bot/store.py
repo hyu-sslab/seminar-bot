@@ -91,7 +91,7 @@ class Store:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.execute("PRAGMA busy_timeout=5000")
-        if self.db.execute("PRAGMA user_version").fetchone()[0] > 11:
+        if self.db.execute("PRAGMA user_version").fetchone()[0] > 12:
             self.db.close()
             raise ValueError("데이터베이스 버전이 봇보다 새롭습니다. 봇을 업데이트해주세요.")
         self.db.executescript("""
@@ -118,6 +118,7 @@ class Store:
                 guild_id INTEGER NOT NULL REFERENCES guilds(guild_id),
                 seminar_date TEXT NOT NULL,
                 presenter_id INTEGER NOT NULL,
+                original_date TEXT,
                 UNIQUE(guild_id, seminar_date)
             );
             CREATE TABLE IF NOT EXISTS archive_presentations (
@@ -281,6 +282,10 @@ class Store:
                     self.db.execute(
                         f"ALTER TABLE {table} ADD COLUMN scope TEXT NOT NULL DEFAULT 'session' CHECK(scope IN ('session','presenter'))"
                     )
+            if "original_date" not in {
+                row["name"] for row in self.db.execute("PRAGMA table_info(sessions)")
+            }:
+                self.db.execute("ALTER TABLE sessions ADD COLUMN original_date TEXT")
             self.db.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS web_upload_key ON documents(guild_id, upload_key) "
                 "WHERE upload_key IS NOT NULL"
@@ -297,7 +302,7 @@ class Store:
                     "WHERE a.id=NEW.archive_presentation_id AND a.guild_id=NEW.guild_id)) "
                     "BEGIN SELECT RAISE(ABORT,'Invalid archive presentation reference'); END"
                 )
-            self.db.execute("PRAGMA user_version=11")
+            self.db.execute("PRAGMA user_version=12")
 
     def close(self) -> None:
         self.db.close()
@@ -453,6 +458,16 @@ class Store:
                 for table in ("submission_invitations", "submission_grants"):
                     self.db.execute(f"DELETE FROM {table} WHERE guild_id=?", (guild_id,))
             if delta:
+                if (
+                    reminder_start
+                    and reminder_start >= today.isoformat()
+                    and self.session_on(guild_id, date.fromisoformat(reminder_start))
+                ):
+                    # The chosen activation occurrence moves with this change,
+                    # including a new explicit floor supplied in this command.
+                    reminder_start = (
+                        date.fromisoformat(reminder_start) + timedelta(days=delta)
+                    ).isoformat()
                 self._shift_dates(guild_id, today, delta)
                 # A long-stopped bot may have an ungenerated cursor in the past.
                 # It must also adopt the new weekday before skipping missed weeks.
@@ -499,15 +514,21 @@ class Store:
     def _shift_dates(self, guild_id: int, from_date: date, days: int) -> int:
         """Caller owns transaction. Descending updates avoid UNIQUE date collisions."""
         rows = self.db.execute(
-            "SELECT id, seminar_date FROM sessions WHERE guild_id=? AND seminar_date>=? "
+            "SELECT id, seminar_date, original_date FROM sessions WHERE guild_id=? AND seminar_date>=? "
             "ORDER BY seminar_date DESC",
             (guild_id, from_date.isoformat()),
         ).fetchall()
         for row in rows:
             self._revoke_submission_sessions([row["id"]])
             shifted = date.fromisoformat(row["seminar_date"]) + timedelta(days=days)
+            original = (
+                (date.fromisoformat(row["original_date"]) + timedelta(days=days)).isoformat()
+                if row["original_date"]
+                else None
+            )
             self.db.execute(
-                "UPDATE sessions SET seminar_date=? WHERE id=?", (shifted.isoformat(), row["id"])
+                "UPDATE sessions SET seminar_date=?,original_date=? WHERE id=?",
+                (shifted.isoformat(), original, row["id"]),
             )
         # Previously skipped weeks also follow any later shift of the timetable.
         holidays = self.db.execute(
@@ -521,6 +542,12 @@ class Store:
                 "UPDATE holidays SET seminar_date=? WHERE id=?", (shifted.isoformat(), row["id"])
             )
         config = self.require_config(guild_id)
+        if any(row["seminar_date"] == config["reminder_start_date"] for row in rows):
+            shifted = date.fromisoformat(config["reminder_start_date"]) + timedelta(days=days)
+            self.db.execute(
+                "UPDATE guilds SET reminder_start_date=? WHERE guild_id=?",
+                (shifted.isoformat(), guild_id),
+            )
         if config["next_date"] and config["next_date"] >= from_date.isoformat():
             shifted = date.fromisoformat(config["next_date"]) + timedelta(days=days)
             self.db.execute(
@@ -537,8 +564,9 @@ class Store:
     def session_has_activity(self, session_id: int) -> bool:
         row = self.db.execute(
             "SELECT EXISTS(SELECT 1 FROM documents WHERE session_id=?) "
-            "OR EXISTS(SELECT 1 FROM deliveries WHERE session_id=?)",
-            (session_id, session_id),
+            "OR EXISTS(SELECT 1 FROM deliveries WHERE session_id=?) "
+            "OR EXISTS(SELECT 1 FROM sessions WHERE id=? AND original_date IS NOT NULL)",
+            (session_id, session_id, session_id),
         ).fetchone()
         return bool(row[0])
 
@@ -570,15 +598,17 @@ class Store:
         with self.db:
             protected = self.db.execute(
                 """
-                SELECT 1 FROM sessions s WHERE s.guild_id=? AND s.seminar_date>=?
-                AND (EXISTS(SELECT 1 FROM documents d WHERE d.session_id=s.id)
-                  OR EXISTS(SELECT 1 FROM deliveries r WHERE r.session_id=s.id)) LIMIT 1
+                SELECT 1 FROM sessions s WHERE s.guild_id=? AND (
+                  (s.original_date IS NOT NULL AND (s.seminar_date>=? OR s.original_date>=?))
+                  OR (s.seminar_date>=? AND (
+                    EXISTS(SELECT 1 FROM documents d WHERE d.session_id=s.id)
+                    OR EXISTS(SELECT 1 FROM deliveries r WHERE r.session_id=s.id)))) LIMIT 1
             """,
-                (guild_id, start.isoformat()),
+                (guild_id, start.isoformat(), start.isoformat(), start.isoformat()),
             ).fetchone()
             if protected:
                 raise UserError(
-                    "변경할 일정에 자료 또는 발송 기록이 있습니다. 그 이후 날짜부터 순서를 설정해주세요."
+                    "변경할 일정에 개별 날짜 변경·자료·발송 기록이 있습니다. 그 이후 날짜부터 순서를 설정해주세요."
                 )
             self._revoke_submission_sessions(
                 [
@@ -722,6 +752,61 @@ class Store:
             )
             # Preserve sent slots: swapping speakers must not replay today's
             # announcements. Any later slot reads the newly assigned speaker.
+
+    def reschedule(self, guild_id: int, from_date: date, to_date: date, today: date) -> dict:
+        """Move one occurrence within its calendar week while retaining its identity."""
+        if any(type(value) is not date for value in (from_date, to_date, today)):
+            raise UserError("기존 날짜와 변경 날짜는 YYYY-MM-DD 형식으로 입력해주세요.")
+        if from_date == to_date:
+            raise UserError("기존 날짜와 다른 변경 날짜를 선택해주세요.")
+        if to_date < today:
+            raise UserError("변경할 날짜는 오늘 이후여야 합니다.")
+        if from_date - timedelta(days=from_date.weekday()) != to_date - timedelta(
+            days=to_date.weekday()
+        ):
+            raise UserError("해당 주의 월요일~일요일 안에서만 발표 날짜를 변경할 수 있습니다.")
+        with self.db:
+            if not self.db.in_transaction:
+                self.db.execute("BEGIN IMMEDIATE")
+            config = self.require_config(guild_id)
+            session = self.session_on(guild_id, from_date)
+            if not session:
+                raise UserError("기존 날짜에 등록된 발표가 없습니다. /일정에서 확인해주세요.")
+            if self.session_on(guild_id, to_date):
+                raise UserError("변경할 날짜에 이미 다른 발표가 있습니다.")
+            if self.db.execute(
+                "SELECT 1 FROM holidays WHERE guild_id=? AND seminar_date=?",
+                (guild_id, to_date.isoformat()),
+            ).fetchone():
+                raise UserError("휴강일로 지정된 날짜에는 발표를 옮길 수 없습니다.")
+            original = session["original_date"] or from_date.isoformat()
+            if original == to_date.isoformat():
+                original = None
+            self.db.execute(
+                "UPDATE sessions SET seminar_date=?,original_date=? WHERE guild_id=? AND id=?",
+                (to_date.isoformat(), original, guild_id, session["id"]),
+            )
+            # Activation follows its first occurrence only. Moving another week
+            # never widens the historical notification scope.
+            if config["reminder_start_date"] == from_date.isoformat():
+                self.db.execute(
+                    "UPDATE guilds SET reminder_start_date=? WHERE guild_id=?",
+                    (to_date.isoformat(), guild_id),
+                )
+            # A presenter's portal covers all of their occurrences, so revoke
+            # their portals too, while keeping other presenters' access intact.
+            for table in ("submission_invitations", "submission_grants"):
+                self.db.execute(
+                    f"DELETE FROM {table} WHERE guild_id=? AND "
+                    "(session_id=? OR (scope='presenter' AND presenter_id=?))",
+                    (guild_id, session["id"], session["presenter_id"]),
+                )
+            return {
+                "id": session["id"],
+                "presenter_id": session["presenter_id"],
+                "seminar_date": to_date.isoformat(),
+                "original_date": original,
+            }
 
     def _revoke_submission_sessions(self, session_ids: list[int]) -> None:
         """Caller owns the schedule transaction; old links never revive after a swap back."""
