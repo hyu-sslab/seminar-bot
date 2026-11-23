@@ -564,6 +564,32 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Asia/Seoul", embed.description + embed.footer.text)
         self.assertNotIn("None", embed.description + embed.footer.text)
 
+    async def test_postpone_last_week_option_moves_the_presenter_and_shows_past_holiday(self):
+        command = self.bot.tree.get_command("연기")
+        options = {option["name"]: option for option in command.to_dict(self.bot.tree)["options"]}
+        self.assertEqual(
+            options["대상"]["choices"], [{"name": "지난주 발표", "value": "last_week"}]
+        )
+        interaction = SimpleNamespace(
+            guild_id=1,
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        earlier = self.bot.store.session_on(1, DAY)
+        next_day = DAY + timedelta(weeks=1)
+        with (
+            patch.object(self.bot, "reload_rotation_file", AsyncMock()),
+            patch("seminar_bot.bot.local_now", return_value=NOW + timedelta(days=4)),
+        ):
+            await command.callback(interaction, period="last_week")
+            self.assertIn(f"{DAY}은 휴강입니다", interaction.followup.send.await_args.args[0])
+            await self.bot.tree.get_command("일정").callback(interaction)
+        self.assertIsNone(self.bot.store.session_on(1, DAY))
+        self.assertEqual(self.bot.store.session_on(1, next_day)["id"], earlier["id"])
+        schedule = interaction.followup.send.await_args.kwargs["embed"].description
+        self.assertIn(f"{DAY} (목) · 💤 휴강", schedule)
+        self.assertIn(f"{next_day} (목) · 발표자 101", schedule)
+
     async def test_schedule_includes_only_recorded_recent_past_without_creating_history(self):
         self.bot.store.ensure_horizon(1, DAY + timedelta(days=6))
         interaction = SimpleNamespace(

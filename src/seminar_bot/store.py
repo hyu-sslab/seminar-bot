@@ -708,23 +708,74 @@ class Store:
         ]
 
     def postpone(
-        self, guild_id: int, today: date, from_date: date | None = None
+        self,
+        guild_id: int,
+        today: date,
+        from_date: date | None = None,
+        *,
+        last_week: bool = False,
     ) -> tuple[date, int]:
-        upcoming = self.upcoming(guild_id, today)
-        if not upcoming:
-            raise UserError("먼저 서버의 config/rotation.json 파일에 발표 순서를 등록해주세요.")
-        start = from_date or date.fromisoformat(upcoming[0]["seminar_date"])
-        if start < today or self.session_on(guild_id, start) is None:
-            raise UserError(
-                "오늘 이후에 예정된 발표 날짜를 선택해주세요. /일정 에서 확인할 수 있습니다."
-            )
+        if last_week and from_date is not None:
+            raise UserError("발표 날짜와 지난주 옵션 중 하나만 선택해주세요.")
+        past = last_week or (from_date is not None and from_date < today)
+        if not past:
+            upcoming = self.upcoming(guild_id, today)
+            if not upcoming:
+                raise UserError("먼저 서버의 config/rotation.json 파일에 발표 순서를 등록해주세요.")
+            if from_date is None:
+                from_date = date.fromisoformat(upcoming[0]["seminar_date"])
         with self.db:
+            if not self.db.in_transaction:
+                self.db.execute("BEGIN IMMEDIATE")
+            start = self._last_week_postpone_date(guild_id, today, from_date) if past else from_date
+            if start is None or self.session_on(guild_id, start) is None:
+                raise UserError("등록된 발표 날짜를 선택해주세요. /일정에서 확인할 수 있습니다.")
+            if self.db.execute(
+                "SELECT 1 FROM holidays WHERE guild_id=? AND seminar_date=?",
+                (guild_id, start.isoformat()),
+            ).fetchone():
+                raise UserError("이미 휴강으로 등록된 날짜입니다.")
             count = self._shift_dates(guild_id, start, 7)
             self.db.execute(
                 "INSERT INTO holidays(guild_id, seminar_date) VALUES(?,?)",
                 (guild_id, start.isoformat()),
             )
         return start, count
+
+    def _last_week_postpone_date(self, guild_id: int, today: date, from_date: date | None) -> date:
+        """Validate a previous-week correction inside the schedule transaction."""
+        self.require_config(guild_id)
+        monday = today - timedelta(days=today.weekday())
+        last_monday = monday - timedelta(weeks=1)
+        if from_date is None:
+            candidates = self.db.execute(
+                "SELECT seminar_date FROM sessions WHERE guild_id=? AND seminar_date>=? "
+                "AND seminar_date<? ORDER BY seminar_date LIMIT 2",
+                (guild_id, last_monday.isoformat(), monday.isoformat()),
+            ).fetchall()
+            if not candidates:
+                raise UserError(
+                    "지난주에 연기할 발표가 없습니다. 휴강 또는 미등록 회차를 확인해주세요."
+                )
+            if len(candidates) > 1:
+                raise UserError("지난주에 등록된 발표가 여러 개입니다. 연기할 날짜를 지정해주세요.")
+            from_date = date.fromisoformat(candidates[0]["seminar_date"])
+        elif not last_monday <= from_date < monday:
+            raise UserError("지난 날짜는 이전 주 월요일~일요일의 발표만 연기할 수 있습니다.")
+
+        session = self.session_on(guild_id, from_date)
+        if session is None:
+            raise UserError("입력한 지난주 날짜에 연기할 발표가 없습니다.")
+        if from_date + timedelta(weeks=1) < today:
+            raise UserError("연기할 새 날짜가 이미 지났습니다. 발표 일정을 확인해주세요.")
+        if self.db.execute(
+            "SELECT 1 FROM sessions WHERE guild_id=? AND seminar_date>? AND seminar_date<? LIMIT 1",
+            (guild_id, from_date.isoformat(), today.isoformat()),
+        ).fetchone():
+            raise UserError("이미 지난 후속 발표에 영향이 있어 지난주 회차를 연기할 수 없습니다.")
+        if self.submission_receipt(session["id"]) is not None:
+            raise UserError("이미 자료 제출을 완료한 지난 발표는 연기할 수 없습니다.")
+        return from_date
 
     def swap(self, guild_id: int, first: date, second: date, today: date) -> None:
         if first == second or min(first, second) < today:

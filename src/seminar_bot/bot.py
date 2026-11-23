@@ -617,7 +617,7 @@ class SeminarBot(discord.Client):
                 )
                 if previous and previous["seminar_date"] >= (today - timedelta(days=7)).isoformat():
                     rows.insert(0, previous)
-                holidays = self.store.holidays(interaction.guild_id, today)
+                holidays = self.store.holidays(interaction.guild_id, today - timedelta(weeks=1))
             if not rows:
                 error = self.rotation_errors.get(None) or self.rotation_errors.get(
                     interaction.guild_id
@@ -669,8 +669,19 @@ class SeminarBot(discord.Client):
         @app_commands.guild_only()
         @app_commands.default_permissions(manage_guild=True)
         @app_commands.checks.has_permissions(manage_guild=True)
-        @app_commands.describe(from_date="휴강할 발표일 YYYY-MM-DD (생략: 다음 발표)")
-        async def postpone(interaction: discord.Interaction, from_date: str | None = None) -> None:
+        @app_commands.rename(period="대상")
+        @app_commands.choices(
+            period=[app_commands.Choice(name="지난주 발표", value="last_week")],
+        )
+        @app_commands.describe(
+            from_date="휴강할 발표일 YYYY-MM-DD (날짜와 대상을 모두 생략하면 다음 발표)",
+            period="지난주 발표를 연기할 때 선택 (날짜와 함께 지정할 수 없음)",
+        )
+        async def postpone(
+            interaction: discord.Interaction,
+            from_date: str | None = None,
+            period: str | None = None,
+        ) -> None:
             await interaction.response.defer()
             async with self.schedule_lock:
                 config = self.store.require_config(interaction.guild_id)
@@ -678,6 +689,7 @@ class SeminarBot(discord.Client):
                     interaction.guild_id,
                     local_now(config).date(),
                     parse_date(from_date) if from_date else None,
+                    last_week=period == "last_week",
                 )
             await interaction.followup.send(
                 f"💤 {start.isoformat()}은 휴강입니다. 해당 회차부터 이후 모든 발표와 알림을 7일씩 뒤로 옮겼습니다."
@@ -938,7 +950,7 @@ class SeminarBot(discord.Client):
                 "파일 저장 후 30초 안에 적용하며 `/일정`을 열 때도 확인합니다.\n"
                 "`/스왑` 두 날짜의 발표자 교환\n"
                 "`/일정변경` 같은 주 안에서 해당 회차 날짜만 변경 (예: 목요일 → 금요일)\n"
-                "`/연기` 해당 주 휴강 + 이후 전체 1주 연기"
+                "`/연기` 해당 주 휴강 + 이후 전체 1주 연기 (`대상`에서 지난주 발표 선택 가능)"
             )
             if not self.web_submission_enabled(interaction.guild_id):
                 text += "\n\n웹 제출이 설정되지 않았습니다. 서버 관리자에게 웹 연동 설정을 요청해주세요."

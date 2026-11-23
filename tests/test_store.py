@@ -9,7 +9,7 @@ from pathlib import Path
 
 from seminar_bot.documents import DocumentInfo
 from seminar_bot.store import Store, UserError, parse_date, parse_time
-from seminar_bot.submission_access import SubmissionAccess
+from seminar_bot.submission_access import SubmissionAccess, SubmissionAccessDenied
 
 TODAY = date(2026, 10, 15)  # Thursday
 NOW = datetime(2026, 10, 15, 1, tzinfo=UTC)  # 10:00 KST
@@ -751,6 +751,111 @@ class StoreTests(unittest.TestCase):
             [r["seminar_date"] for r in self.store.holidays(1, TODAY)], ["2026-10-15", "2026-10-22"]
         )
         self.assertEqual(self.store.upcoming(1, TODAY)[0]["seminar_date"], "2026-10-29")
+
+    def test_last_week_postpone_keeps_preuploads_and_alert_history_with_their_session(self):
+        source = self.store.session_on(1, TODAY)
+        record_id, _ = self.add_document()
+        self.store.mark_sent(source["id"], str(TODAY), "morning", 900)
+        self.store.configure(
+            1,
+            1001,
+            1002,
+            3,
+            "09:00",
+            "18:00",
+            "Asia/Seoul",
+            NOW,
+            notifications_enabled=True,
+            reminder_start_date=TODAY,
+        )
+        access = SubmissionAccess(self.store)
+        invitation, _ = access.issue(1, source["id"], 101, now=100)
+        token, _ = access.redeem(invitation, 1, now=101)
+        before = self.history()
+        config = self.store.require_config(1)
+        current_monday = TODAY + timedelta(days=4)
+        moved_date = TODAY + timedelta(weeks=1)
+
+        self.assertEqual(
+            self.store.postpone(1, current_monday, last_week=True),
+            (TODAY, len(before["sessions"])),
+        )
+
+        self.assertEqual(
+            self.store.session_on(1, moved_date), {**source, "seminar_date": str(moved_date)}
+        )
+        self.assertIsNone(self.store.session_on(1, TODAY))
+        self.assertEqual(
+            [row["seminar_date"] for row in self.store.holidays(1, TODAY)], [str(TODAY)]
+        )
+        self.assertEqual(self.history()["deliveries"], before["deliveries"])
+        self.assertEqual(self.history()["documents"], before["documents"])
+        self.assertEqual(self.store.document(1, record_id)["seminar_date"], str(moved_date))
+        self.assertEqual(
+            self.store.require_config(1),
+            {
+                **config,
+                "reminder_start_date": str(moved_date),
+                "next_date": str(date.fromisoformat(config["next_date"]) + timedelta(weeks=1)),
+            },
+        )
+        with self.assertRaises(SubmissionAccessDenied):
+            access.validate(token, 1, now=102)
+
+        corrected = self.history()
+        with self.assertRaisesRegex(UserError, "지난주에 연기할 발표가 없습니다"):
+            self.store.postpone(1, current_monday, last_week=True)
+        self.assertEqual(self.history(), corrected)
+
+    def test_explicit_last_week_date_supports_a_moved_friday_without_changing_earlier_rows(self):
+        earlier = TODAY - timedelta(days=1)
+        with self.store.db:
+            self.store.db.execute(
+                "INSERT INTO sessions(guild_id,seminar_date,presenter_id) VALUES(1,?,104)",
+                (str(earlier),),
+            )
+        earlier_session = self.store.session_on(1, earlier)
+        friday = TODAY + timedelta(days=1)
+        moved = self.store.reschedule(1, TODAY, friday, TODAY)
+        current_monday = TODAY + timedelta(days=4)
+        before = self.history()
+        with self.assertRaisesRegex(UserError, "발표가 여러 개"):
+            self.store.postpone(1, current_monday, last_week=True)
+        self.assertEqual(self.history(), before)
+
+        self.store.postpone(1, current_monday, from_date=friday)
+        shifted = self.store.session_on(1, friday + timedelta(weeks=1))
+        self.assertEqual(shifted["id"], moved["id"])
+        self.assertEqual(shifted["original_date"], str(TODAY + timedelta(weeks=1)))
+        self.assertEqual(self.store.session_on(1, earlier), earlier_session)
+
+    def test_last_week_postpone_rejects_completed_or_already_elapsed_corrections(self):
+        monday = TODAY + timedelta(days=4)
+        row = self.store.session_on(1, TODAY)
+        self.store.mark_submission_receipt(row["id"], "receipt", 900)
+        before = self.history()
+        for today, from_date, last_week, message in (
+            (monday, None, True, "자료 제출을 완료"),
+            (monday, TODAY, True, "하나만 선택"),
+            (monday, TODAY - timedelta(weeks=1), False, "이전 주"),
+            (TODAY + timedelta(days=8), None, True, "새 날짜가 이미 지났습니다"),
+        ):
+            with (
+                self.subTest(today=today, from_date=from_date, last_week=last_week),
+                self.assertRaisesRegex(UserError, message),
+            ):
+                self.store.postpone(1, today, from_date, last_week=last_week)
+        self.assertEqual(self.history(), before)
+
+    def test_last_week_postpone_leaves_an_already_elapsed_following_session_in_place(self):
+        monday = TODAY + timedelta(days=4)
+        self.store.reschedule(1, TODAY + timedelta(weeks=1), monday, monday)
+        before = self.history()
+        config = self.store.require_config(1)
+        with self.assertRaisesRegex(UserError, "이미 지난 후속 발표"):
+            self.store.postpone(1, monday + timedelta(days=2), last_week=True)
+        self.assertEqual(self.history(), before)
+        self.assertEqual(self.store.require_config(1), config)
 
     def test_past_mutations_rejected(self):
         with self.assertRaises(UserError):
