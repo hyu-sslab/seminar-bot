@@ -918,13 +918,60 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         for guild_id in (2, None):
             interaction = SimpleNamespace(
                 guild_id=guild_id,
+                type=discord.InteractionType.application_command,
                 response=SimpleNamespace(send_message=AsyncMock()),
             )
             self.assertFalse(await self.bot.tree.interaction_check(interaction))
             interaction.response.send_message.assert_awaited_once()
             self.assertTrue(interaction.response.send_message.await_args.kwargs["ephemeral"])
         self.assertTrue(await self.bot.tree.interaction_check(SimpleNamespace(guild_id=1)))
+        autocomplete = SimpleNamespace(
+            guild_id=2,
+            type=discord.InteractionType.autocomplete,
+            response=SimpleNamespace(autocomplete=AsyncMock()),
+        )
+        self.assertFalse(await self.bot.tree.interaction_check(autocomplete))
+        autocomplete.response.autocomplete.assert_awaited_once_with([])
         self.assertEqual("\n".join(self.bot.store.db.iterdump()), before)
+
+    async def test_swap_autocomplete_suggests_available_dates_without_generating_schedule(self):
+        command = self.bot.tree.get_command("스왑")
+        options = command.to_dict(self.bot.tree)["options"]
+        self.assertEqual([option["name"] for option in options], ["first_date", "second_date"])
+        self.assertTrue(all(option["autocomplete"] for option in options))
+        self.assertTrue(all("YYYY-MM-DD" in option["description"] for option in options))
+
+        moved = DAY + timedelta(weeks=2, days=1)
+        self.bot.store.reschedule(1, moved - timedelta(days=1), moved, DAY)
+        with self.bot.store.db:
+            self.bot.store.db.execute(
+                "INSERT INTO holidays(guild_id, seminar_date) VALUES(1, ?)",
+                (str(DAY + timedelta(weeks=1)),),
+            )
+        snapshot = list(self.bot.store.db.iterdump())
+        interaction = SimpleNamespace(
+            guild_id=1,
+            permissions=discord.Permissions(manage_guild=True),
+            response=SimpleNamespace(is_done=lambda: False, autocomplete=AsyncMock()),
+        )
+
+        async def choices(focused, **values):
+            interaction.namespace = SimpleNamespace(**values)
+            await command._invoke_autocomplete(interaction, focused, interaction.namespace)
+            return interaction.response.autocomplete.await_args.args[0]
+
+        with patch("seminar_bot.bot.local_now", return_value=NOW + timedelta(days=1)):
+            dates = await choices("first_date", first_date="10-")
+            self.assertEqual(
+                [(choice.name, choice.value) for choice in dates],
+                [(f"{moved} (금요일)", str(moved))],
+            )
+            self.assertEqual(
+                await choices("second_date", first_date=str(moved), second_date="10-"), []
+            )
+            interaction.permissions = discord.Permissions.none()
+            self.assertEqual(await choices("first_date", first_date="10-"), [])
+        self.assertEqual(list(self.bot.store.db.iterdump()), snapshot)
 
     async def test_schedule_acknowledges_before_json_member_validation(self):
         interaction = SimpleNamespace(

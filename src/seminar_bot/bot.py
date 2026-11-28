@@ -84,9 +84,12 @@ class SeminarCommandTree(app_commands.CommandTree):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         target = self.client.settings.active_guild_id
         if target is not None and interaction.guild_id != target:
-            await interaction.response.send_message(
-                "이 봇은 설정된 세미나 서버에서만 사용할 수 있습니다.", ephemeral=True
-            )
+            if interaction.type is discord.InteractionType.autocomplete:
+                await interaction.response.autocomplete([])
+            else:
+                await interaction.response.send_message(
+                    "이 봇은 설정된 세미나 서버에서만 사용할 수 있습니다.", ephemeral=True
+                )
             return False
         return True
 
@@ -650,6 +653,10 @@ class SeminarBot(discord.Client):
         @app_commands.guild_only()
         @app_commands.default_permissions(manage_guild=True)
         @app_commands.checks.has_permissions(manage_guild=True)
+        @app_commands.describe(
+            first_date="첫 번째 발표 날짜를 선택하거나 YYYY-MM-DD 형식으로 입력",
+            second_date="두 번째 발표 날짜를 선택하거나 YYYY-MM-DD 형식으로 입력",
+        )
         async def swap(interaction: discord.Interaction, first_date: str, second_date: str) -> None:
             await interaction.response.defer()
             async with self.schedule_lock:
@@ -662,6 +669,44 @@ class SeminarBot(discord.Client):
             await interaction.followup.send(
                 f"{safe(first_date)} ↔ {safe(second_date)} 발표자를 교환했습니다. 연결된 자료도 발표자를 따라 이동합니다."
             )
+
+        def swap_date_choices(
+            interaction: discord.Interaction, current: str, other_option: str
+        ) -> list[app_commands.Choice[str]]:
+            # Discord does not run the slash command's permission check for autocomplete.
+            if interaction.guild_id is None or not interaction.permissions.manage_guild:
+                return []
+            config = self.store.config(interaction.guild_id)
+            if config is None:
+                return []
+            today = local_now(config).date().isoformat()
+            other_date = getattr(interaction.namespace, other_option, "")
+            rows = self.store.db.execute(
+                """
+                SELECT s.seminar_date FROM sessions s
+                WHERE s.guild_id=? AND s.seminar_date>=? AND s.seminar_date<>?
+                  AND instr(s.seminar_date, ?) > 0
+                  AND NOT EXISTS (
+                      SELECT 1 FROM holidays h WHERE h.guild_id=s.guild_id
+                      AND h.seminar_date=s.seminar_date
+                  )
+                ORDER BY s.seminar_date LIMIT 25
+                """,
+                (interaction.guild_id, today, other_date, current.strip()),
+            )
+            choices = []
+            for (day,) in rows:
+                weekday = WEEKDAYS[parse_date(day).weekday()]
+                choices.append(app_commands.Choice(name=f"{day} ({weekday})", value=day))
+            return choices
+
+        @swap.autocomplete("first_date")
+        async def autocomplete_first_date(interaction: discord.Interaction, current: str):
+            return swap_date_choices(interaction, current, "second_date")
+
+        @swap.autocomplete("second_date")
+        async def autocomplete_second_date(interaction: discord.Interaction, current: str):
+            return swap_date_choices(interaction, current, "first_date")
 
         @tree.command(
             name="연기", description="해당 주를 휴강하고 모든 후속 발표를 1주씩 연기합니다"
