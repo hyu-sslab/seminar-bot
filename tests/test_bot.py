@@ -934,7 +934,9 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         autocomplete.response.autocomplete.assert_awaited_once_with([])
         self.assertEqual("\n".join(self.bot.store.db.iterdump()), before)
 
-    async def test_swap_autocomplete_suggests_available_dates_without_generating_schedule(self):
+    async def test_swap_autocomplete_only_suggests_regular_weekdays_without_generating_schedule(
+        self,
+    ):
         command = self.bot.tree.get_command("스왑")
         options = command.to_dict(self.bot.tree)["options"]
         self.assertEqual([option["name"] for option in options], ["first_date", "second_date"])
@@ -942,7 +944,16 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all("YYYY-MM-DD" in option["description"] for option in options))
 
         moved = DAY + timedelta(weeks=2, days=1)
+        regular = DAY + timedelta(weeks=3)
         self.bot.store.reschedule(1, moved - timedelta(days=1), moved, DAY)
+        # A candidate must show the presenter actually assigned to that date.
+        self.bot.store.swap(1, regular, regular + timedelta(weeks=1), DAY)
+        guild = SimpleNamespace(
+            get_member=lambda presenter: (
+                SimpleNamespace(display_name="Current Presenter") if presenter == 101 else None
+            ),
+            fetch_member=AsyncMock(),
+        )
         with self.bot.store.db:
             self.bot.store.db.execute(
                 "INSERT INTO holidays(guild_id, seminar_date) VALUES(1, ?)",
@@ -966,20 +977,28 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             await command._invoke_autocomplete(interaction, focused, interaction.namespace)
             return interaction.response.autocomplete.await_args.args[0]
 
-        with patch("seminar_bot.bot.local_now", return_value=NOW + timedelta(days=1)):
+        with (
+            patch("seminar_bot.bot.local_now", return_value=NOW + timedelta(days=1)),
+            patch.object(self.bot, "get_guild", return_value=guild),
+        ):
             dates = await choices("first_date", first_date="")
             self.assertTrue(dates)
-            self.assertEqual(dates[0].value, str(moved))
-            dates = await choices("first_date", first_date="10-")
+            self.assertEqual(dates[0].value, str(regular))
+            self.assertTrue(
+                all(date.fromisoformat(choice.value).weekday() == 3 for choice in dates)
+            )
+            self.assertEqual(await choices("first_date", first_date=str(moved)), [])
+            dates = await choices("first_date", first_date="11-05")
             self.assertEqual(
                 [(choice.name, choice.value) for choice in dates],
-                [(f"{moved} (금요일)", str(moved))],
+                [(f"{regular} (목요일) · Current Presenter", str(regular))],
             )
             self.assertEqual(
-                await choices("second_date", first_date=str(moved), second_date="10-"), []
+                await choices("second_date", first_date=str(regular), second_date="11-05"), []
             )
             interaction.permissions = discord.Permissions.none()
-            self.assertEqual(await choices("first_date", first_date="10-"), [])
+            self.assertEqual(await choices("first_date", first_date=""), [])
+        guild.fetch_member.assert_not_awaited()
         self.assertEqual(list(self.bot.store.db.iterdump()), snapshot)
 
     async def test_schedule_acknowledges_before_json_member_validation(self):

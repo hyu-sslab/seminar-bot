@@ -144,7 +144,9 @@ class SeminarBot(discord.Client):
     def web_submission_enabled(self, guild_id: int) -> bool:
         return bool(self.settings.api_token) and guild_id == self.settings.api_guild_id
 
-    async def presenter_names(self, guild_id: int, presenter_ids: set[int]) -> dict[int, str]:
+    async def presenter_names(
+        self, guild_id: int, presenter_ids: set[int], *, fetch_missing: bool = True
+    ) -> dict[int, str]:
         file_names = {}
         try:
             rotations = await asyncio.to_thread(
@@ -163,13 +165,14 @@ class SeminarBot(discord.Client):
             name = " ".join(member.display_name.split()) if member else ""
             if not name:
                 name = " ".join(file_names.get(user_id, "").split())
-            if not name and guild:
+            if not name and guild and fetch_missing:
                 try:
                     member = await guild.fetch_member(user_id)
                     name = " ".join(member.display_name.split())
                 except (discord.HTTPException, OSError):
                     pass
-            names[user_id] = name or f"발표자 {user_id} (이름 확인 불가)"
+            if name or fetch_missing:
+                names[user_id] = name or f"발표자 {user_id} (이름 확인 불가)"
         return names
 
     async def on_ready(self) -> None:
@@ -670,7 +673,7 @@ class SeminarBot(discord.Client):
                 f"{safe(first_date)} ↔ {safe(second_date)} 발표자를 교환했습니다. 연결된 자료도 발표자를 따라 이동합니다."
             )
 
-        def swap_date_choices(
+        async def swap_date_choices(
             interaction: discord.Interaction, current: str, other_option: str
         ) -> list[app_commands.Choice[str]]:
             # Discord does not run the slash command's permission check for autocomplete.
@@ -682,10 +685,14 @@ class SeminarBot(discord.Client):
             today = local_now(config).date().isoformat()
             # Discord's Namespace returns None for options that were not sent.
             other_date = getattr(interaction.namespace, other_option, None) or ""
+            weekday = config["weekday"]
+            # SQLite's %w starts at Sunday; the saved weekday starts at Monday.
+            sqlite_weekday = str((weekday + 1) % 7)
             rows = self.store.db.execute(
                 """
-                SELECT s.seminar_date FROM sessions s
+                SELECT s.seminar_date, s.presenter_id FROM sessions s
                 WHERE s.guild_id=? AND s.seminar_date>=? AND s.seminar_date<>?
+                  AND strftime('%w', s.seminar_date)=?
                   AND instr(s.seminar_date, ?) > 0
                   AND NOT EXISTS (
                       SELECT 1 FROM holidays h WHERE h.guild_id=s.guild_id
@@ -693,21 +700,28 @@ class SeminarBot(discord.Client):
                   )
                 ORDER BY s.seminar_date LIMIT 25
                 """,
-                (interaction.guild_id, today, other_date, current.strip()),
+                (interaction.guild_id, today, other_date, sqlite_weekday, current.strip()),
+            ).fetchall()
+            if not rows:
+                return []
+            names = await self.presenter_names(
+                interaction.guild_id, {presenter for _, presenter in rows}, fetch_missing=False
             )
             choices = []
-            for (day,) in rows:
-                weekday = WEEKDAYS[parse_date(day).weekday()]
-                choices.append(app_commands.Choice(name=f"{day} ({weekday})", value=day))
+            for day, presenter in rows:
+                label = f"{day} ({WEEKDAYS[weekday]})"
+                if presenter in names:
+                    label += f" · {names[presenter]}"
+                choices.append(app_commands.Choice(name=label[:100], value=day))
             return choices
 
         @swap.autocomplete("first_date")
         async def autocomplete_first_date(interaction: discord.Interaction, current: str):
-            return swap_date_choices(interaction, current, "second_date")
+            return await swap_date_choices(interaction, current, "second_date")
 
         @swap.autocomplete("second_date")
         async def autocomplete_second_date(interaction: discord.Interaction, current: str):
-            return swap_date_choices(interaction, current, "first_date")
+            return await swap_date_choices(interaction, current, "first_date")
 
         @tree.command(
             name="연기", description="해당 주를 휴강하고 모든 후속 발표를 1주씩 연기합니다"
