@@ -951,16 +951,25 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         snapshot = list(self.bot.store.db.iterdump())
         interaction = SimpleNamespace(
             guild_id=1,
+            guild=None,
+            _state=self.bot._connection,
             permissions=discord.Permissions(manage_guild=True),
             response=SimpleNamespace(is_done=lambda: False, autocomplete=AsyncMock()),
         )
 
         async def choices(focused, **values):
-            interaction.namespace = SimpleNamespace(**values)
+            interaction.namespace = discord.app_commands.Namespace(
+                interaction,
+                {},
+                [{"name": name, "type": 3, "value": value} for name, value in values.items()],
+            )
             await command._invoke_autocomplete(interaction, focused, interaction.namespace)
             return interaction.response.autocomplete.await_args.args[0]
 
         with patch("seminar_bot.bot.local_now", return_value=NOW + timedelta(days=1)):
+            dates = await choices("first_date", first_date="")
+            self.assertTrue(dates)
+            self.assertEqual(dates[0].value, str(moved))
             dates = await choices("first_date", first_date="10-")
             self.assertEqual(
                 [(choice.name, choice.value) for choice in dates],

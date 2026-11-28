@@ -680,7 +680,8 @@ class SeminarBot(discord.Client):
             if config is None:
                 return []
             today = local_now(config).date().isoformat()
-            other_date = getattr(interaction.namespace, other_option, "")
+            # Discord's Namespace returns None for options that were not sent.
+            other_date = getattr(interaction.namespace, other_option, None) or ""
             rows = self.store.db.execute(
                 """
                 SELECT s.seminar_date FROM sessions s
